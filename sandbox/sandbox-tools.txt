@@ -101,8 +101,8 @@ keras              Keras deep learning. import keras — model loading, inferenc
 PyJWT              JWT encode/decode. import jwt; jwt.encode(payload, key, algorithm='HS256')
 
 == NOTES ==
-- Sandbox runs ARM64. Do NOT execute x86/x86-64 binaries locally.
-  Use Ghidra tools for RE, and interact with remote services for dynamic analysis.
+- Check the sandbox architecture with `uname -m` before executing a challenge binary.
+  If the binary targets another architecture, prefer static analysis or interact with the remote service.
 - Need a package not listed? Run `pip install <pkg>` or `uv pip install <pkg>`.
 - Distfiles are at /challenge/distfiles/ (read-only)
 - Write generated/repaired files to /challenge/workspace/ (writable)

@@ -12,7 +12,8 @@ from backend.agents.solver import Solver
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.message_bus import ChallengeMessageBus
-from backend.models import DEFAULT_MODELS, provider_from_spec
+from backend.model_specs import provider_from_spec, quota_fallback_spec
+from backend.models import DEFAULT_MODELS
 from backend.prompts import ChallengeMeta
 from backend.solver_base import (
     CANCELLED,
@@ -30,17 +31,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Quota fallback: map subscription-backed providers to API-backed equivalents
-QUOTA_FALLBACK: dict[str, str] = {
-    "claude-sdk/claude-opus-4-6": "bedrock/us.anthropic.claude-opus-4-6-v1",
-    "codex/gpt-5.4": "azure/gpt-5.4",
-    "codex/gpt-5.4-mini": "azure/gpt-5.4-mini",
-    "codex/gpt-5.3-codex-spark": "zen/gpt-5.3-codex-spark",
-}
-
-
 def _quota_fallback_spec(model_spec: str) -> str | None:
-    return QUOTA_FALLBACK.get(model_spec)
+    return quota_fallback_spec(model_spec)
 
 
 @dataclass
@@ -72,7 +64,7 @@ class ChallengeSwarm:
 
         - claude-sdk/* → ClaudeSolver (Claude Agent SDK, subscription-first)
         - codex/* → CodexSolver (Codex App Server, subscription-first)
-        - bedrock/*, azure/*, zen/*, google/* → Pydantic AI Solver (API)
+        - openai/*, bedrock/*, azure/*, zen/*, google/* → Pydantic AI Solver (API)
         """
         provider = provider_from_spec(model_spec)
 

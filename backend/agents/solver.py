@@ -28,7 +28,15 @@ from backend.models import (
 from backend.output_types import FlagFound
 from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
-from backend.solver_base import CANCELLED, CORRECT_MARKERS, ERROR, FLAG_FOUND, GAVE_UP, SolverResult
+from backend.solver_base import (
+    CANCELLED,
+    CORRECT_MARKERS,
+    ERROR,
+    FLAG_FOUND,
+    GAVE_UP,
+    SolverResult,
+    solver_agent_name,
+)
 from backend.tools.flag import submit_flag
 from backend.tools.sandbox import (
     bash,
@@ -144,8 +152,8 @@ class Solver:
             cost_tracker=cost_tracker,
         )
         self.loop_detector = LoopDetector()
-        self.tracer = SolverTracer(meta.name, self.model_id)
-        self.agent_name = f"{meta.name}/{self.model_id}"
+        self.tracer = SolverTracer(meta.name, self.model_spec)
+        self.agent_name = solver_agent_name(meta.name, self.model_spec)
         self._agent: Agent[SolverDeps, FlagFound] | None = None
         self._messages: list = []
         self._step_count = [0]  # mutable ref shared with TracingToolset

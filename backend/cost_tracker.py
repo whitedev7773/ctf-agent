@@ -18,11 +18,29 @@ PROVIDER_MAP: dict[str, str] = {
     "azure": "openai",
     "zen": "openai",
     "codex": "openai",
+    "openai": "openai",
     "google": "google",
 }
 
 # Fallback pricing for models not in genai-prices (per 1M tokens, USD)
 FALLBACK_PRICING: dict[str, dict[str, float]] = {
+    # GPT-5.6 base API rates. Long-context and cache-write surcharges are not
+    # represented here; genai-prices is preferred when it knows these models.
+    "gpt-5.6-sol": {
+        "input": 4.00,
+        "cached_input": 0.40,
+        "output": 20.00,
+    },
+    "gpt-5.6-terra": {
+        "input": 2.00,
+        "cached_input": 0.20,
+        "output": 12.00,
+    },
+    "gpt-5.6-luna": {
+        "input": 0.20,
+        "cached_input": 0.02,
+        "output": 1.20,
+    },
     "us.anthropic.claude-opus-4-6-v1": {
         "input": 5.00,
         "cached_input": 0.50,

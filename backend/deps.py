@@ -43,9 +43,12 @@ class CoordinatorDeps:
     model_specs: list[str] = field(default_factory=list)
     challenges_root: str = "challenges"
     no_submit: bool = False
+    # The CLI dry-run flag cannot be disabled from the dashboard. ``no_submit``
+    # also becomes true dynamically while no CTFd instance is connected.
+    force_no_submit: bool = False
     max_concurrent_challenges: int = 10
 
-    msg_port: int = 0  # 0 = auto-pick free port
+    msg_port: int = 9400  # Dashboard and operator-message port; 0 = auto-pick.
 
     # Runtime state
     coordinator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)

@@ -16,6 +16,11 @@ QUOTA_ERROR = "quota_error"
 CORRECT_MARKERS = ("CORRECT", "ALREADY SOLVED")
 
 
+def solver_agent_name(challenge_name: str, model_spec: str) -> str:
+    """Build a unique accounting/logging key for a solver configuration."""
+    return f"{challenge_name}/{model_spec}"
+
+
 @dataclass
 class SolverResult:
     flag: str | None

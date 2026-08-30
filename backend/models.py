@@ -1,4 +1,4 @@
-"""Model resolution — Bedrock, Azure OpenAI, Zen, Google AI Studio."""
+"""Model resolution — OpenAI, Bedrock, Azure OpenAI, Zen, Google AI Studio."""
 
 from __future__ import annotations
 
@@ -8,28 +8,36 @@ import boto3
 from pydantic_ai.models import Model
 from pydantic_ai.models.bedrock import BedrockConverseModel, BedrockModelSettings
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
-from pydantic_ai.models.openai import OpenAIModel, OpenAIModelSettings
+from pydantic_ai.models.openai import (
+    OpenAIChatModel,
+    OpenAIChatModelSettings,
+    OpenAIResponsesModel,
+    OpenAIResponsesModelSettings,
+)
 from pydantic_ai.providers.bedrock import BedrockProvider
 from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
+from backend.model_specs import model_id_from_spec, provider_from_spec
+
 if TYPE_CHECKING:
     from backend.config import Settings
 
-# Default model specs — claude-sdk and codex providers use the new solver backends
+# Codex-first CTF lineup: quality, balanced, and fast/cost-sensitive lanes.
 DEFAULT_MODELS: list[str] = [
-    "claude-sdk/claude-opus-4-6/medium",
-    "claude-sdk/claude-opus-4-6/max",
-    "codex/gpt-5.4",
-    "codex/gpt-5.4-mini",
-    "codex/gpt-5.3-codex",
+    "codex/gpt-5.6-sol/xhigh",
+    "codex/gpt-5.6-terra/high",
+    "codex/gpt-5.6-luna/medium",
 ]
 
 # Context window sizes (tokens)
 CONTEXT_WINDOWS: dict[str, int] = {
     "us.anthropic.claude-opus-4-6-v1": 1_000_000,
     "claude-opus-4-6": 1_000_000,
+    "gpt-5.6-sol": 1_050_000,
+    "gpt-5.6-terra": 1_050_000,
+    "gpt-5.6-luna": 1_050_000,
     "gpt-5.4": 1_000_000,
     "gpt-5.4-mini": 400_000,
     "gpt-5.3-codex": 1_000_000,
@@ -41,6 +49,9 @@ CONTEXT_WINDOWS: dict[str, int] = {
 VISION_MODELS: set[str] = {
     "us.anthropic.claude-opus-4-6-v1",
     "claude-opus-4-6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5.4",
     "gpt-5.4-mini",
     "gemini-3-flash-preview",
@@ -69,15 +80,20 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                     provider=BedrockProvider(bedrock_client=client),
                 )
         case "azure":
-            return OpenAIModel(
+            return OpenAIChatModel(
                 model_id,
                 provider=OpenAIProvider(
                     base_url=settings.azure_openai_endpoint,
                     api_key=settings.azure_openai_api_key,
                 ),
             )
+        case "openai":
+            return OpenAIResponsesModel(
+                model_id,
+                provider=OpenAIProvider(api_key=settings.openai_api_key),
+            )
         case "zen":
-            return OpenAIModel(
+            return OpenAIChatModel(
                 model_id,
                 provider=OpenAIProvider(
                     base_url="https://opencode.ai/zen/v1",
@@ -109,11 +125,14 @@ def resolve_model_settings(spec: str) -> ModelSettings:
                 bedrock_cache_tool_definitions=True,
                 bedrock_cache_messages=True,
             )
+        case "openai":
+            return OpenAIResponsesModelSettings(
+                max_tokens=128_000,
+            )
         case "azure" | "zen":
-            # Azure/Zen use OpenAI chat completions — server-side prompt caching
-            # is automatic, no explicit config needed. Set max_tokens to avoid
-            # reserving the full context window.
-            return OpenAIModelSettings(
+            # Azure/Zen expose OpenAI-compatible chat completions. Server-side
+            # prompt caching is automatic, so no explicit cache setting is needed.
+            return OpenAIChatModelSettings(
                 max_tokens=128_000,
             )
         case "google":
@@ -126,25 +145,6 @@ def resolve_model_settings(spec: str) -> ModelSettings:
             )
         case _:
             return ModelSettings(max_tokens=128_000)
-
-
-def model_id_from_spec(spec: str) -> str:
-    """Extract just the model ID from a spec (strips effort suffix)."""
-    parts = spec.split("/")
-    return parts[1] if len(parts) >= 2 else spec
-
-
-def provider_from_spec(spec: str) -> str:
-    """Extract the provider from a spec."""
-    return spec.split("/", 1)[0]
-
-
-def effort_from_spec(spec: str) -> str | None:
-    """Extract effort level from a spec like 'claude-sdk/claude-opus-4-6/max'."""
-    parts = spec.split("/")
-    if len(parts) >= 3 and parts[2] in ("low", "medium", "high", "max"):
-        return parts[2]
-    return None
 
 
 def supports_vision(spec: str) -> bool:

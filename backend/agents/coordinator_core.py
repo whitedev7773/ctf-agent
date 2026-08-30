@@ -15,8 +15,21 @@ logger = logging.getLogger(__name__)
 
 
 async def do_fetch_challenges(deps: CoordinatorDeps) -> str:
-    challenges = await deps.ctfd.fetch_all_challenges()
-    solved = await deps.ctfd.fetch_solved_names()
+    if deps.ctfd.is_configured:
+        challenges = await deps.ctfd.fetch_all_challenges()
+        solved = await deps.ctfd.fetch_solved_names()
+    else:
+        challenges = [
+            {
+                "name": meta.name,
+                "category": meta.category,
+                "value": meta.value,
+                "solves": meta.solves,
+                "description": meta.description,
+            }
+            for meta in deps.challenge_metas.values()
+        ]
+        solved = set(deps.results)
     result = [
         {
             "name": ch.get("name", "?"),
@@ -32,7 +45,7 @@ async def do_fetch_challenges(deps: CoordinatorDeps) -> str:
 
 
 async def do_get_solve_status(deps: CoordinatorDeps) -> str:
-    solved = await deps.ctfd.fetch_solved_names()
+    solved = await deps.ctfd.fetch_solved_names() if deps.ctfd.is_configured else set(deps.results)
     swarm_status = {name: swarm.get_status() for name, swarm in deps.swarms.items()}
     return json.dumps({"solved": sorted(solved), "active_swarms": swarm_status}, indent=2)
 
@@ -57,6 +70,8 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
 
     # Auto-pull challenge if needed
     if challenge_name not in deps.challenge_dirs:
+        if not deps.ctfd.is_configured:
+            return f"Challenge '{challenge_name}' not found locally; add it from the dashboard first"
         challenges = await deps.ctfd.fetch_all_challenges()
         ch_data = next((c for c in challenges if c.get("name") == challenge_name), None)
         if not ch_data:
@@ -79,6 +94,7 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
         coordinator_inbox=deps.coordinator_inbox,
     )
     deps.swarms[challenge_name] = swarm
+    standalone_run = not deps.ctfd.is_configured
 
     async def _run_and_cleanup() -> None:
         result = await swarm.run()
@@ -86,7 +102,11 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
         if result and result.status == FLAG_FOUND:
             deps.results[challenge_name] = {
                 "flag": result.flag,
-                "submit": "DRY RUN" if deps.no_submit else "confirmed by solver",
+                "submit": (
+                    "LOCAL RESULT" if standalone_run
+                    else "DRY RUN" if deps.no_submit
+                    else "confirmed by solver"
+                ),
             }
 
     task = asyncio.create_task(_run_and_cleanup(), name=f"swarm-{challenge_name}")
@@ -102,6 +122,10 @@ async def do_check_swarm_status(deps: CoordinatorDeps, challenge_name: str) -> s
 
 
 async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) -> str:
+    if not deps.ctfd.is_configured:
+        candidate = flag.strip()
+        deps.results[challenge_name] = {"flag": candidate, "submit": "LOCAL CANDIDATE"}
+        return f'LOCAL CANDIDATE — recorded "{candidate}" for {challenge_name}'
     if deps.no_submit:
         return f'DRY RUN — would submit "{flag.strip()}" for {challenge_name}'
     try:

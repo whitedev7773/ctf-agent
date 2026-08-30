@@ -20,12 +20,13 @@ class ChallengeMeta:
     description: str = ""
     tags: list[str] = field(default_factory=list)
     connection_info: str = ""
+    flag_format: str = ""
     hints: list[dict[str, Any]] = field(default_factory=list)
     solves: int = 0
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> ChallengeMeta:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         return cls(
             name=data.get("name", "Unknown"),
@@ -34,6 +35,7 @@ class ChallengeMeta:
             description=data.get("description", ""),
             tags=data.get("tags", []),
             connection_info=data.get("connection_info", ""),
+            flag_format=data.get("flag_format", ""),
             hints=data.get("hints", []),
             solves=data.get("solves", 0),
         )
@@ -91,6 +93,8 @@ def build_prompt(
     ]
     if meta.tags:
         lines.append(f"**Tags**    : {', '.join(meta.tags)}")
+    if meta.flag_format:
+        lines.append(f"**Flag format**: `{meta.flag_format}`")
     lines += ["", "## Description", meta.description or "_No description provided._", ""]
 
     if conn_info:

@@ -26,11 +26,20 @@ from claude_agent_sdk import (
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.loop_detect import LoopDetector
+from backend.model_specs import effort_from_spec
 from backend.models import model_id_from_spec
 from backend.output_types import solver_output_json_schema
 from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
-from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, QUOTA_ERROR, SolverResult
+from backend.solver_base import (
+    CANCELLED,
+    ERROR,
+    FLAG_FOUND,
+    GAVE_UP,
+    QUOTA_ERROR,
+    SolverResult,
+    solver_agent_name,
+)
 from backend.tracing import SolverTracer
 
 logger = logging.getLogger(__name__)
@@ -72,8 +81,8 @@ class ClaudeSolver:
             memory_limit=getattr(settings, "container_memory_limit", "4g"),
         )
         self.loop_detector = LoopDetector()
-        self.tracer = SolverTracer(meta.name, self.model_id)
-        self.agent_name = f"{meta.name}/{self.model_id}"
+        self.tracer = SolverTracer(meta.name, self.model_spec)
+        self.agent_name = solver_agent_name(meta.name, self.model_spec)
 
         self._client: ClaudeSDKClient | None = None
         self._session_id: str | None = None
@@ -250,8 +259,11 @@ class ClaudeSolver:
                     }
             return {}
 
-        from backend.models import effort_from_spec
         effort = effort_from_spec(self.model_spec)
+        # Claude Agent SDK currently accepts this narrower effort set. Keep
+        # Codex/OpenAI-only values such as none/xhigh/ultra from leaking into this backend.
+        if effort not in (None, "low", "medium", "high", "max"):
+            effort = None
 
         options = ClaudeAgentOptions(
             model=self.model_id,

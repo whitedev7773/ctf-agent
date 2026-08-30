@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections.abc import Callable, Coroutine
 from pathlib import Path
@@ -48,7 +47,8 @@ def build_deps(
         settings=settings,
         model_specs=specs,
         challenges_root=challenges_root,
-        no_submit=no_submit,
+        no_submit=no_submit or not ctfd.is_configured,
+        force_no_submit=no_submit,
         max_concurrent_challenges=getattr(settings, "max_concurrent_challenges", 10),
         challenge_dirs=challenge_dirs or {},
         challenge_metas=challenge_metas or {},
@@ -85,8 +85,19 @@ async def run_event_loop(
     poller = CTFdPoller(ctfd=ctfd, interval_s=5.0)
     await poller.start()
 
-    # Start operator message HTTP endpoint
-    msg_server = await _start_msg_server(deps.operator_inbox, deps.msg_port)
+    # Dashboard runs in this process so it can inspect and control live swarms.
+    dashboard_server = None
+    try:
+        from backend.dashboard import DashboardServer
+
+        dashboard_server = DashboardServer(deps, poller, cost_tracker, deps.msg_port)
+        await dashboard_server.start()
+        logger.info(
+            "Dashboard listening on http://127.0.0.1:%d",
+            dashboard_server.actual_port,
+        )
+    except Exception as e:
+        logger.warning("Could not start dashboard: %s", e, exc_info=True)
 
     logger.info(
         "Coordinator starting: %d models, %d challenges, %d solved",
@@ -95,12 +106,14 @@ async def run_event_loop(
         len(poller.known_solved),
     )
 
-    unsolved = poller.known_challenges - poller.known_solved
+    known = poller.known_challenges | set(deps.challenge_metas)
+    unsolved = known - poller.known_solved
+    mode = "CTFd connected" if ctfd.is_configured else "standalone local mode"
     initial_msg = (
-        f"CTF is LIVE. {len(poller.known_challenges)} challenges, "
+        f"CTF Agent started in {mode}. {len(known)} challenges, "
         f"{len(poller.known_solved)} solved.\n"
         f"Unsolved: {sorted(unsolved) if unsolved else 'NONE'}\n"
-        "Fetch challenges and spawn swarms for all unsolved."
+        "Spawn swarms for available unsolved challenges."
     )
 
     try:
@@ -163,8 +176,8 @@ async def run_event_loop(
             if now - last_status >= status_interval:
                 last_status = now
                 active = [n for n, t in deps.swarm_tasks.items() if not t.done()]
-                solved_set = poller.known_solved
-                unsolved_set = poller.known_challenges - solved_set
+                solved_set = poller.known_solved | set(deps.results)
+                unsolved_set = (poller.known_challenges | set(deps.challenge_metas)) - solved_set
                 status_line = (
                     f"STATUS: {len(solved_set)} solved, {len(unsolved_set)} unsolved, "
                     f"{len(active)} active swarms. Cost: ${cost_tracker.total_cost_usd:.2f}"
@@ -185,9 +198,8 @@ async def run_event_loop(
     except Exception as e:
         logger.error("Coordinator fatal: %s", e, exc_info=True)
     finally:
-        if msg_server:
-            msg_server.close()
-            await msg_server.wait_closed()
+        if dashboard_server:
+            await dashboard_server.stop()
         await poller.stop()
         for swarm in deps.swarms.values():
             swarm.kill()
@@ -225,56 +237,7 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
 
 async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
     """Auto-spawn swarms for all unsolved challenges that don't have active swarms."""
-    unsolved = poller.known_challenges - poller.known_solved
+    unsolved = (poller.known_challenges | set(deps.challenge_metas)) - poller.known_solved
     for name in sorted(unsolved):
         await _auto_spawn_one(deps, name)
-
-
-async def _start_msg_server(inbox: asyncio.Queue, port: int = 0) -> asyncio.Server | None:
-    """Start a tiny HTTP server that accepts operator messages via POST."""
-
-    async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            # Read HTTP request
-            request_line = await asyncio.wait_for(reader.readline(), timeout=5)
-            headers: dict[str, str] = {}
-            while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=5)
-                if line in (b"\r\n", b"\n", b""):
-                    break
-                if b":" in line:
-                    k, v = line.decode().split(":", 1)
-                    headers[k.strip().lower()] = v.strip()
-
-            method = request_line.decode().split()[0] if request_line else ""
-            content_length = int(headers.get("content-length", 0))
-
-            if method == "POST" and content_length > 0:
-                body = await asyncio.wait_for(reader.read(content_length), timeout=5)
-                try:
-                    data = json.loads(body)
-                    message = data.get("message", body.decode())
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    message = body.decode("utf-8", errors="replace")
-
-                inbox.put_nowait(message)
-                resp = json.dumps({"ok": True, "queued": message[:200]})
-                writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode())
-            else:
-                resp = json.dumps({"error": "POST with JSON body required", "usage": "POST {\"message\": \"...\"}"})
-                writer.write(f"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode())
-
-            await writer.drain()
-        except Exception:
-            pass
-        finally:
-            writer.close()
-
-    try:
-        server = await asyncio.start_server(_handle, "127.0.0.1", port)
-        actual_port = server.sockets[0].getsockname()[1]
-        logger.info(f"Operator message endpoint listening on http://127.0.0.1:{actual_port}")
-        return server
-    except OSError as e:
-        logger.warning(f"Could not start operator message endpoint: {e}")
-        return None
+    return

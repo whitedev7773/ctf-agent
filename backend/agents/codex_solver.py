@@ -1,6 +1,6 @@
 """Codex solver — drives `codex app-server` via JSON-RPC 2.0 over stdio.
 
-Protocol shapes verified against codex-cli 0.116.0 schema:
+Protocol shapes verified against the Codex App Server v2 schema (August 2026):
 - thread/start returns {thread: {id, ...}, ...}
 - turn/start takes {threadId, input: UserInput[]}
 - Dynamic tool calls arrive as item/tool/call server requests with DynamicToolCallParams
@@ -21,13 +21,23 @@ import time
 from typing import Any
 
 from backend.cost_tracker import CostTracker
+from backend.codex_cli import prepare_codex_cli
 from backend.ctfd import CTFdClient
 from backend.loop_detect import LoopDetector
+from backend.model_specs import effort_from_spec
 from backend.models import model_id_from_spec, supports_vision
 from backend.output_types import solver_output_json_schema
 from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
-from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, QUOTA_ERROR, SolverResult
+from backend.solver_base import (
+    CANCELLED,
+    ERROR,
+    FLAG_FOUND,
+    GAVE_UP,
+    QUOTA_ERROR,
+    SolverResult,
+    solver_agent_name,
+)
 from backend.tools.core import (
     do_bash,
     do_list_files,
@@ -45,7 +55,7 @@ logger = logging.getLogger(__name__)
 _rpc_counter = itertools.count(1)
 
 # Per-model reasoning effort (only for models that support it)
-REASONING_EFFORT: dict[str, str] = {
+LEGACY_REASONING_EFFORT: dict[str, str] = {
     "gpt-5.3-codex": "xhigh",
 }
 
@@ -153,8 +163,8 @@ class CodexSolver:
         )
         self.use_vision = supports_vision(model_spec)
         self.loop_detector = LoopDetector()
-        self.tracer = SolverTracer(meta.name, self.model_id)
-        self.agent_name = f"{meta.name}/{self.model_id}"
+        self.tracer = SolverTracer(meta.name, self.model_spec)
+        self.agent_name = solver_agent_name(meta.name, self.model_spec)
 
         self._proc: asyncio.subprocess.Process | None = None
         self._thread_id: str | None = None
@@ -170,6 +180,10 @@ class CodexSolver:
         self._pending_responses: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
         self._turn_done: asyncio.Event = asyncio.Event()
+        self._reasoning_effort = (
+            effort_from_spec(self.model_spec)
+            or LEGACY_REASONING_EFFORT.get(self.model_id)
+        )
 
     async def start(self) -> None:
         await self.sandbox.start()
@@ -183,8 +197,11 @@ class CodexSolver:
             has_named_tools=True,
         )
 
+        codex_executable = await prepare_codex_cli(
+            getattr(self.settings, "codex_cli_path", ""),
+        )
         self._proc = await asyncio.create_subprocess_exec(
-            "codex", "app-server",
+            codex_executable, "app-server",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -199,7 +216,7 @@ class CodexSolver:
         })
         await self._send_notification("initialized", {})
 
-        # thread/start — personality is enum, system prompt in baseInstructions
+        # thread/start — system prompt is supplied through baseInstructions
         # Prepend sandbox path reminder to prevent models from using host paths
         tool_names = [t["name"] for t in SANDBOX_TOOLS]
         sandbox_preamble = (
@@ -210,24 +227,26 @@ class CodexSolver:
         )
         thread_params = {
             "model": self.model_id,
-            "personality": "pragmatic",
             "baseInstructions": sandbox_preamble + system_prompt,
             "cwd": "/challenge",
             "approvalPolicy": "on-request",
             "sandbox": "read-only",
-            "serviceTier": "flex",
             "dynamicTools": SANDBOX_TOOLS,
         }
-        # Reasoning effort for models that support it
-        reasoning = REASONING_EFFORT.get(self.model_id)
-        if reasoning:
-            thread_params["reasoningEffort"] = reasoning
         resp = await self._rpc("thread/start", thread_params)
         # ThreadStartResponse: result.thread.id
         self._thread_id = resp.get("result", {}).get("thread", {}).get("id", "")
 
-        self.tracer.event("start", challenge=self.meta.name, model=self.model_id)
-        logger.info(f"[{self.agent_name}] Codex solver started (thread={self._thread_id})")
+        self.tracer.event(
+            "start",
+            challenge=self.meta.name,
+            model=self.model_id,
+            reasoning_effort=self._reasoning_effort,
+        )
+        logger.info(
+            f"[{self.agent_name}] Codex solver started "
+            f"(thread={self._thread_id}, effort={self._reasoning_effort or 'default'})"
+        )
 
     async def _rpc(self, method: str, params: dict | None = None) -> dict:
         assert self._proc and self._proc.stdin
@@ -478,11 +497,15 @@ class CodexSolver:
             self._turn_done.clear()
             self._structured_output = None
             self._turn_error = None
-            await self._rpc("turn/start", {
+            turn_params: dict[str, Any] = {
                 "threadId": self._thread_id,
                 "input": [{"type": "text", "text": prompt_text}],
                 "outputSchema": solver_output_json_schema(),
-            })
+            }
+            # Current App Server exposes reasoning as `effort` on turn/start.
+            if self._reasoning_effort:
+                turn_params["effort"] = self._reasoning_effort
+            await self._rpc("turn/start", turn_params)
 
             await self._turn_done.wait()
 

@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="CTF Agent live operations dashboard">
+  <title>CTF Agent Command Center</title>
+  <link rel="stylesheet" href="/assets/dashboard.css">
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="CTF Agent dashboard home">
+      <span class="brand-mark">CA</span>
+      <span>
+        <strong>CTF Agent</strong>
+        <small>Command Center</small>
+      </span>
+    </a>
+    <div class="topbar-status">
+      <span class="connection-pill" id="connection-pill">
+        <span class="status-dot"></span>
+        <span id="connection-label">연결 중</span>
+      </span>
+      <span class="mode-pill" id="mode-pill">상태 확인 중</span>
+      <button class="icon-button" id="refresh-button" type="button" aria-label="지금 새로고침" title="새로고침">↻</button>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="stats-grid" aria-label="대회 요약">
+      <article class="stat-card accent-green">
+        <span class="stat-label">SOLVED</span>
+        <strong id="stat-solved">—</strong>
+        <small id="stat-total">전체 — 문제</small>
+      </article>
+      <article class="stat-card accent-cyan">
+        <span class="stat-label">ACTIVE SWARMS</span>
+        <strong id="stat-swarms">—</strong>
+        <small id="stat-capacity">동시 실행 한도 —</small>
+      </article>
+      <article class="stat-card accent-violet">
+        <span class="stat-label">ACTIVE AGENTS</span>
+        <strong id="stat-agents">—</strong>
+        <small id="stat-agent-total">생성된 agent —</small>
+      </article>
+      <article class="stat-card accent-amber">
+        <span class="stat-label">ESTIMATED SPEND</span>
+        <strong id="stat-cost">$—</strong>
+        <small id="stat-tokens">— tokens</small>
+      </article>
+    </section>
+
+    <section class="workspace" aria-labelledby="challenge-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">CHALLENGE QUEUE</p>
+          <h2 id="challenge-title">문제 현황</h2>
+        </div>
+        <div class="filters" role="search">
+          <label class="search-box">
+            <span aria-hidden="true">⌕</span>
+            <span class="sr-only">문제 검색</span>
+            <input id="challenge-search" type="search" placeholder="문제명 또는 카테고리 검색" aria-controls="challenge-rows">
+          </label>
+          <div class="segmented" id="status-filter" aria-label="상태 필터">
+            <button type="button" data-filter="all" class="active" aria-pressed="true">전체</button>
+            <button type="button" data-filter="active" aria-pressed="false">실행 중</button>
+            <button type="button" data-filter="solved" aria-pressed="false">해결</button>
+            <button type="button" data-filter="idle" aria-pressed="false">대기</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="challenge-table-wrap">
+        <table class="challenge-table">
+          <thead>
+            <tr>
+              <th>문제</th>
+              <th>상태</th>
+              <th>Solver</th>
+              <th>진행</th>
+              <th>비용</th>
+              <th><span class="sr-only">작업</span></th>
+            </tr>
+          </thead>
+          <tbody id="challenge-rows"></tbody>
+        </table>
+        <div class="empty-state" id="empty-state" hidden>
+          <span>∅</span>
+          <h3 id="empty-title">표시할 문제가 없습니다</h3>
+          <p id="empty-copy">검색어나 상태 필터를 바꿔보세요.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="operator-panel" aria-labelledby="operator-title">
+      <div class="operator-copy">
+        <span class="terminal-glyph" aria-hidden="true">›_</span>
+        <div>
+          <h2 id="operator-title">Coordinator에게 지시</h2>
+          <p>공통 flag 형식, 우선순위 또는 막힌 solver에 대한 힌트를 전달하세요.</p>
+        </div>
+      </div>
+      <form id="operator-form" class="operator-form">
+        <label class="sr-only" for="operator-message">Coordinator 메시지</label>
+        <input id="operator-message" name="message" maxlength="4000" autocomplete="off" placeholder="예: web-300은 JWT kid injection을 우선 확인해" required>
+        <button class="primary-button" type="submit">메시지 전송</button>
+      </form>
+    </section>
+
+    <section class="source-section" aria-labelledby="source-title">
+      <div class="section-heading source-heading">
+        <div>
+          <p class="eyebrow">CHALLENGE SOURCES</p>
+          <h2 id="source-title">문제 가져오기</h2>
+          <p>CTFd를 연결하거나 하나의 로컬 문제를 직접 등록할 수 있습니다.</p>
+        </div>
+      </div>
+      <div class="setup-grid">
+        <article class="setup-card">
+        <div class="setup-heading">
+          <div>
+            <p class="eyebrow">OPTIONAL INTEGRATION</p>
+            <h2>CTFd 연결</h2>
+            <p id="ctfd-status-copy">연결 상태를 확인하고 있습니다.</p>
+          </div>
+          <span class="source-badge" id="ctfd-source-badge">확인 중</span>
+        </div>
+        <form id="ctfd-form" class="setup-form">
+          <label class="wide-field">
+            <span>CTFd 주소</span>
+            <input id="ctfd-url" name="url" type="url" maxlength="2000" placeholder="https://ctf.example.com" autocomplete="url">
+          </label>
+          <label>
+            <span>API Token</span>
+            <input id="ctfd-token" name="token" type="password" maxlength="4000" placeholder="선택 사항" autocomplete="off">
+          </label>
+          <button class="primary-button setup-submit" type="submit">연결 및 문제 불러오기</button>
+          <details class="credential-details wide-field">
+            <summary>아이디/비밀번호로 연결</summary>
+            <div class="credential-grid">
+              <label><span>아이디</span><input id="ctfd-username" name="username" maxlength="200" autocomplete="username"></label>
+              <label><span>비밀번호</span><input id="ctfd-password" name="password" type="password" maxlength="4000" autocomplete="current-password"></label>
+            </div>
+          </details>
+          <button class="secondary-button wide-field" id="ctfd-disconnect" type="button">CTFd 없이 독립 모드 사용</button>
+        </form>
+        </article>
+
+        <article class="setup-card">
+        <div class="setup-heading">
+          <div>
+            <p class="eyebrow">STANDALONE CHALLENGE</p>
+            <h2>로컬 문제 추가</h2>
+            <p>CTFd 없이 문제 정보와 첨부 파일을 등록해 바로 풀이합니다.</p>
+          </div>
+          <span class="source-badge local">LOCAL</span>
+        </div>
+        <form id="local-challenge-form" class="setup-form" enctype="multipart/form-data">
+          <label><span>문제명</span><input name="name" maxlength="200" required placeholder="baby-pwn"></label>
+          <label><span>카테고리</span><input name="category" maxlength="100" placeholder="pwn"></label>
+          <label><span>점수</span><input name="value" type="number" min="0" step="1" value="0"></label>
+          <label><span>접속 정보</span><input name="connection_info" maxlength="2000" placeholder="nc host 31337"></label>
+          <label class="wide-field"><span>Flag 형식</span><input name="flag_format" maxlength="500" required placeholder="TEAM{...}" autocomplete="off"></label>
+          <label class="wide-field"><span>설명</span><textarea name="description" maxlength="20000" placeholder="문제 설명과 풀이에 필요한 정보를 입력하세요."></textarea></label>
+          <div class="wide-field file-field">
+            <span class="form-label">첨부 파일</span>
+            <label class="file-drop" id="file-drop" for="challenge-files">
+              <input class="sr-only" id="challenge-files" name="files" type="file" multiple>
+              <strong>파일 선택 또는 여기로 드래그</strong>
+              <span>실행 파일, 소스, 라이브러리, 이미지 등 여러 파일을 함께 추가할 수 있습니다.</span>
+            </label>
+            <ul class="file-list" id="file-list" aria-live="polite"></ul>
+          </div>
+          <button class="primary-button setup-submit wide-field" type="submit">등록하고 풀이 시작</button>
+        </form>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <aside class="detail-drawer" id="detail-drawer" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="drawer-title">
+    <button class="drawer-backdrop" id="drawer-backdrop" type="button" aria-label="상세 화면 닫기"></button>
+    <div class="drawer-panel">
+      <header class="drawer-header">
+        <div>
+          <p class="eyebrow" id="drawer-category">CHALLENGE</p>
+          <h2 id="drawer-title">문제 상세</h2>
+        </div>
+        <button class="icon-button" id="drawer-close" type="button" aria-label="상세 화면 닫기">×</button>
+      </header>
+      <div class="drawer-content" id="drawer-content"></div>
+    </div>
+  </aside>
+
+  <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script src="/assets/dashboard.js" defer></script>
+</body>
+</html>

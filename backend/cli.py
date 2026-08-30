@@ -10,6 +10,7 @@ from pathlib import Path
 import click
 from rich.console import Console
 
+from backend.codex_cli import CodexCLIError, prepare_codex_cli
 from backend.config import Settings
 from backend.models import DEFAULT_MODELS
 
@@ -35,11 +36,19 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--models", multiple=True, help="Model specs (default: all configured)")
 @click.option("--challenge", default=None, help="Solve a single challenge directory")
 @click.option("--challenges-dir", default="challenges", help="Directory for challenge files")
-@click.option("--no-submit", is_flag=True, help="Dry run — don't submit flags")
-@click.option("--coordinator-model", default=None, help="Model for coordinator (default: claude-opus-4-6)")
-@click.option("--coordinator", default="claude", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
+@click.option("--no-submit", is_flag=True, help="Dry run; don't submit flags")
+@click.option("--coordinator-model", default=None, help="Coordinator model (Codex default: gpt-5.6-terra)")
+@click.option("--coordinator", default="codex", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
 @click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
-@click.option("--msg-port", default=0, type=int, help="Operator message port (0 = auto)")
+@click.option(
+    "--dashboard-port",
+    "--msg-port",
+    "msg_port",
+    default=9400,
+    type=click.IntRange(0, 65535),
+    show_default=True,
+    help="Local dashboard and operator-message port (0 = auto)",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def main(
     ctfd_url: str | None,
@@ -55,7 +64,7 @@ def main(
     msg_port: int,
     verbose: bool,
 ) -> None:
-    """CTF Agent — multi-model solver swarm.
+    """CTF Agent: multi-model solver swarm.
 
     Run without --challenge to start the full coordinator (Ctrl+C to stop).
     """
@@ -71,16 +80,19 @@ def main(
     model_specs = list(models) if models else list(DEFAULT_MODELS)
 
     console.print("[bold]CTF Agent v2[/bold]")
-    console.print(f"  CTFd: {settings.ctfd_url}")
+    console.print(f"  CTFd: {settings.ctfd_url or 'not configured (standalone/dashboard setup)'}")
     console.print(f"  Models: {', '.join(model_specs)}")
     console.print(f"  Image: {settings.sandbox_image}")
     console.print(f"  Max challenges: {max_challenges}")
     console.print()
 
-    if challenge:
-        asyncio.run(_run_single(settings, challenge, model_specs, no_submit, max_challenges))
-    else:
-        asyncio.run(_run_coordinator(settings, model_specs, challenges_dir, no_submit, coordinator_model, coordinator, max_challenges, msg_port))
+    try:
+        if challenge:
+            asyncio.run(_run_single(settings, challenge, model_specs, no_submit, max_challenges))
+        else:
+            asyncio.run(_run_coordinator(settings, model_specs, challenges_dir, no_submit, coordinator_model, coordinator, max_challenges, msg_port))
+    except CodexCLIError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 async def _run_single(
@@ -96,6 +108,9 @@ async def _run_single(
     from backend.ctfd import CTFdClient
     from backend.prompts import ChallengeMeta
     from backend.sandbox import cleanup_orphan_containers, configure_semaphore
+
+    if any(spec.split("/", 1)[0] == "codex" for spec in model_specs):
+        await prepare_codex_cli(settings.codex_cli_path)
 
     max_containers = max_challenges * len(model_specs)
     configure_semaphore(max_containers)
@@ -125,7 +140,7 @@ async def _run_single(
         cost_tracker=cost_tracker,
         settings=settings,
         model_specs=model_specs,
-        no_submit=no_submit,
+        no_submit=no_submit or not ctfd.is_configured,
     )
 
     try:
@@ -157,10 +172,17 @@ async def _run_coordinator(
     """Run the full coordinator (continuous until Ctrl+C)."""
     from backend.sandbox import cleanup_orphan_containers, configure_semaphore
 
+    if coordinator_backend == "codex" or any(
+        spec.split("/", 1)[0] == "codex" for spec in model_specs
+    ):
+        await prepare_codex_cli(settings.codex_cli_path)
+
     max_containers = max_challenges * len(model_specs)
     configure_semaphore(max_containers)
     await cleanup_orphan_containers()
     console.print(f"[bold]Starting coordinator ({coordinator_backend}, Ctrl+C to stop)...[/bold]\n")
+    if msg_port:
+        console.print(f"  Dashboard: [link=http://127.0.0.1:{msg_port}]http://127.0.0.1:{msg_port}[/link]\n")
 
     if coordinator_backend == "codex":
         from backend.agents.codex_coordinator import run_codex_coordinator

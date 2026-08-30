@@ -7,7 +7,9 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # CTFd
-    ctfd_url: str = "http://localhost:8000"
+    # Empty means standalone mode. A CTFd instance can be connected later from
+    # the local dashboard or supplied through CTFD_URL/--ctfd-url.
+    ctfd_url: str = ""
     ctfd_user: str = "admin"
     ctfd_pass: str = "admin"
     ctfd_token: str = ""
@@ -23,6 +25,7 @@ class Settings(BaseSettings):
     azure_openai_endpoint: str = ""
     azure_openai_api_key: str = ""
     opencode_zen_api_key: str = ""
+    codex_cli_path: str = ""
 
     # Infra
     sandbox_image: str = "ctf-sandbox"

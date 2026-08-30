@@ -28,6 +28,7 @@ class CTFdPoller:
     _event_queue: asyncio.Queue[PollEvent] = field(default_factory=asyncio.Queue)
     _task: asyncio.Task | None = field(default=None, repr=False)
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
+    _last_error: str = ""
 
     async def start(self) -> None:
         """Do initial poll (silent — no events) and start the background loop."""
@@ -41,12 +42,23 @@ class CTFdPoller:
 
     async def _seed(self) -> None:
         """Initial fetch — just populate known state, no events."""
+        if not self.ctfd.is_configured:
+            self._known_challenges.clear()
+            self._known_solved.clear()
+            self._last_error = ""
+            return
         try:
             stubs = await self.ctfd.fetch_challenge_stubs()
             self._known_challenges = {ch["name"] for ch in stubs}
             self._known_solved = await self.ctfd.fetch_solved_names()
+            self._last_error = ""
         except Exception as e:
+            self._last_error = str(e)
             logger.warning("Initial poll error: %s", e)
+
+    async def reseed(self) -> None:
+        """Refresh known state after dashboard connection settings change."""
+        await self._seed()
 
     async def stop(self) -> None:
         self._stop.set()
@@ -82,7 +94,13 @@ class CTFdPoller:
     def known_solved(self) -> set[str]:
         return set(self._known_solved)
 
+    @property
+    def last_error(self) -> str:
+        return self._last_error
+
     async def _poll_once(self) -> None:
+        if not self.ctfd.is_configured:
+            return
         try:
             stubs = await self.ctfd.fetch_challenge_stubs()
             current_names = {ch["name"] for ch in stubs}
@@ -115,8 +133,10 @@ class CTFdPoller:
 
             self._known_challenges = current_names
             self._known_solved = current_solved
+            self._last_error = ""
 
         except Exception as e:
+            self._last_error = str(e)
             logger.warning(f"Poll error: {e}")
 
     async def _loop(self) -> None:

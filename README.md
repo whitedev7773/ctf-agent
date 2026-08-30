@@ -27,7 +27,7 @@ A **coordinator** LLM manages the competition while **solver swarms** attack ind
                                  |
                         +--------v--------+
                         | Coordinator LLM |
-                        | (Claude/Codex)  |
+                        | (Codex default) |
                         +--------+--------+
                                  |
               +------------------+------------------+
@@ -36,11 +36,9 @@ A **coordinator** LLM manages the competition while **solver swarms** attack ind
      | Swarm:          | | Swarm:         | | Swarm:         |
      | challenge-1     | | challenge-2    | | challenge-N    |
      |                 | |                | |                |
-     |  Opus (med)     | |  Opus (med)    | |                |
-     |  Opus (max)     | |  Opus (max)    | |     ...        |
-     |  GPT-5.4        | |  GPT-5.4       | |                |
-     |  GPT-5.4-mini   | |  GPT-5.4-mini  | |                |
-     |  GPT-5.3-codex  | |  GPT-5.3-codex | |                |
+     |  5.6 Sol        | |  5.6 Sol        | |                |
+     |  5.6 Terra      | |  5.6 Terra      | |     ...        |
+     |  5.6 Luna       | |  5.6 Luna       | |                |
      +--------+--------+ +--------+-------+ +----------------+
               |                    |
      +--------v--------+  +-------v--------+
@@ -56,6 +54,8 @@ Each solver runs in an isolated Docker container with CTF tools pre-installed. S
 
 ## Quick Start
 
+처음 설치하거나 실제 대회 운영 절차가 필요하면 [한국어 Codex 사용자 매뉴얼](docs/CODEX_USER_MANUAL.ko.md)을 먼저 확인하세요.
+
 ```bash
 # Install
 uv sync
@@ -63,40 +63,46 @@ uv sync
 # Build sandbox image
 docker build -f sandbox/Dockerfile.sandbox -t ctf-sandbox .
 
-# Configure credentials
+# Configure optional fallback credentials
 cp .env.example .env
-# Edit .env with your API keys and CTFd token
 
-# Run against a CTFd instance
+# Start the coordinator and dashboard
 uv run ctf-solve \
-  --ctfd-url https://ctf.example.com \
-  --ctfd-token ctfd_your_token \
   --challenges-dir challenges \
   --max-challenges 10 \
   -v
 ```
 
+Open the local operations dashboard at [http://127.0.0.1:9400](http://127.0.0.1:9400). Enter a CTFd URL and token there, or stay in standalone mode and register one local challenge with its description, connection details, and attachments. The dashboard also shows live solver status, traces, cost, and swarm controls.
+
+CTFd can still be configured ahead of time with `CTFD_URL`/`CTFD_TOKEN` or the `--ctfd-url`/`--ctfd-token` CLI options. It is no longer required.
+
+Use another port when needed:
+
+```bash
+uv run ctf-solve --dashboard-port 9500 ...
+```
+
 ## Coordinator Backends
 
 ```bash
-# Claude SDK coordinator (default)
-uv run ctf-solve --coordinator claude ...
-
-# Codex coordinator (GPT-5.4 via JSON-RPC)
+# Codex coordinator (default, GPT-5.6 Terra via JSON-RPC)
 uv run ctf-solve --coordinator codex ...
+
+# Claude SDK coordinator (optional)
+uv run ctf-solve --coordinator claude ...
 ```
 
 ## Solver Models
 
-Default model lineup (configurable in `backend/models.py`):
+Default model lineup, updated against OpenAI's model catalog on 2026-08-29
+(configurable in `backend/models.py`):
 
 | Model | Provider | Notes |
 |-------|----------|-------|
-| Claude Opus 4.6 (medium) | Claude SDK | Balanced speed/quality |
-| Claude Opus 4.6 (max) | Claude SDK | Deep reasoning |
-| GPT-5.4 | Codex | Best overall solver |
-| GPT-5.4-mini | Codex | Fast, good for easy challenges |
-| GPT-5.3-codex | Codex | Reasoning model (xhigh effort) |
+| GPT-5.6 Sol | Codex | Quality-first solver (`xhigh`) |
+| GPT-5.6 Terra | Codex | Balanced solver (`high`) |
+| GPT-5.6 Luna | Codex | Fast, cost-sensitive solver (`medium`) |
 
 ## Sandbox Tooling
 
@@ -130,8 +136,9 @@ cp .env.example .env
 ```
 
 ```env
-CTFD_URL=https://ctf.example.com
-CTFD_TOKEN=ctfd_your_token
+# Optional; these can instead be entered at runtime in the dashboard
+CTFD_URL=
+CTFD_TOKEN=
 ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
 GEMINI_API_KEY=...
@@ -143,9 +150,9 @@ All settings can also be passed as environment variables or CLI flags.
 
 - Python 3.14+
 - Docker
-- API keys for at least one provider (Anthropic, OpenAI, Google)
-- `codex` CLI (for Codex solver/coordinator)
-- `claude` CLI (bundled with claude-agent-sdk)
+- Authenticated `codex` CLI (default solver/coordinator)
+- `OPENAI_API_KEY` (optional, for Codex quota fallback)
+- `claude` CLI (optional Claude coordinator/solver)
 
 ## Acknowledgements
 

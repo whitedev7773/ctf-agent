@@ -26,11 +26,12 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-import yaml
-
 import aiohttp
+import yaml
 from bs4 import BeautifulSoup
 from markdownify import markdownify as html2md
+
+from backend.url_utils import same_origin
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.85 Safari/537.36"
 
@@ -294,7 +295,9 @@ async def save_challenge(
         fname = filename_from_url(raw_url)
         dest = distfiles_dir / fname
 
-        content = await fetch_bytes(session, url, extra_headers)
+        # Never forward a CTFd API token to an external attachment host.
+        download_headers = extra_headers if same_origin(url, base_url) else None
+        content = await fetch_bytes(session, url, download_headers)
         if content is None:
             print(f"    WARN: Could not download {url}", file=sys.stderr)
         else:

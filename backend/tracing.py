@@ -3,22 +3,29 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
+import re
 import time
 from pathlib import Path
 
 
 def _sanitize(s: str) -> str:
-    return s.replace("/", "_").replace(" ", "_")
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("._") or "item"
+    digest = hashlib.sha256(s.encode("utf-8")).hexdigest()[:8]
+    return f"{readable[:80]}-{digest}"
 
 
 class SolverTracer:
     """Append-only JSONL event tracer. Flushes every write for tail -f streaming."""
 
-    def __init__(self, challenge_name: str, model_id: str, log_dir: str = "logs") -> None:
+    def __init__(self, challenge_name: str, model_spec: str, log_dir: str = "logs") -> None:
         Path(log_dir).mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        self.path = str(Path(log_dir) / f"trace-{_sanitize(challenge_name)}-{_sanitize(model_id)}-{ts}.jsonl")
+        ts = f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1_000_000_000:09d}"
+        self.path = str(
+            Path(log_dir)
+            / f"trace-{_sanitize(challenge_name)}-{_sanitize(model_spec)}-{ts}.jsonl"
+        )
         self._fh = open(self.path, "a")
         atexit.register(self._close)
 

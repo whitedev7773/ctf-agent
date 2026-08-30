@@ -20,6 +20,7 @@ from backend.agents.coordinator_core import (
     do_submit_flag,
 )
 from backend.agents.coordinator_loop import build_deps, run_event_loop
+from backend.codex_cli import prepare_codex_cli
 from backend.config import Settings
 from backend.deps import CoordinatorDeps
 
@@ -137,7 +138,7 @@ COORDINATOR_TOOLS = [
 class CodexCoordinator:
     """Coordinator using Codex App Server JSON-RPC."""
 
-    def __init__(self, deps: CoordinatorDeps, model: str = "gpt-5.4") -> None:
+    def __init__(self, deps: CoordinatorDeps, model: str = "gpt-5.6-terra") -> None:
         self.deps = deps
         self.model = model
         self._proc: asyncio.subprocess.Process | None = None
@@ -148,8 +149,11 @@ class CodexCoordinator:
         self._turn_error: str | None = None
 
     async def start(self) -> None:
+        codex_executable = await prepare_codex_cli(
+            getattr(self.deps.settings, "codex_cli_path", ""),
+        )
         self._proc = await asyncio.create_subprocess_exec(
-            "codex", "app-server",
+            codex_executable, "app-server",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -164,7 +168,6 @@ class CodexCoordinator:
 
         resp = await self._rpc("thread/start", {
             "model": self.model,
-            "personality": "pragmatic",
             "baseInstructions": COORDINATOR_PROMPT,
             "cwd": ".",
             "approvalPolicy": "on-request",
@@ -185,6 +188,7 @@ class CodexCoordinator:
         await self._rpc("turn/start", {
             "threadId": self._thread_id,
             "input": [{"type": "text", "text": message}],
+            "effort": "medium",
         })
 
         try:
@@ -336,7 +340,7 @@ async def run_codex_coordinator(
     )
     deps.msg_port = msg_port
 
-    resolved_model = coordinator_model or "gpt-5.4"
+    resolved_model = coordinator_model or "gpt-5.6-terra"
     coordinator = CodexCoordinator(deps, model=resolved_model)
     await coordinator.start()
 

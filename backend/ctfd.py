@@ -6,8 +6,11 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
+
+from backend.url_utils import same_origin
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +26,7 @@ class SubmitResult:
 
 @dataclass
 class CTFdClient:
-    base_url: str = "http://localhost:8000"
+    base_url: str = ""
     token: str = ""
     username: str = "admin"
     password: str = "admin"
@@ -33,7 +36,43 @@ class CTFdClient:
     _logged_in: bool = False
     _challenge_ids: dict[str, int] = field(default_factory=dict)
 
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.base_url.strip())
+
+    @staticmethod
+    def normalize_url(value: str) -> str:
+        url = value.strip().rstrip("/")
+        if not url:
+            return ""
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("CTFd URL must be an absolute http:// or https:// URL")
+        if parsed.query or parsed.fragment:
+            raise ValueError("CTFd URL must not contain a query string or fragment")
+        return url
+
+    async def configure(
+        self,
+        base_url: str,
+        token: str = "",
+        username: str = "",
+        password: str = "",
+    ) -> None:
+        """Replace connection settings and discard the previous HTTP session."""
+        normalized = self.normalize_url(base_url)
+        await self.close()
+        self.base_url = normalized
+        self.token = token.strip()
+        self.username = username.strip()
+        self.password = password
+        self._csrf_token = ""
+        self._logged_in = False
+        self._challenge_ids.clear()
+
     async def _ensure_client(self) -> httpx.AsyncClient:
+        if not self.is_configured:
+            raise RuntimeError("CTFd is not configured; running in standalone mode")
         if self._client is None:
             # verify=False: CTFd instances often use self-signed certs or HTTP.
             # This is a CTF tool, not production infrastructure.
@@ -48,6 +87,9 @@ class CTFdClient:
 
     async def _ensure_logged_in(self) -> None:
         if self._logged_in or self.token:
+            return
+        if not self.username or not self.password:
+            # Public CTFd APIs may allow challenge reads without authentication.
             return
         client = await self._ensure_client()
 
@@ -223,8 +265,8 @@ class CTFdClient:
             dest = dist_dir / fname
             if not dest.exists():
                 try:
-                    # Only send auth headers to our CTFd server
-                    headers = self._base_headers() if urlparse(url).hostname == urlparse(self.base_url).hostname else {}
+                    # Only send auth headers back to the exact CTFd origin.
+                    headers = self._base_headers() if same_origin(url, self.base_url) else {}
                     resp = await client.get(
                         url, headers=headers,
                         follow_redirects=True, timeout=60.0,
@@ -273,3 +315,4 @@ class CTFdClient:
     async def close(self) -> None:
         if self._client:
             await self._client.aclose()
+            self._client = None
