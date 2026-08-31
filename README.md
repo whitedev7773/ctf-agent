@@ -110,13 +110,14 @@ Each solver gets an isolated Docker container pre-loaded with CTF tools:
 
 | Category | Tools |
 |----------|-------|
-| **Binary** | radare2, GDB, objdump, binwalk, strings, readelf |
-| **Pwn** | pwntools, ROPgadget, angr, unicorn, capstone |
+| **Binary** | radare2, GDB/gdb-multiarch, QEMU user emulation, pyghidra, LIEF |
+| **Pwn** | pwntools, ROPgadget/ropper, angr, one_gadget, patchelf, capstone/keystone |
 | **Crypto** | SageMath, RsaCtfTool, z3, gmpy2, pycryptodome, cado-nfs |
-| **Forensics** | volatility3, Sleuthkit (mmls/fls/icat), foremost, exiftool |
+| **Forensics** | volatility3, Sleuthkit, tshark, YARA, foremost, exiftool |
 | **Stego** | steghide, stegseek, zsteg, ImageMagick, tesseract OCR |
-| **Web** | curl, nmap, Python requests, flask |
-| **Misc** | ffmpeg, sox, Pillow, numpy, scipy, PyTorch, podman |
+| **Web** | Playwright/Chromium, curl, nmap, socat, requests/WebSocket tooling |
+| **Mobile/Web3** | apktool, androguard, web3.py, eth-abi |
+| **Misc** | ffmpeg, sox, Scapy, Pillow, PyTorch, podman |
 
 ## Features
 
@@ -124,6 +125,10 @@ Each solver gets an isolated Docker container pre-loaded with CTF tools:
 - **Auto-spawn** — new challenges detected and attacked automatically
 - **Coordinator LLM** — reads solver traces, crafts targeted technical guidance
 - **Cross-solver insights** — findings shared between models via message bus
+- **Specialist lanes** — rapid triage, systematic validation, and deep exploitation prompts per model
+- **Category playbooks** — Pwn, reversing, crypto, web, forensics, and misc-specific workflows
+- **Persistent recovery** — exploits, scripts, notes, and checkpoints survive container restarts
+- **Hard budgets** — bounded attempts, runtime, turns, tool steps, tokens, commands, and submissions
 - **Docker sandboxes** — isolated containers with full CTF tooling
 - **Operator messaging** — send hints to running solvers mid-competition
 
@@ -142,6 +147,9 @@ CTFD_TOKEN=
 ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
 GEMINI_API_KEY=...
+ENABLE_API_FALLBACK=false
+MAX_CONCURRENT_CHALLENGES=1
+CONTAINER_MEMORY_LIMIT=4g
 ```
 
 All settings can also be passed as environment variables or CLI flags.

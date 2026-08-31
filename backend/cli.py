@@ -39,7 +39,12 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--no-submit", is_flag=True, help="Dry run; don't submit flags")
 @click.option("--coordinator-model", default=None, help="Coordinator model (Codex default: gpt-5.6-terra)")
 @click.option("--coordinator", default="codex", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
-@click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
+@click.option(
+    "--max-challenges",
+    default=None,
+    type=click.IntRange(1, 100),
+    help="Max challenges solved concurrently (default: env setting or 1)",
+)
 @click.option(
     "--dashboard-port",
     "--msg-port",
@@ -60,7 +65,7 @@ def main(
     no_submit: bool,
     coordinator_model: str | None,
     coordinator: str,
-    max_challenges: int,
+    max_challenges: int | None,
     msg_port: int,
     verbose: bool,
 ) -> None:
@@ -75,7 +80,9 @@ def main(
         settings.ctfd_url = ctfd_url
     if ctfd_token:
         settings.ctfd_token = ctfd_token
-    settings.max_concurrent_challenges = max_challenges
+    if max_challenges is not None:
+        settings.max_concurrent_challenges = max_challenges
+    max_challenges = settings.max_concurrent_challenges
 
     model_specs = list(models) if models else list(DEFAULT_MODELS)
 

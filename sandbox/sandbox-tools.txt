@@ -7,6 +7,8 @@ nc (netcat)        TCP/UDP connections. nc host port <<'EOF' for heredoc session
 curl               HTTP client. -s silent, -k skip TLS, -d data, -H header.
 wget               HTTP download. wget -O file url.
 nmap               Port scanner. nmap -sV host, nmap -p- host.
+socat              Stateful TCP/UDP relay and PTY bridge.
+tcpdump / tshark   Packet capture and scripted protocol analysis.
 
 == BINARY ANALYSIS ==
 file               Identify file type. file binary
@@ -23,6 +25,10 @@ gdb                GNU debugger. gdb binary, then run, break, info, x/...
 ltrace             Library call tracer. ltrace ./binary
 strace             System call tracer. strace ./binary
 radare2            Reverse engineering. r2 binary, then aaa; pdf @main; afl
+gdb-multiarch      Debug foreign-architecture targets with QEMU user emulation.
+qemu-*-static      Execute ARM/AArch64/MIPS/etc. Linux binaries under emulation.
+patchelf           Change ELF interpreter/RPATH for supplied loader and libc.
+one_gadget         Enumerate constrained libc one-shot execution gadgets.
 
 == STEGANOGRAPHY ==
 steghide           Embed/extract in JPEG/BMP/WAV. steghide extract -sf file.jpg
@@ -51,6 +57,8 @@ xfs_db             XFS debugger. xfs_db -c "sb 0" -c "p" disk.img
 xfs_repair         XFS repair. xfs_repair -n disk.img (read-only check).
 dcfldd             Forensic dd with hashing. dcfldd if=in of=out hash=md5
 volatility3        Memory forensics. vol -f memdump.raw windows.info
+yara               Signature and structural scanning across recovered files.
+tshark             PCAP filtering, stream extraction and protocol statistics.
 
 == CRYPTOGRAPHY ==
 openssl            Crypto swiss army knife. openssl enc, openssl rsa, openssl s_client
@@ -60,11 +68,13 @@ sage               SageMath CAS. sage -c 'from sage.all import *; print(factor(n
                    LLL lattice: sage -c 'M=matrix(ZZ,[...]); print(M.LLL())'
 cado-nfs           Number Field Sieve (large factoring/DLP). cado-nfs <N>
 flatter            Fast LLL lattice reduction. flatter < input_matrix
+john / hashcat     Password and hash recovery (CPU/OpenCL availability dependent).
 
 == BUILD TOOLS ==
 gcc / g++          C/C++ compiler. gcc -o exploit exploit.c
 make / cmake       Build systems.
 jq                 JSON processor. cat file.json | jq '.key'
+apktool            Decode/rebuild Android APK resources and smali.
 
 == ARCHIVE ==
 zip / unzip        ZIP archives.
@@ -96,6 +106,15 @@ numpy              Numerical arrays. np.frombuffer, np.bitwise_xor.
 requests           HTTP client. requests.get(url), requests.post(url, data=...).
 flask              HTTP server. Quick listeners for callbacks.
 volatility3        Memory forensics framework (Python API).
+lief               Parse and patch ELF/PE/Mach-O binaries.
+ropper             ROP/JOP gadget discovery and semantic search.
+scapy              Packet crafting and PCAP/protocol automation.
+pyelftools         Scriptable ELF/DWARF parsing.
+keystone-engine    Multi-architecture assembler.
+websocket-client   Stateful WebSocket challenge automation.
+playwright         Headless Chromium automation for JavaScript and bot challenges.
+androguard         Programmatic APK/DEX parsing and Android analysis.
+web3 / eth-abi     Smart-contract RPC, ABI and calldata automation.
 torch              PyTorch (CPU). import torch — tensors, neural nets, ML inference.
 keras              Keras deep learning. import keras — model loading, inference.
 PyJWT              JWT encode/decode. import jwt; jwt.encode(payload, key, algorithm='HS256')

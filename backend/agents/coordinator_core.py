@@ -128,6 +128,15 @@ async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) 
         return f'LOCAL CANDIDATE — recorded "{candidate}" for {challenge_name}'
     if deps.no_submit:
         return f'DRY RUN — would submit "{flag.strip()}" for {challenge_name}'
+    swarm = deps.swarms.get(challenge_name)
+    if swarm:
+        display, _ = await swarm.try_submit_flag(flag, "operator/coordinator")
+        return display
+    from backend.flag_format import flag_matches_format
+    meta = deps.challenge_metas.get(challenge_name)
+    format_hint = getattr(meta, "flag_format", "") if meta else ""
+    if not flag_matches_format(flag, format_hint):
+        return f'REJECTED — candidate does not match flag format "{format_hint}".'
     try:
         result = await deps.ctfd.submit_flag(challenge_name, flag)
         return result.display

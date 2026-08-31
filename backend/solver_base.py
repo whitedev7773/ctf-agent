@@ -11,6 +11,7 @@ GAVE_UP = "gave_up"
 CANCELLED = "cancelled"
 ERROR = "error"
 QUOTA_ERROR = "quota_error"
+BUDGET_EXHAUSTED = "budget_exhausted"
 
 # Flag confirmation markers from CTFd
 CORRECT_MARKERS = ("CORRECT", "ALREADY SOLVED")
@@ -29,6 +30,9 @@ class SolverResult:
     step_count: int
     cost_usd: float
     log_path: str
+    stop_reason: str = ""
+    workspace_path: str = ""
+    attempt: int = 0
 
 
 class SolverProtocol(Protocol):

@@ -14,6 +14,7 @@ from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.toolsets.abstract import ToolsetTool
 from pydantic_ai.toolsets.wrapper import WrapperToolset
 
+from backend.artifacts import solver_workspace_path
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.deps import SolverDeps
@@ -136,10 +137,15 @@ class Solver:
         self.cancel_event = cancel_event or asyncio.Event()
         self._owns_sandbox = owns_sandbox if owns_sandbox is not None else (sandbox is None)
 
+        workspace_dir = solver_workspace_path(settings, meta.name, model_spec)
         self.sandbox = sandbox or DockerSandbox(
             image=getattr(settings, "sandbox_image", "ctf-sandbox"),
             challenge_dir=challenge_dir,
             memory_limit=getattr(settings, "container_memory_limit", "4g"),
+            cpu_limit=getattr(settings, "container_cpu_limit", 2.0),
+            max_exec_timeout_s=getattr(settings, "max_command_timeout_seconds", 600),
+            workspace_dir=workspace_dir,
+            keep_workspace=True,
         )
         self.use_vision = supports_vision(model_spec)
         self.deps = SolverDeps(
@@ -175,6 +181,7 @@ class Solver:
             self.meta,
             distfile_names,
             container_arch=container_arch,
+            model_spec=self.model_spec,
         )
 
         model = resolve_model(self.model_spec, self.settings)
@@ -206,8 +213,6 @@ class Solver:
         assert self._agent is not None
 
         t0 = time.monotonic()
-        steps_before = self._step_count[0]
-
         try:
             from pydantic_ai.usage import UsageLimits
             result = await self._agent.run(

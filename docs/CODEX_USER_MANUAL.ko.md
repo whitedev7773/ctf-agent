@@ -120,9 +120,11 @@ CTFD_TOKEN=
 
 # Codex quota 소진 시 direct OpenAI API fallback을 사용할 때만 입력
 OPENAI_API_KEY=
+ENABLE_API_FALLBACK=false
 
 # 선택 사항
-CONTAINER_MEMORY_LIMIT=8g
+CONTAINER_MEMORY_LIMIT=4g
+MAX_CONCURRENT_CHALLENGES=1
 ```
 
 주요 설정은 다음과 같다.
@@ -135,7 +137,19 @@ CONTAINER_MEMORY_LIMIT=8g
 | `CTFD_PASS` | `admin` | token이 없을 때 로그인 비밀번호 |
 | `OPENAI_API_KEY` | 빈 값 | Codex quota fallback용 API key |
 | `SANDBOX_IMAGE` | `ctf-sandbox` | 사용할 Docker image |
-| `CONTAINER_MEMORY_LIMIT` | `16g` | solver 컨테이너 하나의 memory limit |
+| `CONTAINER_MEMORY_LIMIT` | `4g` | solver 컨테이너 하나의 memory limit |
+| `CONTAINER_CPU_LIMIT` | `2.0` | solver 컨테이너 하나의 CPU limit |
+| `MAX_CONCURRENT_CHALLENGES` | `1` | 동시에 실행할 문제 swarm 수 |
+| `WORKSPACE_ROOT` | `workspace` | 영구 exploit·solver·checkpoint 저장 경로 |
+| `SOLVER_TURN_TIMEOUT_SECONDS` | `1800` | model turn 하나의 최대 실행 시간 |
+| `SOLVER_MAX_RUNTIME_SECONDS` | `7200` | solver 하나의 전체 최대 실행 시간 |
+| `MAX_ATTEMPTS_PER_CHALLENGE` | `3` | solver별 최대 시도 횟수 |
+| `SOLVER_MAX_STEPS` | `240` | solver별 최대 tool step 수 |
+| `SOLVER_MAX_TOKENS` | `1000000` | solver별 누적 token 상한; `0`이면 비활성화 |
+| `SOLVER_MAX_ESTIMATED_COST_USD` | `0` | solver별 추정 비용 상한; `0`이면 비활성화 |
+| `MAX_FLAG_SUBMISSIONS_PER_CHALLENGE` | `8` | 문제별 live flag 제출 최대 횟수 |
+| `MAX_COMMAND_TIMEOUT_SECONDS` | `600` | container 명령 하나의 최대 실행 시간 |
+| `ENABLE_API_FALLBACK` | `false` | quota 소진 후 사용량 과금 API로 전환할지 여부 |
 
 CTFd를 사용할 때는 token 방식을 권장한다. URL과 token은 실행 후 대시보드에서도 입력할 수 있으며 이 값은 현재 프로세스에만 적용된다. `.env`와 Codex 인증 캐시는 비밀 정보이며 저장소에 commit하거나 대회 채팅에 공유하지 않는다.
 
@@ -211,7 +225,7 @@ tags:
 hints: []
 ```
 
-`distfiles/`는 컨테이너의 `/challenge/distfiles`에 read-only로 mount된다. Solver가 만든 exploit과 중간 파일은 `/challenge/workspace`에 기록되지만 이 workspace는 solver 종료 시 삭제되는 임시 디렉터리다. 현재 기본 동작에서는 exploit 파일이 영구 보존되지 않으므로 필요한 명령과 단서는 trace에서 회수해야 한다.
+`distfiles/`는 컨테이너의 `/challenge/distfiles`에 read-only로 mount된다. Solver가 만든 exploit과 중간 파일은 `/challenge/workspace`에 기록되고 호스트의 `workspace/<challenge>/<model>/`에 영구 보존된다. 각 경로의 `.ctf-agent-state.json`에는 마지막 상태, 시도, step, token, 추정 비용과 종료 사유가 저장된다. 같은 문제와 model을 다시 실행하면 기존 산출물을 이어서 사용할 수 있다.
 
 ## 8. 실행 방법
 
@@ -248,12 +262,12 @@ uv run ctf-solve `
   --challenges-dir challenges `
   --coordinator codex `
   --coordinator-model gpt-5.6-terra `
-  --max-challenges 3 `
+  --max-challenges 1 `
   --dashboard-port 9400 `
   -v
 ```
 
-대회 첫 운영에서는 `--max-challenges 2` 또는 `3`으로 시작하고 CPU, RAM, Docker 상태와 Codex quota를 확인한 후 늘리는 것을 권장한다.
+16GB PC에서는 `--max-challenges 1`로 시작한다. 가벼운 Web/Misc 문제에서 CPU, RAM, Docker 상태와 Codex quota를 확인한 뒤에만 `2` 이상으로 늘린다.
 
 ### 8.3 모델을 직접 선택하기
 
@@ -293,7 +307,7 @@ codex/<model-id>/<reasoning-effort>
 최대 solver 컨테이너 수 = --max-challenges × --models 개수
 ```
 
-기본 모델 3개와 `--max-challenges 10`을 사용하면 최대 30개 컨테이너가 실행될 수 있다. 각 컨테이너는 기본적으로 CPU 2개와 memory limit 16GB를 갖는다. Memory limit는 예약량은 아니지만 동시에 무거운 angr, SageMath, Ghidra 작업이 실행되면 호스트가 빠르게 부족해질 수 있다.
+기본 모델 3개와 기본 `--max-challenges 1`을 사용하면 최대 3개 컨테이너가 실행된다. 각 컨테이너는 기본적으로 CPU 2개와 memory limit 4GB를 갖는다. `--max-challenges 10`으로 올리면 최대 30개 컨테이너가 열릴 수 있으므로 대형 서버가 아니라면 사용하지 않는다. Memory limit는 예약량은 아니지만 동시에 무거운 angr, SageMath, Ghidra 작업이 실행되면 호스트가 빠르게 부족해질 수 있다.
 
 일반적인 출발점:
 
@@ -379,6 +393,8 @@ Message endpoint는 대시보드와 같은 `127.0.0.1:9400`을 사용한다. 운
 
 - `--no-submit`이면 실제 제출하지 않는다.
 - 같은 flag는 swarm 전체에서 중복 제출하지 않는다.
+- 입력한 flag 형식(`cce2026{...}` 등)에 맞지 않는 후보는 CTFd 전송 전에 거부한다.
+- 문제별 live 제출은 기본 8회로 제한한다.
 - 오답 제출 후 model별 cooldown이 `0, 30, 120, 300, 600초` 순으로 증가한다.
 - 한 solver의 flag가 정답으로 확인되면 해당 문제의 나머지 solver가 취소된다.
 
@@ -388,7 +404,7 @@ Message endpoint는 대시보드와 같은 `127.0.0.1:9400`을 사용한다. 운
 
 Codex solver는 기본적으로 현재 Codex CLI 로그인 세션을 사용한다. ChatGPT 로그인은 해당 구독/workspace의 Codex 사용 정책을 따르고, API key 로그인은 OpenAI Platform 사용량 기반 과금을 따른다.
 
-Codex quota 관련 오류가 감지되면 다음 direct API fallback을 시도한다.
+Codex quota 관련 오류가 감지되어도 기본적으로 solver를 중단하며 유료 API로 자동 전환하지 않는다. `.env`에서 `ENABLE_API_FALLBACK=true`를 명시한 경우에만 다음 direct API fallback을 시도한다.
 
 | Codex 모델 | Fallback |
 |---|---|
@@ -396,7 +412,7 @@ Codex quota 관련 오류가 감지되면 다음 direct API fallback을 시도�
 | `codex/gpt-5.6-terra/*` | `openai/gpt-5.6-terra` |
 | `codex/gpt-5.6-luna/*` | `openai/gpt-5.6-luna` |
 
-Fallback을 실제로 사용하려면 `.env`에 유효한 `OPENAI_API_KEY`가 필요하다. 키가 없으면 Codex quota 소진 후 fallback도 실패한다. 비용 표시는 App Server가 보낸 token usage와 내장 가격표를 기반으로 한 추정치이며 최종 청구서와 다를 수 있다.
+Fallback을 실제로 사용하려면 `ENABLE_API_FALLBACK=true`와 유효한 `OPENAI_API_KEY`가 모두 필요하며, 이때는 사용량 기반 API 요금이 실제로 발생한다. 비용 표시는 App Server가 보낸 token usage와 내장 가격표를 기반으로 한 추정치이며 최종 청구서와 다를 수 있다.
 
 비용과 quota를 줄이는 가장 효과적인 방법은 다음과 같다.
 
@@ -407,7 +423,7 @@ Fallback을 실제로 사용하려면 `.env`에 유효한 `OPENAI_API_KEY`가 �
 
 ## 12. 종료와 재시작
 
-정상 종료는 실행 터미널에서 `Ctrl+C`를 사용한다. Coordinator는 poller와 swarm을 중단하고 Docker 컨테이너를 정리한다.
+정상 종료는 실행 터미널에서 `Ctrl+C`를 사용한다. Coordinator는 poller와 swarm을 중단하고 Docker 컨테이너를 정리한다. `workspace/`의 분석 산출물과 `.ctf-agent-state.json`은 삭제하지 않으므로 재실행하거나 사람이 직접 이어서 분석할 수 있다.
 
 강제 종료로 컨테이너가 남았는지 확인하려면 다음을 사용한다.
 

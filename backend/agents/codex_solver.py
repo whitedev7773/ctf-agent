@@ -20,8 +20,9 @@ import logging
 import time
 from typing import Any
 
-from backend.cost_tracker import CostTracker
+from backend.artifacts import solver_workspace_path
 from backend.codex_cli import prepare_codex_cli
+from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.loop_detect import LoopDetector
 from backend.model_specs import effort_from_spec
@@ -160,6 +161,10 @@ class CodexSolver:
             image=getattr(settings, "sandbox_image", "ctf-sandbox"),
             challenge_dir=challenge_dir,
             memory_limit=getattr(settings, "container_memory_limit", "4g"),
+            cpu_limit=getattr(settings, "container_cpu_limit", 2.0),
+            max_exec_timeout_s=getattr(settings, "max_command_timeout_seconds", 600),
+            workspace_dir=solver_workspace_path(settings, meta.name, model_spec),
+            keep_workspace=True,
         )
         self.use_vision = supports_vision(model_spec)
         self.loop_detector = LoopDetector()
@@ -195,6 +200,7 @@ class CodexSolver:
         system_prompt = build_prompt(
             self.meta, distfile_names, container_arch=container_arch,
             has_named_tools=True,
+            model_spec=self.model_spec,
         )
 
         codex_executable = await prepare_codex_cli(
@@ -366,15 +372,19 @@ class CodexSolver:
                 # Proactive compaction at 70% context window (only for small-context models like spark)
                 context_window = token_usage.get("modelContextWindow")
                 total_tokens = total.get("totalTokens", 0)
-                if context_window and context_window < 200_000 and total_tokens > context_window * 0.7:
-                    if not self._compact_requested:
-                        self._compact_requested = True
-                        logger.info(f"[{self.agent_name}] Requesting compaction ({total_tokens}/{context_window} tokens)")
-                        try:
-                            await self._rpc("thread/compact/start", {"threadId": self._thread_id})
-                            self.tracer.event("compact_requested", tokens=total_tokens, window=context_window)
-                        except Exception as e:
-                            logger.warning(f"[{self.agent_name}] Compaction request failed: {e}")
+                if (
+                    context_window
+                    and context_window < 200_000
+                    and total_tokens > context_window * 0.7
+                    and not self._compact_requested
+                ):
+                    self._compact_requested = True
+                    logger.info(f"[{self.agent_name}] Requesting compaction ({total_tokens}/{context_window} tokens)")
+                    try:
+                        await self._rpc("thread/compact/start", {"threadId": self._thread_id})
+                        self.tracer.event("compact_requested", tokens=total_tokens, window=context_window)
+                    except Exception as e:
+                        logger.warning(f"[{self.agent_name}] Compaction request failed: {e}")
 
                 self.cost_tracker.record_tokens(
                     self.agent_name, self.model_id,
@@ -440,7 +450,11 @@ class CodexSolver:
 
     async def _exec_tool(self, name: str, args: dict) -> str | tuple[bytes, str]:
         if name == "bash":
-            return await do_bash(self.sandbox, args.get("command", ""), args.get("timeout_seconds", 60))
+            try:
+                timeout = int(args.get("timeout_seconds", 60) or 60)
+            except (TypeError, ValueError):
+                timeout = 60
+            return await do_bash(self.sandbox, args.get("command", ""), timeout)
         elif name == "read_file":
             return str(await do_read_file(self.sandbox, args.get("path", "")))
         elif name == "write_file":
@@ -521,12 +535,11 @@ class CodexSolver:
                     return self._result(QUOTA_ERROR)
                 return self._result(ERROR)
 
-            if self._structured_output:
-                if self._structured_output.get("type") == "flag_found":
-                    self._flag = self._structured_output.get("flag")
-                    self._findings = f"Flag found via {self._structured_output.get('method', '?')}: {self._flag}"
-                    if self.no_submit:
-                        self._confirmed = True
+            if self._structured_output and self._structured_output.get("type") == "flag_found":
+                self._flag = self._structured_output.get("flag")
+                self._findings = f"Flag found via {self._structured_output.get('method', '?')}: {self._flag}"
+                if self.no_submit:
+                    self._confirmed = True
 
             if self._confirmed and self._flag:
                 return self._result(FLAG_FOUND)

@@ -99,7 +99,16 @@ function statusLabel(status) {
 }
 
 function agentStatusLabel(status) {
-  return { running: "RUNNING", won: "WINNER", finished: "FINISHED" }[status] || status;
+  return {
+    running: "RUNNING",
+    won: "WINNER",
+    finished: "FINISHED",
+    budget_exhausted: "BUDGET STOP",
+    error: "ERROR",
+    quota_error: "QUOTA STOP",
+    cancelled: "CANCELLED",
+    gave_up: "STOPPED",
+  }[status] || status;
 }
 
 async function api(path, options = {}) {
@@ -316,6 +325,8 @@ function renderDrawer() {
     );
     card.append(header, stats);
     if (agent.findings) card.append(node("p", "agent-findings", agent.findings));
+    if (agent.stop_reason) card.append(node("p", "agent-stop-reason", `종료 사유: ${agent.stop_reason}`));
+    if (agent.workspace_path) card.append(node("p", "agent-workspace", `산출물: ${agent.workspace_path}`));
     const traceButton = button("최근 trace 보기 →", "trace-button", () => loadTrace(challenge.name, agent.model_spec, card));
     card.append(traceButton);
     agentsSection.append(card);

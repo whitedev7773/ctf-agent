@@ -207,7 +207,11 @@ class DashboardServer:
             if swarm:
                 for spec in swarm.model_specs:
                     solver = swarm.solvers.get(spec)
-                    running = solver is not None and is_active
+                    outcome = swarm.outcomes.get(spec)
+                    running = solver is not None and is_active and outcome is None
+                    raw_steps = getattr(solver, "_step_count", 0) if solver else 0
+                    if isinstance(raw_steps, list):
+                        raw_steps = raw_steps[0] if raw_steps else 0
                     usage = _usage_payload(
                         self.cost_tracker,
                         solver_agent_name(name, spec),
@@ -216,11 +220,19 @@ class DashboardServer:
                         {
                             "model_spec": spec,
                             "status": "running" if running else (
-                                "won" if swarm.winner and swarm.winner.flag else "finished"
+                                "won" if swarm.winner and swarm.winner.flag else (
+                                    outcome.status if outcome else "finished"
+                                )
                             ),
-                            "steps": getattr(solver, "_step_count", 0) if solver else 0,
+                            "steps": raw_steps,
                             "findings": swarm.findings.get(spec, ""),
                             "trace": Path(getattr(getattr(solver, "tracer", None), "path", "")).name,
+                            "stop_reason": outcome.stop_reason if outcome else "",
+                            "attempt": outcome.attempt if outcome else 0,
+                            "workspace_path": (
+                                outcome.workspace_path if outcome and outcome.workspace_path
+                                else getattr(getattr(solver, "sandbox", None), "workspace_dir", "")
+                            ),
                             **usage,
                         }
                     )
@@ -262,6 +274,15 @@ class DashboardServer:
             },
             "models": self.deps.model_specs,
             "max_concurrent_challenges": self.deps.max_concurrent_challenges,
+            "runtime_policy": {
+                "max_attempts": getattr(self.deps.settings, "max_attempts_per_challenge", 3),
+                "turn_timeout_seconds": getattr(self.deps.settings, "solver_turn_timeout_seconds", 1800),
+                "max_runtime_seconds": getattr(self.deps.settings, "solver_max_runtime_seconds", 7200),
+                "max_steps": getattr(self.deps.settings, "solver_max_steps", 240),
+                "max_tokens": getattr(self.deps.settings, "solver_max_tokens", 1_000_000),
+                "max_submissions": getattr(self.deps.settings, "max_flag_submissions_per_challenge", 8),
+                "workspace_root": str(getattr(self.deps.settings, "workspace_root", "workspace")),
+            },
             "stats": {
                 "total": len(known),
                 "solved": len(solved),

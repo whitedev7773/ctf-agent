@@ -178,6 +178,9 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .agent-model { max-width: 350px; overflow: hidden; font: 400 13px/1.45 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .agent-stats { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; color: var(--muted); font: 400 12px/1.45 var(--mono); }
 .agent-findings { margin: 12px 0 0; color: var(--ink-secondary); font-size: 13px; line-height: 1.55; white-space: pre-wrap; }
+.agent-stop-reason,
+.agent-workspace { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: var(--canvas-soft); color: var(--ink-secondary); font: 500 12px/1.45 var(--mono); overflow-wrap: anywhere; }
+.agent-stop-reason { border-left: 3px solid var(--ink); }
 .trace-button { margin-top: 12px; padding: 0; border: 0; color: var(--ink); background: transparent; cursor: pointer; font-size: 13px; font-weight: 500; text-decoration: underline; text-underline-offset: 3px; }
 .trace-output { max-height: 320px; overflow: auto; margin: 12px 0 0; padding: 16px; border-radius: var(--radius-sm); color: var(--canvas); background: var(--night); font: 400 12px/1.5 var(--mono); white-space: pre-wrap; }
 .drawer-form { display: grid; gap: 8px; }

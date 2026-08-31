@@ -26,11 +26,26 @@ class Settings(BaseSettings):
     azure_openai_api_key: str = ""
     opencode_zen_api_key: str = ""
     codex_cli_path: str = ""
+    enable_api_fallback: bool = False
 
     # Infra
     sandbox_image: str = "ctf-sandbox"
-    max_concurrent_challenges: int = 10
+    # Desktop-safe default: one three-agent swarm at a time. Override explicitly
+    # on a larger contest workstation.
+    max_concurrent_challenges: int = 1
     max_attempts_per_challenge: int = 3
-    container_memory_limit: str = "16g"
+    container_memory_limit: str = "4g"
+    container_cpu_limit: float = 2.0
+    workspace_root: str = "workspace"
+
+    # Per-solver hard budgets. Zero disables token/cost limits only; time, step,
+    # and attempt limits stay mandatory so a wedged model cannot run forever.
+    solver_turn_timeout_seconds: int = 1800
+    solver_max_runtime_seconds: int = 7200
+    solver_max_steps: int = 240
+    solver_max_tokens: int = 1_000_000
+    solver_max_estimated_cost_usd: float = 0.0
+    max_flag_submissions_per_challenge: int = 8
+    max_command_timeout_seconds: int = 600
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

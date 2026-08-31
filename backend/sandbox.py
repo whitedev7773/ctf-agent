@@ -82,7 +82,10 @@ class DockerSandbox:
     image: str
     challenge_dir: str
     memory_limit: str = "16g"
+    cpu_limit: float = 2.0
+    max_exec_timeout_s: int = 600
     workspace_dir: str = ""
+    keep_workspace: bool = False
     _container: Any = field(default=None, repr=False)
     _docker: Any = field(default=None, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -111,7 +114,12 @@ class DockerSandbox:
         async with sem:
             self._docker = aiodocker.Docker()
 
-            self.workspace_dir = tempfile.mkdtemp(prefix="ctf-workspace-")
+            if self.workspace_dir:
+                workspace = Path(self.workspace_dir).expanduser().resolve()
+                workspace.mkdir(parents=True, exist_ok=True)
+                self.workspace_dir = str(workspace)
+            else:
+                self.workspace_dir = tempfile.mkdtemp(prefix="ctf-workspace-")
 
             challenge_root = Path(self.challenge_dir).resolve()
             distfiles = str(challenge_root / "distfiles")
@@ -136,7 +144,7 @@ class DockerSandbox:
                     "SecurityOpt": ["seccomp=unconfined"],
                     "Devices": [{"PathOnHost": "/dev/loop-control", "PathInContainer": "/dev/loop-control", "CgroupPermissions": "rwm"}],
                     "Memory": self._parse_memory_limit(),
-                    "NanoCpus": int(2 * 1e9),
+                    "NanoCpus": int(max(0.1, self.cpu_limit) * 1e9),
                 },
             }
 
@@ -151,6 +159,8 @@ class DockerSandbox:
     async def exec(self, command: str, timeout_s: int = 300) -> ExecResult:
         if not self._container:
             raise RuntimeError("Sandbox not started")
+
+        timeout_s = max(1, min(int(timeout_s), self.max_exec_timeout_s))
 
         async with self._lock:
             try:
@@ -285,11 +295,12 @@ class DockerSandbox:
                 pass
             self._docker = None
 
-        if self.workspace_dir:
+        if self.workspace_dir and not self.keep_workspace:
             import shutil
             try:
                 shutil.rmtree(self.workspace_dir, ignore_errors=True)
             except Exception:
                 pass
+        if not self.keep_workspace:
             self.workspace_dir = ""
         logger.info("Sandbox stopped")

@@ -5,17 +5,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from backend.agents.solver import Solver
+from backend.artifacts import write_checkpoint
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
+from backend.flag_format import flag_matches_format
 from backend.message_bus import ChallengeMessageBus
 from backend.model_specs import provider_from_spec, quota_fallback_spec
 from backend.models import DEFAULT_MODELS
 from backend.prompts import ChallengeMeta
 from backend.solver_base import (
+    BUDGET_EXHAUSTED,
     CANCELLED,
     ERROR,
     FLAG_FOUND,
@@ -23,6 +26,7 @@ from backend.solver_base import (
     QUOTA_ERROR,
     SolverProtocol,
     SolverResult,
+    solver_agent_name,
 )
 
 if TYPE_CHECKING:
@@ -51,12 +55,14 @@ class ChallengeSwarm:
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     solvers: dict[str, SolverProtocol] = field(default_factory=dict)
     findings: dict[str, str] = field(default_factory=dict)
+    outcomes: dict[str, SolverResult] = field(default_factory=dict)
     winner: SolverResult | None = None
     confirmed_flag: str | None = None
     _flag_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _submit_count: dict[str, int] = field(default_factory=dict)  # per-model wrong submission count
     _submitted_flags: set[str] = field(default_factory=set)  # dedup exact flags
     _last_submit_time: dict[str, float] = field(default_factory=dict)  # per-model last submit timestamp
+    _total_submit_count: int = 0
     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
 
     def _create_solver(self, model_spec: str):
@@ -152,6 +158,23 @@ class ChallengeSwarm:
 
             normalized = flag.strip()
 
+            if not flag_matches_format(normalized, self.meta.flag_format):
+                return (
+                    f'REJECTED — candidate does not match flag format "{self.meta.flag_format}".',
+                    False,
+                )
+
+            submission_limit = max(
+                1,
+                int(getattr(self.settings, "max_flag_submissions_per_challenge", 8)),
+            )
+            if self._total_submit_count >= submission_limit:
+                return (
+                    f"SUBMISSION LIMIT — {submission_limit} candidates were already sent for this challenge. "
+                    "Ask the operator to verify evidence before any further submission.",
+                    False,
+                )
+
             # Dedup exact flags across all models
             if normalized in self._submitted_flags:
                 return "INCORRECT — already tried this exact flag.", False
@@ -173,6 +196,7 @@ class ChallengeSwarm:
                     )
 
             self._submitted_flags.add(normalized)
+            self._total_submit_count += 1
 
             from backend.tools.core import do_submit_flag
             display, is_confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag)
@@ -190,6 +214,7 @@ class ChallengeSwarm:
         try:
             result, final_solver = await self._run_solver_loop(solver, model_spec)
             solver = final_solver
+            self.outcomes[model_spec] = result
             return result
         except Exception as e:
             logger.error(f"[{self.meta.name}/{model_spec}] Fatal: {e}", exc_info=True)
@@ -201,6 +226,11 @@ class ChallengeSwarm:
         """Inner loop: start → run → bump → run → ..."""
         bump_count = 0
         consecutive_errors = 0
+        attempt = 0
+        started_at = time.monotonic()
+        max_attempts = max(1, int(getattr(self.settings, "max_attempts_per_challenge", 3)))
+        turn_timeout = max(30, int(getattr(self.settings, "solver_turn_timeout_seconds", 1800)))
+        max_runtime = max(turn_timeout, int(getattr(self.settings, "solver_max_runtime_seconds", 7200)))
         result = SolverResult(
             flag=None, status=CANCELLED, findings_summary="",
             step_count=0, cost_usd=0.0, log_path="",
@@ -208,7 +238,43 @@ class ChallengeSwarm:
         await solver.start()
 
         while not self.cancel_event.is_set():
-            result = await solver.run_until_done_or_gave_up()
+            elapsed = time.monotonic() - started_at
+            if attempt >= max_attempts:
+                result = self._budget_result(
+                    solver, model_spec, result, attempt,
+                    f"attempt budget exhausted ({attempt}/{max_attempts})",
+                )
+                break
+            if elapsed >= max_runtime:
+                result = self._budget_result(
+                    solver, model_spec, result, attempt,
+                    f"runtime budget exhausted ({int(elapsed)}s/{max_runtime}s)",
+                )
+                break
+
+            attempt += 1
+            allowed = min(turn_timeout, max(1.0, max_runtime - elapsed))
+            run_task = asyncio.create_task(
+                solver.run_until_done_or_gave_up(),
+                name=f"turn-{self.meta.name}-{model_spec}-{attempt}",
+            )
+            done, _ = await asyncio.wait({run_task}, timeout=allowed)
+            if not done:
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
+                result = self._budget_result(
+                    solver, model_spec, result, attempt,
+                    f"turn timeout exceeded ({int(allowed)}s)",
+                )
+                self._checkpoint(solver, model_spec, result, attempt)
+                break
+            result = run_task.result()
+            result = replace(
+                result,
+                attempt=attempt,
+                workspace_path=getattr(getattr(solver, "sandbox", None), "workspace_dir", ""),
+            )
+            self._checkpoint(solver, model_spec, result, attempt)
 
             # Only broadcast useful findings — skip errors and broken solvers
             if (result.status not in (ERROR, QUOTA_ERROR)
@@ -229,9 +295,19 @@ class ChallengeSwarm:
             if result.status == CANCELLED:
                 break
 
+            budget_reason = self._budget_reason(solver, model_spec, attempt, started_at)
+            if budget_reason:
+                result = self._budget_result(solver, model_spec, result, attempt, budget_reason)
+                self._checkpoint(solver, model_spec, result, attempt)
+                break
+
             # Quota exhaustion: fall back to API-backed Pydantic AI solver
             if result.status == QUOTA_ERROR:
-                fallback_spec = _quota_fallback_spec(model_spec)
+                fallback_spec = (
+                    _quota_fallback_spec(model_spec)
+                    if getattr(self.settings, "enable_api_fallback", False)
+                    else None
+                )
                 if fallback_spec:
                     logger.warning(
                         f"[{self.meta.name}/{model_spec}] Quota exhausted — falling back to {fallback_spec}"
@@ -244,7 +320,12 @@ class ChallengeSwarm:
                     self.solvers[model_spec] = solver
                     await solver.start()
                     continue
-                # No fallback available, treat as error
+                if _quota_fallback_spec(model_spec):
+                    logger.warning(
+                        "[%s/%s] API fallback is disabled; set ENABLE_API_FALLBACK=true to opt in",
+                        self.meta.name,
+                        model_spec,
+                    )
                 break
 
             if result.status in (GAVE_UP, ERROR):
@@ -283,6 +364,87 @@ class ChallengeSwarm:
                 continue
 
         return result, solver
+
+    @staticmethod
+    def _step_count(solver) -> int:
+        raw = getattr(solver, "_step_count", 0)
+        if isinstance(raw, list):
+            raw = raw[0] if raw else 0
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
+
+    def _agent_usage(self, model_spec: str):
+        return self.cost_tracker.by_agent.get(solver_agent_name(self.meta.name, model_spec))
+
+    def _budget_reason(self, solver, model_spec: str, attempt: int, started_at: float) -> str:
+        max_attempts = max(1, int(getattr(self.settings, "max_attempts_per_challenge", 3)))
+        max_steps = max(1, int(getattr(self.settings, "solver_max_steps", 240)))
+        max_runtime = max(1, int(getattr(self.settings, "solver_max_runtime_seconds", 7200)))
+        max_tokens = max(0, int(getattr(self.settings, "solver_max_tokens", 1_000_000)))
+        max_cost = max(0.0, float(getattr(self.settings, "solver_max_estimated_cost_usd", 0.0)))
+        usage = self._agent_usage(model_spec)
+        tokens = usage.usage.total_tokens if usage else 0
+        cost = usage.cost_usd if usage else 0.0
+        elapsed = time.monotonic() - started_at
+
+        if self._step_count(solver) >= max_steps:
+            return f"step budget exhausted ({self._step_count(solver)}/{max_steps})"
+        if max_tokens and tokens >= max_tokens:
+            return f"token budget exhausted ({tokens}/{max_tokens})"
+        if max_cost and cost >= max_cost:
+            return f"estimated cost budget exhausted (${cost:.2f}/${max_cost:.2f})"
+        if elapsed >= max_runtime:
+            return f"runtime budget exhausted ({int(elapsed)}s/{max_runtime}s)"
+        if attempt >= max_attempts:
+            return f"attempt budget exhausted ({attempt}/{max_attempts})"
+        return ""
+
+    def _budget_result(
+        self,
+        solver,
+        model_spec: str,
+        previous: SolverResult,
+        attempt: int,
+        reason: str,
+    ) -> SolverResult:
+        usage = self._agent_usage(model_spec)
+        workspace = getattr(getattr(solver, "sandbox", None), "workspace_dir", "")
+        logger.warning("[%s/%s] %s", self.meta.name, model_spec, reason)
+        tracer = getattr(solver, "tracer", None)
+        if tracer:
+            tracer.event("budget_exhausted", reason=reason, attempt=attempt)
+        return replace(
+            previous,
+            status=BUDGET_EXHAUSTED,
+            step_count=self._step_count(solver),
+            cost_usd=usage.cost_usd if usage else previous.cost_usd,
+            stop_reason=reason,
+            workspace_path=workspace,
+            attempt=attempt,
+        )
+
+    def _checkpoint(self, solver, model_spec: str, result: SolverResult, attempt: int) -> None:
+        workspace = getattr(getattr(solver, "sandbox", None), "workspace_dir", "")
+        if not workspace:
+            return
+        usage = self._agent_usage(model_spec)
+        try:
+            write_checkpoint(
+                workspace,
+                challenge=self.meta.name,
+                model_spec=model_spec,
+                status=result.status,
+                attempt=attempt,
+                steps=self._step_count(solver),
+                tokens=usage.usage.total_tokens if usage else 0,
+                estimated_cost_usd=usage.cost_usd if usage else result.cost_usd,
+                findings=result.findings_summary,
+                stop_reason=result.stop_reason,
+            )
+        except OSError as exc:
+            logger.warning("Could not write solver checkpoint in %s: %s", workspace, exc)
 
     async def run(self) -> SolverResult | None:
         """Run all solvers in parallel. Returns the winner's result or None."""
@@ -332,8 +494,10 @@ class ChallengeSwarm:
             "agents": {
                 spec: {
                     "findings": self.findings.get(spec, ""),
-                    "status": "running" if spec in self.solvers and not self.cancel_event.is_set()
-                             else ("won" if self.winner and self.winner.flag else "finished"),
+                    "status": "running" if spec in self.solvers and spec not in self.outcomes and not self.cancel_event.is_set()
+                             else ("won" if self.winner and self.winner.flag else self.outcomes.get(spec).status if spec in self.outcomes else "finished"),
+                    "stop_reason": self.outcomes.get(spec).stop_reason if spec in self.outcomes else "",
+                    "workspace_path": getattr(getattr(self.solvers.get(spec), "sandbox", None), "workspace_dir", ""),
                 }
                 for spec in self.model_specs
             },

@@ -23,6 +23,7 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
+from backend.artifacts import solver_workspace_path
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.loop_detect import LoopDetector
@@ -79,6 +80,10 @@ class ClaudeSolver:
             image=getattr(settings, "sandbox_image", "ctf-sandbox"),
             challenge_dir=challenge_dir,
             memory_limit=getattr(settings, "container_memory_limit", "4g"),
+            cpu_limit=getattr(settings, "container_cpu_limit", 2.0),
+            max_exec_timeout_s=getattr(settings, "max_command_timeout_seconds", 600),
+            workspace_dir=solver_workspace_path(settings, meta.name, model_spec),
+            keep_workspace=True,
         )
         self.loop_detector = LoopDetector()
         self.tracer = SolverTracer(meta.name, self.model_spec)
@@ -114,6 +119,7 @@ class ClaudeSolver:
         system_prompt = sandbox_preamble + build_prompt(
             self.meta, distfile_names, container_arch=container_arch,
             has_named_tools=False,
+            model_spec=self.model_spec,
         )
 
         # PreToolUse hook: rewrite Bash commands to run in the sandbox container.
@@ -196,8 +202,9 @@ class ClaudeSolver:
                     }
 
                 # Rewrite command to run in the Docker container
-                escaped = shlex.quote(command)
-                rewritten = f"docker exec -i {self._container_id} bash -c {escaped}"
+                timeout = getattr(self.settings, "max_command_timeout_seconds", 600)
+                bounded = f"timeout --signal=KILL --kill-after=5 {max(1, int(timeout))} bash -c {shlex.quote(command)}"
+                rewritten = f"docker exec -i {self._container_id} bash -c {shlex.quote(bounded)}"
 
                 result = {
                     "hookSpecificOutput": {
@@ -339,12 +346,11 @@ class ClaudeSolver:
                     )
 
                     output = getattr(message, "structured_output", None)
-                    if output:
-                        if output.get("type") == "flag_found":
-                            self._flag = output.get("flag")
-                            self._findings = f"Flag found via {output.get('method', '?')}: {self._flag}"
-                            if self.no_submit:
-                                self._confirmed = True
+                    if output and output.get("type") == "flag_found":
+                        self._flag = output.get("flag")
+                        self._findings = f"Flag found via {output.get('method', '?')}: {self._flag}"
+                        if self.no_submit:
+                            self._confirmed = True
 
             self.tracer.event("turn_complete", duration=round(time.monotonic() - t0, 1), cost=round(self._cost_usd, 4))
 

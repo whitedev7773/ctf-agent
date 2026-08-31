@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from backend.challenge_profiles import category_playbook, solver_lane
 from backend.tools.core import IMAGE_EXTS_FOR_VISION as IMAGE_EXTS
 
 
@@ -62,6 +63,7 @@ def build_prompt(
     distfile_names: list[str],
     container_arch: str = "unknown",
     has_named_tools: bool = True,
+    model_spec: str = "",
 ) -> str:
     """Build the system prompt.
 
@@ -133,6 +135,20 @@ def build_prompt(
         for h in visible_hints:
             lines.append(f"- {h['content']}")
         lines.append("")
+
+    lines += [
+        "## Assigned solver lane",
+        solver_lane(model_spec),
+        "",
+        "## Persistent workspace",
+        "`/challenge/workspace/` survives solver/container restarts. Inspect existing artifacts, "
+        "continue useful prior work, and save every exploit, solver, extracted constant, request, "
+        "and concise `NOTES.md` there. Never modify the read-only distfiles in place.",
+        "",
+        "## Category playbook",
+        category_playbook(meta.category),
+        "",
+    ]
 
     # pyghidra is always installed in the sandbox — show for RE/pwn/misc categories
     # or when distfiles contain binaries (non-text files)

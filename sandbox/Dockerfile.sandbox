@@ -9,15 +9,15 @@ ENV TERM=xterm
 # ── System packages ───────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y \
     # Networking
-    netcat-openbsd curl wget nmap \
+    netcat-openbsd curl wget nmap socat dnsutils whois tcpdump tshark \
     # Binary analysis
     binutils file xxd bsdmainutils binwalk \
-    gdb ltrace strace \
+    gdb gdb-multiarch ltrace strace qemu-user-static qemu-system-x86 patchelf nasm gcc-multilib libc6-dbg \
     # Forensics / steg / image analysis
     exiftool steghide \
     pngcheck imagemagick \
     # Filesystem forensics
-    xfsprogs sleuthkit foremost dcfldd testdisk \
+    xfsprogs sleuthkit foremost dcfldd testdisk yara p7zip-full sqlite3 \
     # Audio / media
     ffmpeg sox \
     # OCR
@@ -25,15 +25,15 @@ RUN apt-get update && apt-get install -y \
     # Crypto / encoding
     openssl libssl-dev \
     # Build tools
-    gcc g++ make cmake \
+    gcc g++ make cmake cpio busybox-static musl-tools \
     # Python (system base)
     python3 python3-pip python3-dev \
     # Ruby (for zsteg)
     ruby ruby-dev \
     # Java (for Ghidra headless if mounted)
-    default-jre-headless \
+    default-jre-headless apktool \
     # Misc
-    git jq zip unzip ca-certificates ncurses-term \
+    git jq zip unzip ca-certificates ncurses-term john hashcat \
     # Math libs (required by flatter, cado-nfs, fpylll)
     libgmp-dev libmpfr-dev libfplll-dev libeigen3-dev \
     # z3 solver system lib
@@ -77,7 +77,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.cargo/bin:/root/.local/bin:$PATH"
 
 # ── zsteg ─────────────────────────────────────────────────────────────────────
-RUN gem install zsteg
+RUN gem install zsteg one_gadget
 
 # ── stegseek (build from source — pre-built .deb is amd64 only) ──────────────
 RUN apt-get update && apt-get install -y libmhash-dev libmcrypt-dev libjpeg-dev zlib1g-dev \
@@ -109,16 +109,36 @@ RUN pip3 install --no-cache-dir \
     flask \
     volatility3 \
     PyJWT \
-    pyghidra
+    pyghidra \
+    lief \
+    ropper \
+    scapy \
+    pyelftools \
+    keystone-engine \
+    zstandard \
+    networkx \
+    websocket-client \
+    playwright \
+    beautifulsoup4 \
+    lxml \
+    androguard \
+    web3 \
+    eth-abi
+
+# Real browser engine for JavaScript-heavy web and bot challenges.
+RUN playwright install --with-deps chromium
 
 # ── PyTorch (CPU-only) + Keras ────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir --ignore-installed sympy \
     torch --index-url https://download.pytorch.org/whl/cpu \
-    && pip3 install --no-cache-dir keras
+    && pip3 install --no-cache-dir keras \
+    && pip3 install --no-cache-dir --upgrade "numpy<2" "scipy<1.16" "ml-dtypes<0.6"
 
-# ── RsaCtfTool (catch-all automated RSA/factoring attacks) ────────────────────
+# ── RsaCtfTool (isolated because upstream pins old crypto/network libraries) ──
 RUN git clone --depth=1 https://github.com/RsaCtfTool/RsaCtfTool /opt/RsaCtfTool \
-    && pip3 install --no-cache-dir /opt/RsaCtfTool
+    && uv venv /opt/rsactftool-venv \
+    && uv pip install --python /opt/rsactftool-venv/bin/python /opt/RsaCtfTool \
+    && ln -s /opt/rsactftool-venv/bin/RsaCtfTool /usr/local/bin/RsaCtfTool
 
 # ── CADO-NFS (Number Field Sieve — large integer factoring + DLP) ─────────────
 RUN git clone --depth=1 https://gitlab.inria.fr/cado-nfs/cado-nfs.git /opt/cado-nfs \
@@ -132,6 +152,9 @@ if [ ! -d "$BUILD_PARENT/$H" ]; then\n\
 fi\n\
 exec python3 /opt/cado-nfs/cado-nfs.py "$@"\n' > /usr/local/bin/cado-nfs \
     && chmod +x /usr/local/bin/cado-nfs
+
+# Ubuntu's bundled requests is too old for the urllib3 used by Web3 tooling.
+RUN pip3 install --no-cache-dir --upgrade requests
 
 # ── Tools reference ──────────────────────────────────────────────────────────
 COPY sandbox/sandbox-tools.txt /tools.txt
