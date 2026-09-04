@@ -7,6 +7,7 @@ Protocol shapes verified against the Codex App Server v2 schema (August 2026):
   {tool, arguments, callId, threadId, turnId}
 - Client responds with DynamicToolCallResponse {contentItems: [{type, text}], success}
 - Token usage via thread/tokenUsage/updated notification
+- Active budget enforcement via turn/interrupt with {threadId, turnId}
 - Turn completion via turn/completed notification with {threadId, turn: Turn}
 """
 
@@ -20,21 +21,28 @@ import logging
 import time
 from typing import Any
 
-from backend.artifacts import solver_workspace_path
+from backend.artifacts import (
+    challenge_shared_path,
+    solver_workspace_path,
+    workspace_resume_manifest,
+)
+from backend.budgets import solver_step_limit, solver_token_limits, token_metrics
+from backend.challenge_profiles import external_skill_path, solver_role
 from backend.codex_cli import prepare_codex_cli
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.loop_detect import LoopDetector
 from backend.model_specs import effort_from_spec
 from backend.models import model_id_from_spec, supports_vision
-from backend.output_types import solver_output_json_schema
+from backend.output_types import assess_solver_output, solver_output_json_schema
 from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
 from backend.solver_base import (
+    BUDGET_EXHAUSTED,
     CANCELLED,
     ERROR,
     FLAG_FOUND,
-    GAVE_UP,
+    PROGRESS_CHECKPOINT,
     QUOTA_ERROR,
     SolverResult,
     solver_agent_name,
@@ -75,6 +83,11 @@ SANDBOX_TOOLS = [
             "properties": {
                 "command": {"type": "string"},
                 "timeout_seconds": {"type": "integer", "default": 60},
+                "max_output_chars": {
+                    "type": "integer",
+                    "default": 12000,
+                    "description": "Bound returned output; prefer targeted commands over raising this.",
+                },
             },
             "required": ["command"],
         },
@@ -126,6 +139,35 @@ SANDBOX_TOOLS = [
     },
 ]
 
+DELEGATION_TOOLS = [
+    {
+        "name": "delegate_task",
+        "description": (
+            "Launch one low-budget Luna worker for a narrow independent subproblem. "
+            "The lead must continue its own critical path while the worker runs."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "One falsifiable technical question; never the whole challenge.",
+                },
+                "deliverable": {
+                    "type": "string",
+                    "description": "Exact evidence, script, value, or negative result needed by the lead.",
+                },
+            },
+            "required": ["task", "deliverable"],
+        },
+    },
+    {
+        "name": "check_delegates",
+        "description": "Return bounded status, findings, and handoff paths for all delegated workers.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
 
 class CodexSolver:
     """Codex solver speaking the actual app-server JSON-RPC 2.0 protocol."""
@@ -143,6 +185,9 @@ class CodexSolver:
         submit_fn=None,
         message_bus=None,
         notify_coordinator=None,
+        delegate_task_fn=None,
+        delegate_status_fn=None,
+        task_directive: str = "",
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
@@ -150,6 +195,9 @@ class CodexSolver:
         self.meta = meta
         self.message_bus = message_bus
         self.notify_coordinator = notify_coordinator
+        self.delegate_task_fn = delegate_task_fn
+        self.delegate_status_fn = delegate_status_fn
+        self.task_directive = task_directive.strip()[:6000]
         self.ctfd = ctfd
         self.cost_tracker = cost_tracker
         self.settings = settings
@@ -164,27 +212,40 @@ class CodexSolver:
             cpu_limit=getattr(settings, "container_cpu_limit", 2.0),
             max_exec_timeout_s=getattr(settings, "max_command_timeout_seconds", 600),
             workspace_dir=solver_workspace_path(settings, meta.name, model_spec),
+            shared_workspace_dir=challenge_shared_path(settings, meta.name),
             keep_workspace=True,
         )
         self.use_vision = supports_vision(model_spec)
         self.loop_detector = LoopDetector()
-        self.tracer = SolverTracer(meta.name, self.model_spec)
+        self.tracer = SolverTracer(
+            meta.name,
+            self.model_spec,
+            log_dir=getattr(settings, "logs_root", "logs"),
+        )
         self.agent_name = solver_agent_name(meta.name, self.model_spec)
 
         self._proc: asyncio.subprocess.Process | None = None
         self._thread_id: str | None = None
+        self._current_turn_id: str | None = None
         self._step_count = 0
         self._flag: str | None = None
         self._confirmed = False
         self._findings = ""
         self._cost_usd = 0.0
         self._bump_insights: str | None = None
+        self._resume_after_checkpoint = False
         self._structured_output: dict | None = None
         self._turn_error: str | None = None
-        self._compact_requested = False
+        self._budget_stop_reason = ""
+        self._checkpoint_stop_reason = ""
+        self._interrupt_requested = False
+        self._interrupt_task: asyncio.Task[None] | None = None
+        self._latest_raw_tokens = 0
+        self._turn_start_raw_tokens = 0
         self._pending_responses: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
         self._turn_done: asyncio.Event = asyncio.Event()
+        self._compact_done: asyncio.Event = asyncio.Event()
         self._reasoning_effort = (
             effort_from_spec(self.model_spec)
             or LEGACY_REASONING_EFFORT.get(self.model_id)
@@ -201,7 +262,23 @@ class CodexSolver:
             self.meta, distfile_names, container_arch=container_arch,
             has_named_tools=True,
             model_spec=self.model_spec,
+            resume_manifest=workspace_resume_manifest(
+                self.sandbox.workspace_dir,
+                self.sandbox.shared_workspace_dir,
+            ),
         )
+        if self.task_directive:
+            system_prompt += "\n\n## Live delegated assignment\n" + self.task_directive
+        if self.delegate_task_fn:
+            system_prompt += (
+                "\n\n## Adaptive delegation\n"
+                "You are the SOL-xhigh lead and retain end-to-end ownership. After initial "
+                "triage, use `delegate_task` only when a narrow independent question can run "
+                "in parallel. Continue the critical path yourself, use `check_delegates` at "
+                "decision points, and integrate only evidence written to shared handoffs. "
+                "Do not delegate broad solving, final candidate verification, or work you can "
+                "finish with one cheap experiment."
+            )
 
         codex_executable = await prepare_codex_cli(
             getattr(self.settings, "codex_cli_path", ""),
@@ -224,11 +301,16 @@ class CodexSolver:
 
         # thread/start — system prompt is supplied through baseInstructions
         # Prepend sandbox path reminder to prevent models from using host paths
-        tool_names = [t["name"] for t in SANDBOX_TOOLS]
+        dynamic_tools = list(SANDBOX_TOOLS)
+        if self.delegate_task_fn:
+            dynamic_tools.extend(DELEGATION_TOOLS)
+        tool_names = [str(t["name"]) for t in dynamic_tools]
         sandbox_preamble = (
             "IMPORTANT: You are running inside a Docker sandbox. "
             "All files are under /challenge/ — distfiles at /challenge/distfiles/, "
-            "workspace at /challenge/workspace/. Do NOT use any paths outside /challenge/. "
+            "workspace at /challenge/workspace/, shared handoffs at /challenge/shared/, "
+            "and read-only tactical skills at /challenge/skills/. "
+            "Do NOT use paths outside /challenge/. "
             f"Your tools: {', '.join(tool_names)}. Use these for ALL operations.\n\n"
         )
         thread_params = {
@@ -237,7 +319,7 @@ class CodexSolver:
             "cwd": "/challenge",
             "approvalPolicy": "on-request",
             "sandbox": "read-only",
-            "dynamicTools": SANDBOX_TOOLS,
+            "dynamicTools": dynamic_tools,
         }
         resp = await self._rpc("thread/start", thread_params)
         # ThreadStartResponse: result.thread.id
@@ -247,7 +329,10 @@ class CodexSolver:
             "start",
             challenge=self.meta.name,
             model=self.model_id,
+            role=solver_role(self.model_spec).key,
+            skill=external_skill_path(self.meta.category),
             reasoning_effort=self._reasoning_effort,
+            token_limits=vars(solver_token_limits(self.settings, self.model_spec)),
         )
         logger.info(
             f"[{self.agent_name}] Codex solver started "
@@ -287,6 +372,74 @@ class CodexSolver:
         self._proc.stdin.write((json.dumps(msg) + "\n").encode())
         await self._proc.stdin.drain()
 
+    def _request_budget_interrupt(self, reason: str, turn_id: str | None = None) -> None:
+        """Schedule a turn interrupt without blocking the sole JSON-RPC reader."""
+        self._request_turn_interrupt(reason, turn_id, budget=True)
+
+    def _request_checkpoint_interrupt(self, reason: str, turn_id: str | None = None) -> None:
+        """End an oversized turn so it can be compacted and resumed cheaply."""
+        self._request_turn_interrupt(reason, turn_id, budget=False)
+
+    def _request_turn_interrupt(
+        self,
+        reason: str,
+        turn_id: str | None,
+        *,
+        budget: bool,
+    ) -> None:
+        if self._interrupt_requested:
+            return
+        self._interrupt_requested = True
+        if budget:
+            self._budget_stop_reason = reason
+        else:
+            self._checkpoint_stop_reason = reason
+        self.tracer.event(
+            "budget_interrupt_requested" if budget else "checkpoint_interrupt_requested",
+            reason=reason,
+            step=self._step_count,
+        )
+        self._interrupt_task = asyncio.create_task(
+            self._interrupt_turn(turn_id or self._current_turn_id, reason),
+            name=f"budget-interrupt-{self.agent_name}",
+        )
+
+    async def _interrupt_turn(self, turn_id: str | None, reason: str) -> None:
+        if not self._thread_id or not turn_id:
+            logger.warning(
+                "[%s] Could not interrupt over-budget turn: missing turn id",
+                self.agent_name,
+            )
+            return
+        try:
+            await self._rpc(
+                "turn/interrupt",
+                {"threadId": self._thread_id, "turnId": turn_id},
+            )
+            logger.warning("[%s] Turn interrupted: %s", self.agent_name, reason)
+            self.tracer.event("budget_interrupt_sent", reason=reason, turn_id=turn_id)
+        except Exception as exc:
+            logger.warning("[%s] Turn interrupt failed: %s", self.agent_name, exc)
+            self.tracer.event("budget_interrupt_failed", reason=reason, error=str(exc))
+
+    async def _compact_between_turns(self) -> bool:
+        """Compact after an interrupted turn and report whether it completed."""
+        self._compact_done.clear()
+        try:
+            await self._rpc("thread/compact/start", {"threadId": self._thread_id})
+            self.tracer.event("compact_requested", tokens=self._latest_raw_tokens)
+            try:
+                await asyncio.wait_for(self._compact_done.wait(), timeout=120)
+            except TimeoutError:
+                logger.warning("[%s] Compaction completion timed out", self.agent_name)
+                self.tracer.event("compact_timeout", tokens=self._latest_raw_tokens)
+                return False
+        except Exception as exc:
+            logger.warning("[%s] Compaction request failed: %s", self.agent_name, exc)
+            self.tracer.event("compact_failed", error=str(exc))
+            return False
+        return True
+
     async def _read_loop(self) -> None:
         """Read JSON-RPC messages: responses, notifications, and server requests."""
         assert self._proc and self._proc.stdout
@@ -322,7 +475,12 @@ class CodexSolver:
             # Notification: item completed — assistant text arrives here
             elif method == "item/completed":
                 item = params.get("item", params)
-                if item.get("type") == "agentMessage":
+                if item.get("type") == "contextCompaction":
+                    # Current app-server protocol. ``thread/compacted`` below is
+                    # retained for compatibility with older Codex versions.
+                    self._compact_done.set()
+                    self.tracer.event("compact_complete", tokens=self._latest_raw_tokens)
+                elif item.get("type") == "agentMessage":
                     text = item.get("text", "")
                     phase = item.get("phase")  # "commentary" | "final_answer" | null
                     if text:
@@ -362,29 +520,16 @@ class CodexSolver:
                     self._turn_error = None
                 self._turn_done.set()
 
+            elif method == "thread/compacted":
+                self._compact_done.set()
+                self.tracer.event("compact_complete", tokens=self._latest_raw_tokens)
+
             # Notification: token usage updated
             # params: {threadId, turnId, tokenUsage: {last: TokenUsageBreakdown, total: TokenUsageBreakdown}}
             elif method == "thread/tokenUsage/updated":
                 token_usage = params.get("tokenUsage", {})
                 last = token_usage.get("last", {})
                 total = token_usage.get("total", {})
-
-                # Proactive compaction at 70% context window (only for small-context models like spark)
-                context_window = token_usage.get("modelContextWindow")
-                total_tokens = total.get("totalTokens", 0)
-                if (
-                    context_window
-                    and context_window < 200_000
-                    and total_tokens > context_window * 0.7
-                    and not self._compact_requested
-                ):
-                    self._compact_requested = True
-                    logger.info(f"[{self.agent_name}] Requesting compaction ({total_tokens}/{context_window} tokens)")
-                    try:
-                        await self._rpc("thread/compact/start", {"threadId": self._thread_id})
-                        self.tracer.event("compact_requested", tokens=total_tokens, window=context_window)
-                    except Exception as e:
-                        logger.warning(f"[{self.agent_name}] Compaction request failed: {e}")
 
                 self.cost_tracker.record_tokens(
                     self.agent_name, self.model_id,
@@ -402,6 +547,59 @@ class CodexSolver:
                     self._cost_usd,
                 )
 
+                metrics = token_metrics(
+                    total.get("inputTokens", 0),
+                    total.get("outputTokens", 0),
+                    total.get("cachedInputTokens", 0),
+                    getattr(self.settings, "solver_cached_token_weight", 0.10),
+                )
+                self._latest_raw_tokens = metrics.raw_tokens
+                limits = solver_token_limits(self.settings, self.model_spec)
+                self.tracer.event(
+                    "budget_usage",
+                    raw_tokens=metrics.raw_tokens,
+                    effective_tokens=metrics.effective_tokens,
+                    cached_tokens=metrics.cached_input_tokens,
+                    raw_limit=limits.raw_tokens,
+                    effective_limit=limits.effective_tokens,
+                )
+                if (
+                    limits.effective_tokens
+                    and metrics.effective_tokens >= limits.effective_tokens
+                ):
+                    self._request_budget_interrupt(
+                        "effective token budget exhausted during turn "
+                        f"({metrics.effective_tokens}/{limits.effective_tokens}; "
+                        f"raw={metrics.raw_tokens}, cached={metrics.cached_input_tokens})",
+                        params.get("turnId"),
+                    )
+                if limits.raw_tokens and metrics.raw_tokens >= limits.raw_tokens:
+                    self._request_budget_interrupt(
+                        f"raw token safety ceiling exhausted during turn "
+                        f"({metrics.raw_tokens}/{limits.raw_tokens})",
+                        params.get("turnId"),
+                    )
+                max_cost = max(
+                    0.0,
+                    float(getattr(self.settings, "solver_max_estimated_cost_usd", 0.0)),
+                )
+                if max_cost and self._cost_usd >= max_cost:
+                    self._request_budget_interrupt(
+                        f"estimated cost budget exhausted during turn "
+                        f"(${self._cost_usd:.2f}/${max_cost:.2f})",
+                        params.get("turnId"),
+                    )
+                turn_raw_tokens = metrics.raw_tokens - self._turn_start_raw_tokens
+                if (
+                    limits.turn_slice_raw_tokens
+                    and turn_raw_tokens >= limits.turn_slice_raw_tokens
+                ):
+                    self._request_checkpoint_interrupt(
+                        f"turn slice checkpoint ({turn_raw_tokens}/"
+                        f"{limits.turn_slice_raw_tokens} raw tokens)",
+                        params.get("turnId"),
+                    )
+
     async def _handle_tool_call(self, request_id: int, params: dict) -> None:
         """Handle item/tool/call server request. Params are DynamicToolCallParams."""
         tool_name = params.get("tool", "")
@@ -415,15 +613,36 @@ class CodexSolver:
         self._step_count += 1
         self.tracer.tool_call(tool_name, args, self._step_count)
 
+        max_steps = solver_step_limit(self.settings, self.model_spec)
+        if self._step_count > max_steps:
+            result = f"Step budget exhausted ({self._step_count - 1}/{max_steps}); tool was not executed."
+            self.tracer.tool_result(tool_name, result, self._step_count)
+            await self._respond_to_request(request_id, {
+                "contentItems": [{"type": "inputText", "text": result}],
+                "success": False,
+            })
+            self._request_budget_interrupt(
+                f"step budget exhausted during turn ({self._step_count - 1}/{max_steps})",
+                params.get("turnId"),
+            )
+            return
+
         loop_status = self.loop_detector.check(tool_name, args)
         if loop_status == "break":
             self.tracer.event("loop_break", tool=tool_name, step=self._step_count)
             result = "Loop detected — try a completely different approach."
         else:
             result = await self._exec_tool(tool_name, args)
+            outcome_status = self.loop_detector.record_result(tool_name, args, result)
             if loop_status == "warn" and isinstance(result, str):
                 from backend.loop_detect import LOOP_WARNING_MESSAGE
                 result = f"{result}\n\n{LOOP_WARNING_MESSAGE}"
+            elif outcome_status == "warn" and isinstance(result, str):
+                result = (
+                    f"{result}\n\nTwo consecutive emulator boots produced no usable signal. "
+                    "The next boot is blocked until a coordinator bump; pivot to static analysis "
+                    "or fix the concrete environment fault first."
+                )
 
         # Build content items — handle image tuples from view_image
         if isinstance(result, tuple):
@@ -447,6 +666,11 @@ class CodexSolver:
             "contentItems": content_items,
             "success": True,
         })
+        if self._step_count >= max_steps:
+            self._request_budget_interrupt(
+                f"step budget exhausted during turn ({self._step_count}/{max_steps})",
+                params.get("turnId"),
+            )
 
     async def _exec_tool(self, name: str, args: dict) -> str | tuple[bytes, str]:
         if name == "bash":
@@ -454,7 +678,16 @@ class CodexSolver:
                 timeout = int(args.get("timeout_seconds", 60) or 60)
             except (TypeError, ValueError):
                 timeout = 60
-            return await do_bash(self.sandbox, args.get("command", ""), timeout)
+            try:
+                max_output_chars = int(args.get("max_output_chars", 12_000) or 12_000)
+            except (TypeError, ValueError):
+                max_output_chars = 12_000
+            return await do_bash(
+                self.sandbox,
+                args.get("command", ""),
+                timeout,
+                max_output_chars,
+            )
         elif name == "read_file":
             return str(await do_read_file(self.sandbox, args.get("path", "")))
         elif name == "write_file":
@@ -487,6 +720,17 @@ class CodexSolver:
                 await self.notify_coordinator(args.get("message", ""))
                 return "Message sent to coordinator."
             return "No coordinator connected."
+        elif name == "delegate_task":
+            if self.delegate_task_fn:
+                return await self.delegate_task_fn(
+                    str(args.get("task", "")),
+                    str(args.get("deliverable", "")),
+                )
+            return "Dynamic delegation is not available to this agent."
+        elif name == "check_delegates":
+            if self.delegate_status_fn:
+                return await self.delegate_status_fn()
+            return "No delegated workers are attached to this agent."
         return f"Unknown tool: {name}"
 
     async def run_until_done_or_gave_up(self) -> SolverResult:
@@ -502,15 +746,33 @@ class CodexSolver:
                 "Try a different approach."
             )
             self._bump_insights = None
+        elif self._resume_after_checkpoint:
+            prompt_text = (
+                "Resume the same productive solve path from the compacted context and saved "
+                "workspace artifacts. Read the latest checkpoint and lead STATE/progress file first, "
+                "state the single unresolved blocker, and run its cheapest discriminating experiment. "
+                "Do not restart triage, bulk-extract again, or repeat completed experiments."
+            )
+            self._resume_after_checkpoint = False
         elif self._step_count == 0:
             prompt_text = "Solve this CTF challenge."
         else:
-            prompt_text = "Continue solving. Try a different approach."
+            prompt_text = (
+                "Continue from the evidence ledger. Record why the previous route failed or remains "
+                "unproven, select one unresolved blocker, and run a different falsifiable experiment. "
+                "Do not repeat inventory or broad extraction."
+            )
 
         try:
             self._turn_done.clear()
             self._structured_output = None
             self._turn_error = None
+            self._budget_stop_reason = ""
+            self._checkpoint_stop_reason = ""
+            self._interrupt_requested = False
+            self._interrupt_task = None
+            self._current_turn_id = None
+            self._turn_start_raw_tokens = self._latest_raw_tokens
             turn_params: dict[str, Any] = {
                 "threadId": self._thread_id,
                 "input": [{"type": "text", "text": prompt_text}],
@@ -519,12 +781,33 @@ class CodexSolver:
             # Current App Server exposes reasoning as `effort` on turn/start.
             if self._reasoning_effort:
                 turn_params["effort"] = self._reasoning_effort
-            await self._rpc("turn/start", turn_params)
+            turn_response = await self._rpc("turn/start", turn_params)
+            self._current_turn_id = (
+                turn_response.get("result", {}).get("turn", {}).get("id")
+            )
 
             await self._turn_done.wait()
 
             duration = time.monotonic() - t0
             self.tracer.event("turn_complete", duration=round(duration, 1), steps=self._step_count)
+
+            if self._budget_stop_reason:
+                self._findings = self._findings or self._budget_stop_reason
+                return self._result(BUDGET_EXHAUSTED, self._budget_stop_reason)
+
+            if self._checkpoint_stop_reason:
+                compacted = await self._compact_between_turns()
+                if not compacted:
+                    reason = (
+                        f"{self._checkpoint_stop_reason}; compaction did not complete, "
+                        "so starting another turn is unsafe"
+                    )
+                    self._resume_after_checkpoint = False
+                    self._findings = self._findings or reason
+                    return self._result(BUDGET_EXHAUSTED, reason)
+                self._resume_after_checkpoint = True
+                self._findings = self._findings or self._checkpoint_stop_reason
+                return self._result(PROGRESS_CHECKPOINT, self._checkpoint_stop_reason)
 
             if self._turn_error:
                 err = self._turn_error.lower()
@@ -535,15 +818,22 @@ class CodexSolver:
                     return self._result(QUOTA_ERROR)
                 return self._result(ERROR)
 
-            if self._structured_output and self._structured_output.get("type") == "flag_found":
-                self._flag = self._structured_output.get("flag")
-                self._findings = f"Flag found via {self._structured_output.get('method', '?')}: {self._flag}"
-                if self.no_submit:
-                    self._confirmed = True
-
-            if self._confirmed and self._flag:
-                return self._result(FLAG_FOUND)
-            return self._result(GAVE_UP)
+            output = self._structured_output or {
+                "type": "incomplete",
+                "flag": "",
+                "method": self._findings or "No structured progress was returned.",
+            }
+            assessment = assess_solver_output(
+                output_type=str(output.get("type", "incomplete")),
+                flag=output.get("flag"),
+                method=output.get("method"),
+                confirmed_flag=self._flag if self._confirmed else None,
+                flag_format=self.meta.flag_format,
+            )
+            self._confirmed = assessment.status == FLAG_FOUND
+            self._flag = assessment.flag
+            self._findings = assessment.findings
+            return self._result(assessment.status)
 
         except asyncio.CancelledError:
             return self._result(CANCELLED)
@@ -558,21 +848,26 @@ class CodexSolver:
 
     def bump(self, insights: str) -> None:
         self._bump_insights = insights
+        self._resume_after_checkpoint = False
         self.loop_detector.reset()
         self.tracer.event("bump", insights=insights[:500])
 
-    def _result(self, status: str) -> SolverResult:
+    def _result(self, status: str, stop_reason: str = "") -> SolverResult:
         self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed)
         return SolverResult(
             flag=self._flag, status=status,
             findings_summary=self._findings[:2000],
             step_count=self._step_count,
             cost_usd=self._cost_usd, log_path=self.tracer.path,
+            stop_reason=stop_reason,
         )
 
     async def stop(self) -> None:
         self.tracer.event("stop", step_count=self._step_count)
         self.tracer.close()
+        if self._interrupt_task and not self._interrupt_task.done():
+            self._interrupt_task.cancel()
+            await asyncio.gather(self._interrupt_task, return_exceptions=True)
         if self._reader_task:
             self._reader_task.cancel()
             try:

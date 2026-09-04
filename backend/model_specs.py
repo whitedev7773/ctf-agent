@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 # Subscription-backed providers can continue through these API-backed models.
 QUOTA_FALLBACKS: dict[str, str] = {
     "claude-sdk/claude-opus-4-6": "bedrock/us.anthropic.claude-opus-4-6-v1",

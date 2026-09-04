@@ -30,22 +30,57 @@ class Settings(BaseSettings):
 
     # Infra
     sandbox_image: str = "ctf-sandbox"
-    # Desktop-safe default: one three-agent swarm at a time. Override explicitly
-    # on a larger contest workstation.
+    # Desktop-safe default: one SOL-led challenge at a time.
     max_concurrent_challenges: int = 1
-    max_attempts_per_challenge: int = 3
+    max_attempts_per_challenge: int = 8
     container_memory_limit: str = "4g"
     container_cpu_limit: float = 2.0
     workspace_root: str = "workspace"
+    logs_root: str = "logs"
 
     # Per-solver hard budgets. Zero disables token/cost limits only; time, step,
     # and attempt limits stay mandatory so a wedged model cannot run forever.
     solver_turn_timeout_seconds: int = 1800
-    solver_max_runtime_seconds: int = 7200
-    solver_max_steps: int = 240
-    solver_max_tokens: int = 1_000_000
+    solver_max_runtime_seconds: int = 10800
+    solver_max_steps: int = 300
+    # Cache-weighted work budget. Cached context is charged at the weight below,
+    # while raw tokens retain an independent safety ceiling.
+    solver_max_tokens: int = 1_500_000
+    solver_max_raw_tokens: int = 12_000_000
+    solver_cached_token_weight: float = 0.10
+    # End a long turn at a tool boundary, compact it, then resume. This prevents
+    # a 150k context from being replayed for dozens of calls in one giant turn.
+    solver_turn_slice_tokens: int = 1_500_000
     solver_max_estimated_cost_usd: float = 0.0
     max_flag_submissions_per_challenge: int = 8
     max_command_timeout_seconds: int = 600
+    # Downstream roles wait for SCOUT evidence before starting. VERIFIER uses
+    # twice this duration. Set to zero to start every role immediately.
+    solver_handoff_wait_seconds: int = 180
+
+    # SOL-led adaptive delegation. The lead keeps ownership of the solve and
+    # creates small Luna workers only for narrow, independent investigations.
+    dynamic_delegation_enabled: bool = True
+    delegate_model_spec: str = "codex/gpt-5.6-luna/low"
+    delegate_max_agents: int = 4
+    delegate_max_concurrent: int = 2
+    delegate_max_attempts: int = 4
+    delegate_max_runtime_seconds: int = 1800
+    delegate_turn_timeout_seconds: int = 600
+    delegate_max_steps: int = 96
+    delegate_max_tokens: int = 250_000
+    delegate_max_raw_tokens: int = 1_200_000
+    delegate_turn_slice_tokens: int = 300_000
+    # Reserve one very small worker to consolidate an interrupted delegate only
+    # when its handoff is missing or fails the evidence audit.
+    delegate_postprocess_on_budget_stop: bool = True
+    delegate_postprocess_max_agents: int = 1
+    delegate_postprocess_max_attempts: int = 1
+    delegate_postprocess_max_runtime_seconds: int = 600
+    delegate_postprocess_turn_timeout_seconds: int = 300
+    delegate_postprocess_max_steps: int = 40
+    delegate_postprocess_max_tokens: int = 80_000
+    delegate_postprocess_max_raw_tokens: int = 400_000
+    delegate_postprocess_turn_slice_tokens: int = 150_000
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

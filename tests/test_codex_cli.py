@@ -36,9 +36,9 @@ class CodexCLIResolutionTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"CODEX_CLI_PATH": "missing-codex.exe"}, clear=True),
             patch("backend.codex_cli.shutil.which", return_value=None),
+            self.assertRaisesRegex(CodexCLIError, "CODEX_CLI_PATH"),
         ):
-            with self.assertRaisesRegex(CodexCLIError, "CODEX_CLI_PATH"):
-                resolve_codex_executable()
+            resolve_codex_executable()
 
 
 class CodexCLIAuthenticationTests(unittest.IsolatedAsyncioTestCase):
@@ -52,9 +52,9 @@ class CodexCLIAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 "backend.codex_cli.asyncio.create_subprocess_exec",
                 return_value=_FakeProcess(1, b"Not logged in"),
             ),
+            self.assertRaisesRegex(CodexCLIError, "codex login"),
         ):
-            with self.assertRaisesRegex(CodexCLIError, "codex login"):
-                await prepare_codex_cli()
+            await prepare_codex_cli()
 
     async def test_authenticated_executable_is_cached(self) -> None:
         fake_launch = AsyncMock(return_value=_FakeProcess(0, b"Logged in using ChatGPT"))

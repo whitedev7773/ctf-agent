@@ -85,6 +85,7 @@ class DockerSandbox:
     cpu_limit: float = 2.0
     max_exec_timeout_s: int = 600
     workspace_dir: str = ""
+    shared_workspace_dir: str = ""
     keep_workspace: bool = False
     _container: Any = field(default=None, repr=False)
     _docker: Any = field(default=None, repr=False)
@@ -126,6 +127,11 @@ class DockerSandbox:
             meta_yml = str(challenge_root / "metadata.yml")
 
             binds: list[str] = [f"{self.workspace_dir}:/challenge/workspace:rw"]
+            if self.shared_workspace_dir:
+                shared_workspace = Path(self.shared_workspace_dir).expanduser().resolve()
+                shared_workspace.mkdir(parents=True, exist_ok=True)
+                self.shared_workspace_dir = str(shared_workspace)
+                binds.append(f"{self.shared_workspace_dir}:/challenge/shared:rw")
             if Path(distfiles).exists():
                 binds.append(f"{distfiles}:/challenge/distfiles:ro")
             if Path(meta_yml).exists():

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from backend.deps import CoordinatorDeps
 from backend.prompts import ChallengeMeta
+from backend.runtime_state import persist_deps_state
 from backend.solver_base import FLAG_FOUND
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,14 @@ async def do_fetch_challenges(deps: CoordinatorDeps) -> str:
 async def do_get_solve_status(deps: CoordinatorDeps) -> str:
     solved = await deps.ctfd.fetch_solved_names() if deps.ctfd.is_configured else set(deps.results)
     swarm_status = {name: swarm.get_status() for name, swarm in deps.swarms.items()}
-    return json.dumps({"solved": sorted(solved), "active_swarms": swarm_status}, indent=2)
+    return json.dumps(
+        {
+            "solved": sorted(solved),
+            "candidates": deps.candidates,
+            "active_swarms": swarm_status,
+        },
+        indent=2,
+    )
 
 
 async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
@@ -94,24 +102,36 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
         coordinator_inbox=deps.coordinator_inbox,
     )
     deps.swarms[challenge_name] = swarm
-    standalone_run = not deps.ctfd.is_configured
 
     async def _run_and_cleanup() -> None:
         result = await swarm.run()
-        # Flag already submitted/confirmed by solver's submit_fn — just record the result
+        if swarm.candidates:
+            flags = sorted(
+                {candidate.flag for candidate in swarm.candidates.values() if candidate.flag}
+            )
+            if flags:
+                deps.candidates[challenge_name] = {
+                    "flag": flags[0],
+                    "flags": flags,
+                    "sources": sorted(swarm.candidates),
+                    "status": "unverified",
+                    "review_required": True,
+                }
+        # A solved result must have been confirmed by the live submission path.
         if result and result.status == FLAG_FOUND:
             deps.results[challenge_name] = {
                 "flag": result.flag,
-                "submit": (
-                    "LOCAL RESULT" if standalone_run
-                    else "DRY RUN" if deps.no_submit
-                    else "confirmed by solver"
-                ),
+                "submit": "confirmed by solver",
             }
+            deps.candidates.pop(challenge_name, None)
+        persist_deps_state(deps)
 
     task = asyncio.create_task(_run_and_cleanup(), name=f"swarm-{challenge_name}")
     deps.swarm_tasks[challenge_name] = task
-    return f"Swarm spawned for {challenge_name} with {len(deps.model_specs)} models"
+    return (
+        f"SOL-led swarm spawned for {challenge_name} with {len(deps.model_specs)} primary model(s); "
+        "bounded delegates are created on demand"
+    )
 
 
 async def do_check_swarm_status(deps: CoordinatorDeps, challenge_name: str) -> str:
@@ -122,26 +142,78 @@ async def do_check_swarm_status(deps: CoordinatorDeps, challenge_name: str) -> s
 
 
 async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) -> str:
+    from backend.flag_format import flag_matches_format
+
+    candidate = flag.strip()
+    meta = deps.challenge_metas.get(challenge_name)
+    format_hint = getattr(meta, "flag_format", "") if meta else ""
+    if not flag_matches_format(candidate, format_hint):
+        return f'REJECTED — candidate does not match flag format "{format_hint}".'
+
     if not deps.ctfd.is_configured:
-        candidate = flag.strip()
-        deps.results[challenge_name] = {"flag": candidate, "submit": "LOCAL CANDIDATE"}
+        deps.candidates[challenge_name] = {
+            "flag": candidate,
+            "flags": [candidate],
+            "source": "operator",
+            "status": "unverified",
+            "review_required": True,
+        }
+        persist_deps_state(deps)
         return f'LOCAL CANDIDATE — recorded "{candidate}" for {challenge_name}'
     if deps.no_submit:
-        return f'DRY RUN — would submit "{flag.strip()}" for {challenge_name}'
-    swarm = deps.swarms.get(challenge_name)
+        deps.candidates[challenge_name] = {
+            "flag": candidate,
+            "flags": [candidate],
+            "source": "operator/dry-run",
+            "status": "unverified",
+            "review_required": True,
+        }
+        persist_deps_state(deps)
+        return f'DRY RUN — recorded unverified candidate "{candidate}" for {challenge_name}'
+    swarm = getattr(deps, "swarms", {}).get(challenge_name)
     if swarm:
         display, _ = await swarm.try_submit_flag(flag, "operator/coordinator")
         return display
-    from backend.flag_format import flag_matches_format
-    meta = deps.challenge_metas.get(challenge_name)
-    format_hint = getattr(meta, "flag_format", "") if meta else ""
-    if not flag_matches_format(flag, format_hint):
-        return f'REJECTED — candidate does not match flag format "{format_hint}".'
     try:
         result = await deps.ctfd.submit_flag(challenge_name, flag)
         return result.display
     except Exception as e:
         return f"submit_flag error: {e}"
+
+
+async def do_review_candidate(
+    deps: CoordinatorDeps,
+    challenge_name: str,
+    flag: str,
+    accepted: bool,
+) -> str:
+    """Resolve a human review for a standalone/dry-run candidate."""
+    record = deps.candidates.get(challenge_name)
+    candidate = flag.strip()
+    known_flags = set(record.get("flags", [])) if record else set()
+    if record and record.get("flag"):
+        known_flags.add(record["flag"])
+    if not record or candidate not in known_flags:
+        return f'NO PENDING CANDIDATE — "{candidate}" is not awaiting review.'
+
+    if accepted:
+        deps.results[challenge_name] = {
+            "flag": candidate,
+            "submit": "operator confirmed local candidate",
+        }
+        deps.candidates.pop(challenge_name, None)
+        persist_deps_state(deps)
+        return f'LOCAL CONFIRMED — recorded "{candidate}" as solved for {challenge_name}'
+
+    deps.candidates.pop(challenge_name, None)
+    swarm = getattr(deps, "swarms", {}).get(challenge_name)
+    if swarm:
+        swarm.candidates.clear()
+    persist_deps_state(deps)
+    return (
+        f'LOCAL REJECTED — removed "{candidate}" for {challenge_name}. '
+        "Restart the swarm to continue solving."
+    )
 
 
 async def do_kill_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
@@ -160,7 +232,11 @@ async def do_bump_agent(deps: CoordinatorDeps, challenge_name: str, model_spec: 
     if not solver:
         return f"No solver for {model_spec} in {challenge_name}"
     solver.bump(insights)
-    return f"Bumped {model_spec} on {challenge_name}"
+    await swarm.message_bus.post("coordinator", insights, target=model_spec)
+    return (
+        f"Bumped {model_spec} on {challenge_name}; guidance queued for both "
+        "the active turn and the next turn"
+    )
 
 
 async def do_read_solver_trace(deps: CoordinatorDeps, challenge_name: str, model_spec: str, last_n: int = 20) -> str:

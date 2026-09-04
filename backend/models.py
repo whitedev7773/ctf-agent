@@ -24,11 +24,9 @@ from backend.model_specs import model_id_from_spec, provider_from_spec
 if TYPE_CHECKING:
     from backend.config import Settings
 
-# Codex-first CTF lineup: quality, balanced, and fast/cost-sensitive lanes.
+# SOL owns the solve. It can create bounded Luna delegates while it is running.
 DEFAULT_MODELS: list[str] = [
     "codex/gpt-5.6-sol/xhigh",
-    "codex/gpt-5.6-terra/high",
-    "codex/gpt-5.6-luna/medium",
 ]
 
 # Context window sizes (tokens)

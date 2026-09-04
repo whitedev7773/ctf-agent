@@ -119,7 +119,12 @@ async def _run_single(
     if any(spec.split("/", 1)[0] == "codex" for spec in model_specs):
         await prepare_codex_cli(settings.codex_cli_path)
 
-    max_containers = max_challenges * len(model_specs)
+    delegate_slots = (
+        max(0, settings.delegate_max_concurrent)
+        if settings.dynamic_delegation_enabled
+        else 0
+    )
+    max_containers = max_challenges * (len(model_specs) + delegate_slots)
     configure_semaphore(max_containers)
     await cleanup_orphan_containers()
 
@@ -155,6 +160,23 @@ async def _run_single(
         from backend.solver_base import FLAG_FOUND
         if result and result.status == FLAG_FOUND:
             console.print(f"\n[bold green]FLAG FOUND:[/bold green] {result.flag}")
+        elif swarm.candidates:
+            console.print("\n[bold yellow]LOCAL CANDIDATE REVIEW REQUIRED[/bold yellow]")
+            for model_spec, candidate in swarm.candidates.items():
+                console.print(
+                    f"  [yellow]UNVERIFIED CANDIDATE[/yellow] "
+                    f"({model_spec}): {candidate.flag}"
+                )
+                if not ctfd.is_configured and sys.stdin.isatty() and click.confirm(
+                    f'Confirm "{candidate.flag}" as the local answer?',
+                    default=False,
+                ):
+                    console.print(
+                        f"\n[bold green]LOCAL FLAG CONFIRMED:[/bold green] {candidate.flag}"
+                    )
+                    break
+            else:
+                console.print("\nCandidate rejected or left unconfirmed; rerun to continue solving.")
         else:
             console.print("\n[bold red]No flag found.[/bold red]")
 
@@ -184,7 +206,12 @@ async def _run_coordinator(
     ):
         await prepare_codex_cli(settings.codex_cli_path)
 
-    max_containers = max_challenges * len(model_specs)
+    delegate_slots = (
+        max(0, settings.delegate_max_concurrent)
+        if settings.dynamic_delegation_enabled
+        else 0
+    )
+    max_containers = max_challenges * (len(model_specs) + delegate_slots)
     configure_semaphore(max_containers)
     await cleanup_orphan_containers()
     console.print(f"[bold]Starting coordinator ({coordinator_backend}, Ctrl+C to stop)...[/bold]\n")
@@ -215,6 +242,8 @@ async def _run_coordinator(
     console.print("\n[bold]Final Results:[/bold]")
     for challenge, data in results.get("results", {}).items():
         console.print(f"  {challenge}: {data.get('flag', 'no flag')}")
+    for challenge, data in results.get("candidates", {}).items():
+        console.print(f"  [yellow]{challenge} candidate:[/yellow] {data.get('flag', 'unknown')}")
     console.print(f"\n[bold]Total cost: ${results.get('total_cost_usd', 0):.2f}[/bold]")
 
 

@@ -1,23 +1,38 @@
 """SDK-agnostic tool logic — pure async functions, no Pydantic AI types."""
 
 import json
+import re
 import shlex
 from pathlib import Path
 
 import httpx
 
-MAX_OUTPUT = 24_000
+MAX_OUTPUT = 12_000
+MAX_OUTPUT_HARD = 24_000
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT) -> str:
     if len(text) <= limit:
         return text
-    lines = text.split("\n")
-    head = "\n".join(lines[:200])
-    return head[:limit] + f"\n... [truncated — {len(text)} total chars, {len(lines)} lines]"
+    marker = f"\n... [middle truncated — {len(text)} total chars] ...\n"
+    remaining = max(2, limit - len(marker))
+    head_size = remaining // 2
+    tail_size = remaining - head_size
+    candidates = sorted(
+        set(re.findall(r"\b[A-Za-z][A-Za-z0-9_-]{1,31}\{[^{}\r\n]{1,300}\}", text))
+    )
+    candidate_note = ""
+    if candidates:
+        candidate_note = "\n[candidate-like output preserved]\n" + "\n".join(candidates[:10])
+    return text[:head_size] + marker + text[-tail_size:] + candidate_note
 
 
-async def do_bash(sandbox, command: str, timeout_seconds: int = 60) -> str:
+async def do_bash(
+    sandbox,
+    command: str,
+    timeout_seconds: int = 60,
+    max_output_chars: int = MAX_OUTPUT,
+) -> str:
     result = await sandbox.exec(command, timeout_s=timeout_seconds)
     parts: list[str] = []
     if result.stdout:
@@ -27,7 +42,8 @@ async def do_bash(sandbox, command: str, timeout_seconds: int = 60) -> str:
     if result.exit_code != 0:
         parts.append(f"[exit {result.exit_code}]")
     out = "\n".join(parts).strip() or "(no output)"
-    return _truncate(out)
+    output_limit = max(1_000, min(int(max_output_chars or MAX_OUTPUT), MAX_OUTPUT_HARD))
+    return _truncate(out, output_limit)
 
 
 async def do_read_file(sandbox, path: str) -> str:

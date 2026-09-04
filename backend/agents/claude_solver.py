@@ -23,13 +23,18 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
-from backend.artifacts import solver_workspace_path
+from backend.artifacts import (
+    challenge_shared_path,
+    solver_workspace_path,
+    workspace_resume_manifest,
+)
+from backend.challenge_profiles import external_skill_path, solver_role
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.loop_detect import LoopDetector
 from backend.model_specs import effort_from_spec
 from backend.models import model_id_from_spec
-from backend.output_types import solver_output_json_schema
+from backend.output_types import assess_solver_output, solver_output_json_schema
 from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
 from backend.solver_base import (
@@ -83,10 +88,15 @@ class ClaudeSolver:
             cpu_limit=getattr(settings, "container_cpu_limit", 2.0),
             max_exec_timeout_s=getattr(settings, "max_command_timeout_seconds", 600),
             workspace_dir=solver_workspace_path(settings, meta.name, model_spec),
+            shared_workspace_dir=challenge_shared_path(settings, meta.name),
             keep_workspace=True,
         )
         self.loop_detector = LoopDetector()
-        self.tracer = SolverTracer(meta.name, self.model_spec)
+        self.tracer = SolverTracer(
+            meta.name,
+            self.model_spec,
+            log_dir=getattr(settings, "logs_root", "logs"),
+        )
         self.agent_name = solver_agent_name(meta.name, self.model_spec)
 
         self._client: ClaudeSDKClient | None = None
@@ -111,7 +121,9 @@ class ClaudeSolver:
         sandbox_preamble = (
             "IMPORTANT: You are running inside a Docker sandbox. "
             "All files are under /challenge/ — distfiles at /challenge/distfiles/, "
-            "workspace at /challenge/workspace/. Do NOT use any paths outside /challenge/. "
+            "workspace at /challenge/workspace/, shared handoffs at /challenge/shared/, "
+            "and read-only tactical skills at /challenge/skills/. "
+            "Do NOT use paths outside /challenge/. "
             "All bash commands run inside the container via docker exec. "
             "Use bash for everything: cat/head to read files, tee/echo> to write, find/grep to search. "
             "submit_flag 'FLAG' to submit. notify_coordinator 'MSG' to message the coordinator.\n\n"
@@ -120,6 +132,10 @@ class ClaudeSolver:
             self.meta, distfile_names, container_arch=container_arch,
             has_named_tools=False,
             model_spec=self.model_spec,
+            resume_manifest=workspace_resume_manifest(
+                self.sandbox.workspace_dir,
+                self.sandbox.shared_workspace_dir,
+            ),
         )
 
         # PreToolUse hook: rewrite Bash commands to run in the sandbox container.
@@ -293,7 +309,13 @@ class ClaudeSolver:
 
         self._client = ClaudeSDKClient(options=options)
         await self._client.__aenter__()
-        self.tracer.event("start", challenge=self.meta.name, model=self.model_id)
+        self.tracer.event(
+            "start",
+            challenge=self.meta.name,
+            model=self.model_id,
+            role=solver_role(self.model_spec).key,
+            skill=external_skill_path(self.meta.category),
+        )
         logger.info(f"[{self.agent_name}] Claude SDK solver started")
 
     async def run_until_done_or_gave_up(self) -> SolverResult:
@@ -304,6 +326,7 @@ class ClaudeSolver:
         t0 = time.monotonic()
         cost_before = self._cost_usd
         steps_before = self._step_count
+        turn_status = GAVE_UP
 
         try:
             if self._bump_insights:
@@ -346,11 +369,18 @@ class ClaudeSolver:
                     )
 
                     output = getattr(message, "structured_output", None)
-                    if output and output.get("type") == "flag_found":
-                        self._flag = output.get("flag")
-                        self._findings = f"Flag found via {output.get('method', '?')}: {self._flag}"
-                        if self.no_submit:
-                            self._confirmed = True
+                    if output:
+                        assessment = assess_solver_output(
+                            output_type=str(output.get("type", "incomplete")),
+                            flag=output.get("flag"),
+                            method=output.get("method"),
+                            confirmed_flag=self._flag if self._confirmed else None,
+                            flag_format=self.meta.flag_format,
+                        )
+                        self._confirmed = assessment.status == FLAG_FOUND
+                        self._flag = assessment.flag
+                        self._findings = assessment.findings
+                        turn_status = assessment.status
 
             self.tracer.event("turn_complete", duration=round(time.monotonic() - t0, 1), cost=round(self._cost_usd, 4))
 
@@ -360,7 +390,7 @@ class ClaudeSolver:
             # Report per-run metrics so broken-solver detection works
             run_steps = self._step_count - steps_before
             run_cost = self._cost_usd - cost_before
-            return self._result(GAVE_UP, run_steps=run_steps, run_cost=run_cost)
+            return self._result(turn_status, run_steps=run_steps, run_cost=run_cost)
 
         except asyncio.CancelledError:
             return self._result(CANCELLED)

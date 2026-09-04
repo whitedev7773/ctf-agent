@@ -156,6 +156,20 @@ exec python3 /opt/cado-nfs/cado-nfs.py "$@"\n' > /usr/local/bin/cado-nfs \
 # Ubuntu's bundled requests is too old for the urllib3 used by Web3 tooling.
 RUN pip3 install --no-cache-dir --upgrade requests
 
+# Curated CTF technique catalog. Pin the reviewed revision so solver behavior
+# does not change between image rebuilds. Agents read category SKILL.md files;
+# bundled installers/scripts are never run automatically.
+ARG CTF_SKILLS_REF=36c72e53a96a035791821caff7440882ea0f5c57
+RUN mkdir -p /challenge/skills \
+    && git -C /challenge/skills init \
+    && git -C /challenge/skills remote add origin https://github.com/ljagiello/ctf-skills.git \
+    && git -C /challenge/skills fetch --depth=1 origin "$CTF_SKILLS_REF" \
+    && git -C /challenge/skills checkout --detach FETCH_HEAD \
+    && test -f /challenge/skills/ctf-pwn/SKILL.md \
+    && test -f /challenge/skills/ctf-reverse/SKILL.md \
+    && rm -rf /challenge/skills/.git \
+    && chmod -R a-w /challenge/skills
+
 # ── Tools reference ──────────────────────────────────────────────────────────
 COPY sandbox/sandbox-tools.txt /tools.txt
 

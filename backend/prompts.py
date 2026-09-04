@@ -9,7 +9,12 @@ from typing import Any
 
 import yaml
 
-from backend.challenge_profiles import category_playbook, solver_lane
+from backend.challenge_profiles import (
+    category_playbook,
+    external_skill_path,
+    solver_lane,
+    solver_role,
+)
 from backend.tools.core import IMAGE_EXTS_FOR_VISION as IMAGE_EXTS
 
 
@@ -64,6 +69,7 @@ def build_prompt(
     container_arch: str = "unknown",
     has_named_tools: bool = True,
     model_spec: str = "",
+    resume_manifest: str = "",
 ) -> str:
     """Build the system prompt.
 
@@ -72,6 +78,7 @@ def build_prompt(
     steghide/exiftool/curl instead). Codex has named dynamic tools so uses True.
     """
     conn_info = _rewrite_connection_info(meta.connection_info.strip())
+    role = solver_role(model_spec)
 
     lines: list[str] = [
         "You are an expert CTF solver. Find the real flag for the challenge below.",
@@ -136,34 +143,55 @@ def build_prompt(
             lines.append(f"- {h['content']}")
         lines.append("")
 
+    if resume_manifest:
+        lines += [
+            "## Existing work — resume before new triage",
+            "A prior run left these curated checkpoints and reusable artifacts. Read the concise "
+            "checkpoint/STATE first, then open only the artifact needed for the narrowest unresolved "
+            "blocker. Do not re-run inventory or bulk extraction merely to rebuild context:",
+            resume_manifest,
+            "",
+        ]
+
+    if role.key == "scout":
+        skill_instruction = (
+            f"Read `{external_skill_path(meta.category)}` once during triage. Distill only the "
+            "relevant pivot rules into the shared TRIAGE handoff so later roles do not reread it."
+        )
+    else:
+        skill_instruction = (
+            f"`{external_skill_path(meta.category)}` is available as a fallback. Read the shared "
+            "handoffs first and open only a specifically needed section when the current blocker "
+            "is not already covered; do not repeat the scout's full skill read."
+        )
+
     lines += [
-        "## Assigned solver lane",
+        "## Assigned solver role",
         solver_lane(model_spec),
         "",
-        "## Persistent workspace",
-        "`/challenge/workspace/` survives solver/container restarts. Inspect existing artifacts, "
-        "continue useful prior work, and save every exploit, solver, extracted constant, request, "
-        "and concise `NOTES.md` there. Never modify the read-only distfiles in place.",
+        "## Workspaces and handoff",
+        "`/challenge/workspace/` is private scratch space for this model and survives restarts. "
+        "`/challenge/shared/` is mounted into every solver for this challenge. Read it before "
+        "repeating work and publish only reproducible artifacts under your assigned role directory. "
+        "Never modify the read-only distfiles in place.",
         "",
         "## Category playbook",
         category_playbook(meta.category),
         "",
+        "## External tactical skill",
+        skill_instruction + " "
+        "Treat the catalog as technique guidance, not permission to broaden scope: do not run its installer "
+        "scripts, download extra tools, or execute bundled scripts blindly. Use the tools already present in "
+        "this sandbox and preserve the evidence/verification rules above.",
+        "",
     ]
 
-    # pyghidra is always installed in the sandbox — show for RE/pwn/misc categories
-    # or when distfiles contain binaries (non-text files)
     cat_lower = (meta.category or "").lower()
     if cat_lower in ("reverse", "reversing", "re", "pwn", "binary", "misc", ""):
         lines += [
             "## Binary Analysis",
-            "**pyghidra** is installed for decompilation. Use it via bash:",
-            "```python",
-            "import pyghidra",
-            "with pyghidra.open_program('/challenge/distfiles/binary') as flat_api:",
-            "    listing = flat_api.currentProgram.getListing()",
-            "    # Iterate functions, decompile, etc.",
-            "```",
-            "Also available: radare2 (`r2`), gdb, angr, capstone.",
+            "Available: pyghidra, radare2, gdb, angr and capstone. Request only the smallest "
+            "function, symbol set or debugger snapshot that answers the current hypothesis.",
             "",
         ]
 
@@ -181,21 +209,36 @@ def build_prompt(
         "## Instructions",
         "**Use tools immediately. Do not describe — execute.**",
         "",
-        "1. " + ("Connect to the service now." if conn_info else "Inspect distfiles now."),
-        "2. Keep using tools until you have the flag.",
-        "3. **Be creative and thorough** — try the obvious path, then explore further:",
-        "   - Hidden files, env vars, backup files, HTTP headers, error messages, timing, encoding tricks.",
-        f"   - {image_hint}",
-        f"   - {web_hint}",
-        (
-            "   - Crypto: identify algorithm, weak keys, nonce reuse, padding oracles. "
-            "For RSA: use `RsaCtfTool`, sage ECM, or `cado-nfs`."
+        "1. " + (
+            "Resume from the existing work manifest and then connect to the service."
+            if resume_manifest and conn_info
+            else "Resume from the existing work manifest."
+            if resume_manifest
+            else "Connect to the service now."
+            if conn_info
+            else "Inspect distfiles now."
         ),
-        "   - Pwn: `stty raw -echo` before launching vulnerable binaries over nc.",
-        '4. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.',
-        f"5. {submit_hint}",
-        "6. Once CORRECT: output `FLAG: <value>` on its own line.",
-        "7. Do not guess. Do not ask. Cover maximum surface area.",
+        f"2. Execute the {role.key.upper()} contract above; do not duplicate another role's work.",
+        "3. Keep one ranked, falsifiable hypothesis. Run the cheapest experiment that can reject it, "
+        "then pivot; do not perform broad inventory after triage.",
+        f"4. {image_hint} {web_hint}",
+        "5. Before a long emulator, debugger, symbolic or algebra job, write the expected signal and "
+        "the pivot if absent. Do not repeat a failed environment setup with cosmetic argument changes.",
+        '6. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.',
+        f"7. {submit_hint}",
+        "8. Use `flag_found` only after direct solve/exploit output produces the candidate. "
+        "A DRY RUN or echoed/static value is not verification.",
+        "9. If the turn must end without direct evidence, return `incomplete` with an empty flag "
+        "and concise progress so the swarm can continue.",
+        "10. Preserve decisive code and facts in the assigned shared handoff. Keep tool output bounded "
+        "with `head`, `tail`, targeted ranges or scripts that emit summaries.",
+        "11. Do not guess or ask. Continue within the measured solve route.",
+        "12. Treat generated files and static suspicion as leads, not evidence. A claimed primitive must "
+        "cite source/offsets and, when the environment permits, one observed dynamic result.",
+        "13. If two handoffs disagree, record the conflict before using either conclusion and run the "
+        "smallest discriminating experiment. Never silently combine incompatible layouts or arithmetic.",
+        "14. After a concrete static primitive is found, do not spend another bulk extraction or long analysis phase without "
+        "creating or running a minimal reproducer, harness, solver, or debugger check for that primitive.",
     ]
 
     return "\n".join(lines)

@@ -7,11 +7,14 @@ from typing import Protocol
 
 # Status constants
 FLAG_FOUND = "flag_found"
+CANDIDATE_FOUND = "candidate_found"
 GAVE_UP = "gave_up"
+HANDOFF_COMPLETE = "handoff_complete"
 CANCELLED = "cancelled"
 ERROR = "error"
 QUOTA_ERROR = "quota_error"
 BUDGET_EXHAUSTED = "budget_exhausted"
+PROGRESS_CHECKPOINT = "progress_checkpoint"
 
 # Flag confirmation markers from CTFd
 CORRECT_MARKERS = ("CORRECT", "ALREADY SOLVED")

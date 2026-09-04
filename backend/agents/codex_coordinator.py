@@ -20,6 +20,7 @@ from backend.agents.coordinator_core import (
     do_submit_flag,
 )
 from backend.agents.coordinator_loop import build_deps, run_event_loop
+from backend.challenge_profiles import format_solver_roster
 from backend.codex_cli import prepare_codex_cli
 from backend.config import Settings
 from backend.deps import CoordinatorDeps
@@ -36,8 +37,9 @@ Strategy:
 - Prioritize by expected points per unit time: high solve-count/easy tasks first, then high-value blockers
 - Use read_solver_trace to monitor what each solver is doing and where it's stuck
 - When agents are stuck, read traces and persistent-workspace notes, then craft targeted technical guidance
-- Use broadcast to share cross-solver insights (e.g. flag format discovery, shared vulnerabilities)
-- Diversify hypotheses across the rapid-triage, systematic-validation, and deep-exploitation lanes
+- Use broadcast for facts useful to every role; use bump_agent for one role's targeted next action
+- Treat SOL-xhigh as the primary solve owner. It may create bounded Luna-low delegates
+  for narrow parallel questions and remains responsible for integration and verification
 
 CRITICAL RULES:
 - Respect attempt, runtime, step, token, command, and submission budgets. Never tell an agent
@@ -65,7 +67,7 @@ COORDINATOR_TOOLS = [
     },
     {
         "name": "spawn_swarm",
-        "description": "Launch all solver models on a challenge.",
+        "description": "Launch the SOL-xhigh lead; it creates bounded workers only when useful.",
         "inputSchema": {
             "type": "object",
             "properties": {"challenge_name": {"type": "string"}},
@@ -170,7 +172,11 @@ class CodexCoordinator:
 
         resp = await self._rpc("thread/start", {
             "model": self.model,
-            "baseInstructions": COORDINATOR_PROMPT,
+            "baseInstructions": (
+                COORDINATOR_PROMPT
+                + "\nConfigured solver roster:\n"
+                + format_solver_roster(self.deps.model_specs)
+            ),
             "cwd": ".",
             "approvalPolicy": "on-request",
             "sandbox": "read-only",

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+from backend.model_specs import model_id_from_spec
+
 _ALIASES = {
     "binary": "pwn",
     "exploitation": "pwn",
@@ -30,6 +34,7 @@ _PLAYBOOKS: dict[str, str] = {
     "reversing": """### Reversing specialist playbook
 - Identify format, ISA, packing, managed runtime and anti-debugging before decompilation.
 - Combine static (`r2`, `objdump`, `pyghidra`, `jadx`/`apktool`) and dynamic (`gdb`, `strace`, `ltrace`, QEMU) evidence.
+- Once static analysis identifies a concrete layout, boundary or state transition, build the smallest harness that measures it before another broad extraction/decompilation pass.
 - Lift verification logic into a small Python/Z3/angr solver; avoid manually transcribing large constants when scripts can extract them.
 - Search for custom VM bytecode, opaque predicates, self-modification and crypto misuse. Preserve every extractor and patch in `/challenge/workspace/`.""",
     "cryptography": """### Cryptography specialist playbook
@@ -64,6 +69,17 @@ _PLAYBOOKS: dict[str, str] = {
 - Validate that the exploit changes the challenge's win condition, not merely that one suspicious call succeeds.""",
 }
 
+_EXTERNAL_SKILLS_BY_CATEGORY = {
+    "pwn": "ctf-pwn",
+    "reversing": "ctf-reverse",
+    "cryptography": "ctf-crypto",
+    "web": "ctf-web",
+    "forensics": "ctf-forensics",
+    "misc": "ctf-misc",
+    "android": "ctf-reverse",
+    "blockchain": "ctf-misc",
+}
+
 
 def normalized_category(category: str) -> str:
     value = (category or "").strip().lower()
@@ -74,20 +90,157 @@ def category_playbook(category: str) -> str:
     return _PLAYBOOKS[normalized_category(category)]
 
 
+def external_skill_path(category: str) -> str:
+    """Route a challenge to one pinned ctf-skills entry point in the sandbox."""
+    raw = (category or "").strip().lower()
+    if "osint" in raw:
+        skill = "ctf-osint"
+    elif "malware" in raw:
+        skill = "ctf-malware"
+    elif raw in {"ai", "ml", "ai/ml", "machine learning", "artificial intelligence"}:
+        skill = "ctf-ai-ml"
+    else:
+        skill = _EXTERNAL_SKILLS_BY_CATEGORY[normalized_category(category)]
+    return f"/challenge/skills/{skill}/SKILL.md"
+
+
+@dataclass(frozen=True)
+class SolverRole:
+    """One explicit responsibility in a challenge swarm."""
+
+    key: str
+    title: str
+    objective: str
+    instructions: tuple[str, ...]
+    handoff_path: str
+    handoff_wait_factor: float
+
+    def prompt(self) -> str:
+        lines = [f"### {self.title}", self.objective]
+        lines.extend(f"- {instruction}" for instruction in self.instructions)
+        lines.append(f"- Required handoff: `{self.handoff_path}`")
+        return "\n".join(lines)
+
+
+SCOUT_ROLE = SolverRole(
+    key="scout",
+    title="Rapid triage lane (SCOUT)",
+    objective="Own intake and triage. Produce a small evidence-backed map before deep solving begins.",
+    instructions=(
+        "Inspect `/challenge/shared/` first and never repeat facts already recorded there.",
+        "Fingerprint inputs, protections, format and the likely validation/attack surface using bounded cheap tools.",
+        "Separate confirmed facts from ranked hypotheses and identify one falsifiable solve route.",
+        "By tool step 8, write the handoff and call `notify_coordinator` with decisive facts and artifact paths.",
+        "Avoid long symbolic jobs, broad web searches and exhaustive debugger traces; hand those to the analyst.",
+    ),
+    handoff_path="/challenge/shared/scout/TRIAGE.md",
+    handoff_wait_factor=0.0,
+)
+
+ANALYST_ROLE = SolverRole(
+    key="analyst",
+    title="Systematic solve lane (ANALYST)",
+    objective="Own the primary solve path and convert triage evidence into a reproducible end-to-end solver.",
+    instructions=(
+        "Start by reading `/challenge/shared/scout/TRIAGE.md`; perform only missing minimum triage.",
+        "Model the verifier, protocol or exploit primitive and test the cheapest high-value hypothesis first.",
+        "Prefer bounded targeted debugger/tool runs over broad scans, timing guesses or repeated inventory.",
+        "Save the final `solve.py`, `solve.sage` or `exploit.py` under `/challenge/shared/analyst/`.",
+        "Notify the coordinator after every decisive primitive, disproved route or candidate-producing run.",
+    ),
+    handoff_path="/challenge/shared/analyst/SOLUTION.md",
+    handoff_wait_factor=1.0,
+)
+
+VERIFIER_ROLE = SolverRole(
+    key="verifier",
+    title="Independent verification lane (VERIFIER)",
+    objective="Own independent evidence review, hard-gap closure and final candidate verification.",
+    instructions=(
+        "Read scout and analyst handoffs before invoking routine inventory tools.",
+        "Challenge assumptions and focus on the narrowest unresolved blocker or an orthogonal high-value method.",
+        "Reproduce the final solver against the untouched target in a clean process/session.",
+        "Reject reflected input, patched success branches, static placeholders and unverified guesses.",
+        "Use `flag_found` only for direct eligible output; otherwise return `incomplete` with the exact gap.",
+    ),
+    handoff_path="/challenge/shared/verifier/VERIFY.md",
+    handoff_wait_factor=2.0,
+)
+
+LEAD_ROLE = SolverRole(
+    key="lead",
+    title="Primary solve owner (LEAD)",
+    objective=(
+        "Own the end-to-end solve, preserve the global hypothesis tree, and use bounded "
+        "delegation only when an independent subproblem can be specified precisely."
+    ),
+    instructions=(
+        "Read existing shared artifacts, then establish the main solve route yourself. Maintain `/challenge/shared/lead/STATE.md` with Confirmed facts, Conflicts, Current blocker, and Next experiment.",
+        "Keep the critical path; never delegate the whole challenge or wait idly for workers.",
+        "Use `delegate_task` only for narrow parallel work with a falsifiable question and explicit deliverable.",
+        "Check delegate status at natural decision points. Recompute critical offsets/assumptions and do not integrate a handoff whose evidence audit reports conflicts or missing reproduction.",
+        "After a static primitive is credible, prioritize a minimal executable harness or debugger measurement; bulk extraction is not progress unless it answers the current blocker.",
+        "Reproduce the final exploit or solver directly before reporting a candidate.",
+    ),
+    handoff_path="/challenge/shared/lead/SOLUTION.md",
+    handoff_wait_factor=0.0,
+)
+
+DELEGATE_ROLE = SolverRole(
+    key="delegate",
+    title="Bounded delegated worker (DELEGATE)",
+    objective="Answer one narrow question for the lead with the cheapest decisive experiment.",
+    instructions=(
+        "Work only on the delegated task; do not restart broad challenge triage.",
+        "Read existing shared evidence first and avoid duplicating the lead or another worker.",
+        "Prefer a small script or bounded tool run that proves or disproves the assigned hypothesis.",
+        "Cross-check arithmetic and layout claims against source or observed addresses; explicitly name any conflict with an existing handoff.",
+        "Publish concise positive or negative evidence using the required Conclusion, Evidence, Reproduction, and Assumptions and conflicts sections.",
+        "Stop after the requested deliverable; the lead owns integration and final verification.",
+    ),
+    handoff_path="/challenge/shared/delegates/",
+    handoff_wait_factor=0.0,
+)
+
+SPECIALIST_ROLE = SolverRole(
+    key="specialist",
+    title="Orthogonal specialist lane (SPECIALIST)",
+    objective="Pursue one complementary hypothesis that the named scout, analyst and verifier do not cover.",
+    instructions=(
+        "Read every existing handoff before selecting a lane.",
+        "State the one hypothesis you own and avoid duplicating active work.",
+        "Use bounded experiments and publish positive or negative evidence promptly.",
+        "Leave reproducible scripts and concise notes for the other roles.",
+    ),
+    handoff_path="/challenge/shared/specialist/HANDOFF.md",
+    handoff_wait_factor=1.0,
+)
+
+
+def solver_role(model_spec: str) -> SolverRole:
+    """Map known model families to stable complementary responsibilities."""
+    if any(part.startswith("delegate-") for part in model_spec.split("/")[3:]):
+        return DELEGATE_ROLE
+    model_id = model_id_from_spec(model_spec).lower()
+    if any(marker in model_id for marker in ("luna", "mini", "flash", "spark")):
+        return SCOUT_ROLE
+    if "terra" in model_id:
+        return ANALYST_ROLE
+    if "sol" in model_id:
+        return LEAD_ROLE
+    if "opus" in model_id:
+        return VERIFIER_ROLE
+    return SPECIALIST_ROLE
+
+
 def solver_lane(model_spec: str) -> str:
-    """Give parallel default models complementary jobs instead of identical prompts."""
-    lowered = model_spec.lower()
-    if "luna" in lowered or "mini" in lowered or "flash" in lowered:
-        return (
-            "Rapid triage lane: inventory the attack surface, automate cheap tests, and notify the "
-            "coordinator early with concrete observations. Escalate promising paths with saved scripts."
-        )
-    if "terra" in lowered:
-        return (
-            "Systematic validation lane: build a complete model of the challenge, reproduce each primitive, "
-            "and turn sibling hypotheses into reliable end-to-end solvers."
-        )
-    return (
-        "Deep exploitation lane: pursue the hardest or most novel path, challenge assumptions, and produce "
-        "a rigorous working exploit/solver rather than a shallow list of possibilities."
+    """Return the complete role contract injected into a solver prompt."""
+    return solver_role(model_spec).prompt()
+
+
+def format_solver_roster(model_specs: list[str]) -> str:
+    """Describe configured assignments for coordinator prompts and diagnostics."""
+    return "\n".join(
+        f"- `{spec}` → {solver_role(spec).title}: {solver_role(spec).objective}"
+        for spec in model_specs
     )

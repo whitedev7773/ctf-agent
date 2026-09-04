@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import secrets
 import shutil
@@ -15,17 +16,110 @@ from typing import TYPE_CHECKING, Any
 import yaml
 from aiohttp import web
 
+from backend.artifacts import challenge_approach_notes
+from backend.budgets import solver_token_limits, token_metrics
+from backend.challenge_profiles import external_skill_path, solver_role
+from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.prompts import ChallengeMeta
 from backend.solver_base import solver_agent_name
 
 if TYPE_CHECKING:
-    from backend.cost_tracker import CostTracker
     from backend.deps import CoordinatorDeps
     from backend.poller import CTFdPoller
 
 
 STATIC_DIR = Path(__file__).parent / "static"
+RESET_CONFIRMATION = "초기화"
+RUNTIME_REVISION = 10
+
+
+def _runtime_source_fingerprint(project_root: Path | None = None) -> str:
+    """Fingerprint restart-sensitive source/config without exposing file contents."""
+    root = project_root or Path(__file__).resolve().parents[2]
+    paths = list((root / "backend").rglob("*.py"))
+    paths.extend(path for path in (root / ".env", root / "pyproject.toml") if path.is_file())
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: str(item).casefold()):
+        try:
+            stat = path.stat()
+            relative = path.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        digest.update(f"{relative.as_posix()}:{stat.st_size}:{stat.st_mtime_ns}\n".encode())
+    return digest.hexdigest()[:16]
+
+
+def _is_link_like(path: Path) -> bool:
+    """Return whether a path redirects deletion outside its configured root."""
+    is_junction = getattr(path, "is_junction", None)
+    return path.is_symlink() or bool(is_junction and is_junction())
+
+
+def _validate_runtime_root(root: Path, project_root: Path) -> None:
+    """Reject broad or source-bearing paths before any destructive operation."""
+    anchor = Path(root.anchor).resolve()
+    home = Path.home().resolve()
+    if root in {anchor, home, project_root} or project_root.is_relative_to(root):
+        raise ValueError(f"unsafe runtime path: {root}")
+    if root.exists() and _is_link_like(root):
+        raise ValueError(f"runtime path cannot be a link or junction: {root}")
+
+    protected = (
+        project_root / ".git",
+        project_root / ".env",
+        project_root / ".venv",
+        project_root / "backend",
+        project_root / "docs",
+        project_root / "tests",
+        project_root / "pyproject.toml",
+    )
+    if any(root == path or root.is_relative_to(path) or path.is_relative_to(root) for path in protected):
+        raise ValueError(f"runtime path overlaps protected project files: {root}")
+
+
+def _remove_runtime_child(child: Path) -> None:
+    """Remove one runtime entry without following links."""
+    if _is_link_like(child):
+        if child.is_symlink() or not child.is_dir():
+            child.unlink()
+        else:
+            child.rmdir()
+    elif child.is_dir():
+        shutil.rmtree(child)
+    else:
+        child.unlink()
+
+
+def _clear_runtime_root(root: Path) -> tuple[int, list[Path]]:
+    """Remove runtime children while retaining files locked by this process.
+
+    Windows does not allow deleting the stdout/stderr files currently opened by
+    the coordinator. Report those files and continue clearing sibling entries.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    removed = 0
+    retained: list[Path] = []
+    for child in root.iterdir():
+        try:
+            _remove_runtime_child(child)
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            retained.append(child)
+            continue
+        removed += 1
+    return removed, retained
+
+
+def _drain_queue(queue: asyncio.Queue | None) -> None:
+    if queue is None:
+        return
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
 
 
 @contextmanager
@@ -50,21 +144,40 @@ def _staging_directory(root: Path):
             shutil.rmtree(path, ignore_errors=True)
 
 
-def _usage_payload(cost_tracker: CostTracker, agent_name: str) -> dict[str, Any]:
+def _usage_payload(
+    cost_tracker: CostTracker,
+    agent_name: str,
+    settings: object,
+    model_spec: str,
+) -> dict[str, Any]:
     agent = cost_tracker.by_agent.get(agent_name)
     if not agent:
+        limits = solver_token_limits(settings, model_spec)
         return {
             "cost_usd": 0.0,
             "input_tokens": 0,
             "cached_tokens": 0,
             "output_tokens": 0,
+            "effective_tokens": 0,
+            "effective_token_limit": limits.effective_tokens,
+            "raw_token_limit": limits.raw_tokens,
             "duration_seconds": 0.0,
         }
+    metrics = token_metrics(
+        agent.usage.input_tokens,
+        agent.usage.output_tokens,
+        agent.usage.cache_read_tokens,
+        getattr(settings, "solver_cached_token_weight", 0.10),
+    )
+    limits = solver_token_limits(settings, model_spec)
     return {
         "cost_usd": round(agent.cost_usd, 6),
         "input_tokens": agent.usage.input_tokens,
         "cached_tokens": agent.usage.cache_read_tokens,
         "output_tokens": agent.usage.output_tokens,
+        "effective_tokens": metrics.effective_tokens,
+        "effective_token_limit": limits.effective_tokens,
+        "raw_token_limit": limits.raw_tokens,
         "duration_seconds": round(agent.duration_seconds, 1),
     }
 
@@ -85,6 +198,7 @@ class DashboardServer:
         self.port = port
         self.actual_port = port
         self.started_at = time.monotonic()
+        self._startup_source_fingerprint = _runtime_source_fingerprint()
         self.csrf_token = secrets.token_urlsafe(32)
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -108,6 +222,8 @@ class DashboardServer:
                 web.post("/api/control/stop", self._stop_swarm),
                 web.post("/api/control/broadcast", self._broadcast),
                 web.post("/api/control/submit", self._submit),
+                web.post("/api/control/review-candidate", self._review_candidate),
+                web.post("/api/control/reset-runtime", self._reset_runtime),
                 # Backward-compatible endpoint used by the ctf-msg command.
                 web.post("/msg", self._legacy_message),
             ]
@@ -159,6 +275,7 @@ class DashboardServer:
                 "csrf_token": self.csrf_token,
                 "port": self.actual_port,
                 "no_submit": self.deps.no_submit,
+                "capabilities": {"reset_runtime": True},
             }
         )
 
@@ -177,11 +294,13 @@ class DashboardServer:
         return data
 
     def _snapshot(self) -> dict[str, Any]:
+        candidates = getattr(self.deps, "candidates", {})
         known = (
             self.poller.known_challenges
             | set(self.deps.challenge_metas)
             | set(self.deps.swarms)
             | set(self.deps.results)
+            | set(candidates)
         )
         solved = self.poller.known_solved | set(self.deps.results)
         active_names = {
@@ -200,6 +319,7 @@ class DashboardServer:
             meta = self.deps.challenge_metas.get(name)
             swarm = self.deps.swarms.get(name)
             result = self.deps.results.get(name, {})
+            candidate = candidates.get(name, {})
             is_active = name in active_names and swarm is not None and not swarm.cancel_event.is_set()
             is_solved = name in solved
 
@@ -208,26 +328,46 @@ class DashboardServer:
                 for spec in swarm.model_specs:
                     solver = swarm.solvers.get(spec)
                     outcome = swarm.outcomes.get(spec)
+                    waiting = spec in swarm.waiting_models and is_active
                     running = solver is not None and is_active and outcome is None
+                    budget_stop_pending = (
+                        getattr(solver, "_budget_stop_reason", "") if solver else ""
+                    )
+                    checkpoint_pending = (
+                        getattr(solver, "_checkpoint_stop_reason", "") if solver else ""
+                    )
                     raw_steps = getattr(solver, "_step_count", 0) if solver else 0
                     if isinstance(raw_steps, list):
                         raw_steps = raw_steps[0] if raw_steps else 0
                     usage = _usage_payload(
                         self.cost_tracker,
                         solver_agent_name(name, spec),
+                        self.deps.settings,
+                        spec,
                     )
                     agents.append(
                         {
                             "model_spec": spec,
-                            "status": "running" if running else (
-                                "won" if swarm.winner and swarm.winner.flag else (
+                            "role": solver_role(spec).key,
+                            "role_title": solver_role(spec).title,
+                            "skill_path": external_skill_path(getattr(meta, "category", "")),
+                            "status": "waiting" if waiting else "compacting" if (
+                                running and checkpoint_pending
+                            ) else "stopping" if (
+                                running and budget_stop_pending
+                            ) else "running" if running else (
+                                "won" if outcome is swarm.winner else (
                                     outcome.status if outcome else "finished"
                                 )
                             ),
                             "steps": raw_steps,
                             "findings": swarm.findings.get(spec, ""),
                             "trace": Path(getattr(getattr(solver, "tracer", None), "path", "")).name,
-                            "stop_reason": outcome.stop_reason if outcome else "",
+                            "stop_reason": (
+                                outcome.stop_reason if outcome else (
+                                    budget_stop_pending or checkpoint_pending
+                                )
+                            ),
                             "attempt": outcome.attempt if outcome else 0,
                             "workspace_path": (
                                 outcome.workspace_path if outcome and outcome.workspace_path
@@ -237,9 +377,19 @@ class DashboardServer:
                         }
                     )
                     total_agents += 1
-                    active_agents += int(running)
+                    active_agents += int(running or waiting)
 
-            status = "solved" if is_solved else "active" if is_active else "idle"
+            status = (
+                "solved" if is_solved
+                else "active" if is_active
+                else "candidate" if candidate
+                else "idle"
+            )
+            approach_notes = challenge_approach_notes(
+                self.deps.settings,
+                name,
+                live_findings=getattr(swarm, "findings", {}) if swarm else {},
+            )
             challenges.append(
                 {
                     "name": name,
@@ -250,6 +400,10 @@ class DashboardServer:
                     "active": is_active,
                     "solved": is_solved,
                     "flag": result.get("flag"),
+                    "candidate": candidate.get("flag"),
+                    "candidates": candidate.get("flags", []),
+                    "candidate_review_required": bool(candidate.get("review_required")),
+                    "approach_notes": approach_notes,
                     "agents": agents,
                     "cost_usd": round(sum(a["cost_usd"] for a in agents), 6),
                 }
@@ -259,9 +413,21 @@ class DashboardServer:
         configured = bool(ctfd and ctfd.is_configured)
         force_no_submit = bool(getattr(self.deps, "force_no_submit", False))
         submission_mode = "dry_run" if force_no_submit else "live" if configured else "standalone"
+        effective_total = sum(
+            token_metrics(
+                agent.usage.input_tokens,
+                agent.usage.output_tokens,
+                agent.usage.cache_read_tokens,
+                getattr(self.deps.settings, "solver_cached_token_weight", 0.10),
+            ).effective_tokens
+            for agent in self.cost_tracker.by_agent.values()
+        )
 
+        current_source_fingerprint = _runtime_source_fingerprint()
         return {
             "updated_at": datetime.now(UTC).isoformat(),
+            "runtime_revision": RUNTIME_REVISION,
+            "restart_required": current_source_fingerprint != self._startup_source_fingerprint,
             "uptime_seconds": round(time.monotonic() - self.started_at),
             "no_submit": self.deps.no_submit,
             "submission_mode": submission_mode,
@@ -275,22 +441,88 @@ class DashboardServer:
             "models": self.deps.model_specs,
             "max_concurrent_challenges": self.deps.max_concurrent_challenges,
             "runtime_policy": {
-                "max_attempts": getattr(self.deps.settings, "max_attempts_per_challenge", 3),
+                "max_attempts": getattr(self.deps.settings, "max_attempts_per_challenge", 8),
                 "turn_timeout_seconds": getattr(self.deps.settings, "solver_turn_timeout_seconds", 1800),
-                "max_runtime_seconds": getattr(self.deps.settings, "solver_max_runtime_seconds", 7200),
-                "max_steps": getattr(self.deps.settings, "solver_max_steps", 240),
-                "max_tokens": getattr(self.deps.settings, "solver_max_tokens", 1_000_000),
+                "max_runtime_seconds": getattr(self.deps.settings, "solver_max_runtime_seconds", 10800),
+                "max_steps": getattr(self.deps.settings, "solver_max_steps", 300),
+                "max_tokens": getattr(self.deps.settings, "solver_max_tokens", 1_500_000),
+                "max_raw_tokens": getattr(self.deps.settings, "solver_max_raw_tokens", 12_000_000),
+                "cached_token_weight": getattr(self.deps.settings, "solver_cached_token_weight", 0.10),
+                "turn_slice_tokens": getattr(self.deps.settings, "solver_turn_slice_tokens", 1_500_000),
                 "max_submissions": getattr(self.deps.settings, "max_flag_submissions_per_challenge", 8),
+                "in_turn_budget_interrupt": True,
+                "runtime_state_persistence": True,
+                "adaptive_delegation": bool(
+                    getattr(self.deps.settings, "dynamic_delegation_enabled", True)
+                ),
+                "delegate_model": getattr(
+                    self.deps.settings,
+                    "delegate_model_spec",
+                    "codex/gpt-5.6-luna/low",
+                ),
+                "delegate_max_agents": getattr(self.deps.settings, "delegate_max_agents", 4),
+                "delegate_max_concurrent": getattr(
+                    self.deps.settings,
+                    "delegate_max_concurrent",
+                    2,
+                ),
+                "delegate_max_tokens": getattr(self.deps.settings, "delegate_max_tokens", 250_000),
+                "delegate_max_raw_tokens": getattr(
+                    self.deps.settings,
+                    "delegate_max_raw_tokens",
+                    1_200_000,
+                ),
+                "delegate_max_attempts": getattr(
+                    self.deps.settings,
+                    "delegate_max_attempts",
+                    4,
+                ),
+                "delegate_max_runtime_seconds": getattr(
+                    self.deps.settings,
+                    "delegate_max_runtime_seconds",
+                    1800,
+                ),
+                "delegate_max_steps": getattr(self.deps.settings, "delegate_max_steps", 96),
+                "delegate_turn_slice_tokens": getattr(
+                    self.deps.settings,
+                    "delegate_turn_slice_tokens",
+                    300_000,
+                ),
+                "delegate_postprocess_on_budget_stop": bool(
+                    getattr(
+                        self.deps.settings,
+                        "delegate_postprocess_on_budget_stop",
+                        True,
+                    )
+                ),
+                "delegate_postprocess_max_agents": getattr(
+                    self.deps.settings,
+                    "delegate_postprocess_max_agents",
+                    1,
+                ),
+                "delegate_postprocess_max_tokens": getattr(
+                    self.deps.settings,
+                    "delegate_postprocess_max_tokens",
+                    80_000,
+                ),
+                "delegate_postprocess_max_raw_tokens": getattr(
+                    self.deps.settings,
+                    "delegate_postprocess_max_raw_tokens",
+                    400_000,
+                ),
                 "workspace_root": str(getattr(self.deps.settings, "workspace_root", "workspace")),
+                "logs_root": str(getattr(self.deps.settings, "logs_root", "logs")),
             },
             "stats": {
                 "total": len(known),
                 "solved": len(solved),
+                "candidates": len(set(candidates) - solved),
                 "active_swarms": len(active_names),
                 "active_agents": active_agents,
                 "total_agents": total_agents,
                 "cost_usd": round(self.cost_tracker.total_cost_usd, 6),
                 "tokens": self.cost_tracker.total_tokens,
+                "effective_tokens": effective_total,
             },
             "challenges": challenges,
         }
@@ -515,3 +747,86 @@ class DashboardServer:
         async with self._command_lock:
             message = await do_submit_flag(self.deps, name, flag[:2000])
         return web.json_response({"ok": True, "message": message})
+
+    async def _review_candidate(self, request: web.Request) -> web.Response:
+        from backend.agents.coordinator_core import do_review_candidate
+
+        self._require_csrf(request)
+        data = await self._json_body(request)
+        name = str(data.get("challenge", "")).strip()
+        flag = str(data.get("flag", "")).strip()
+        accepted = data.get("accepted")
+        if not name or not flag or not isinstance(accepted, bool):
+            raise web.HTTPBadRequest(text="challenge, flag, and boolean accepted are required")
+        async with self._command_lock:
+            message = await do_review_candidate(self.deps, name, flag[:2000], accepted)
+        return web.json_response({"ok": True, "message": message})
+
+    async def _reset_runtime(self, request: web.Request) -> web.Response:
+        """Stop all work and clear only configured runtime state and directories."""
+        self._require_csrf(request)
+        data = await self._json_body(request)
+        if data.get("confirmation") != RESET_CONFIRMATION:
+            raise web.HTTPBadRequest(text=f"'{RESET_CONFIRMATION}'를 정확히 입력해야 합니다.")
+
+        project_root = Path.cwd().resolve()
+        roots = {
+            Path(self.deps.challenges_root).expanduser().resolve(),
+            Path(getattr(self.deps.settings, "workspace_root", "workspace")).expanduser().resolve(),
+            Path(getattr(self.deps.settings, "logs_root", "logs")).expanduser().resolve(),
+        }
+        try:
+            for root in roots:
+                _validate_runtime_root(root, project_root)
+        except ValueError as exc:
+            raise web.HTTPConflict(text=str(exc)) from exc
+
+        async with self._command_lock:
+            for swarm in list(self.deps.swarms.values()):
+                swarm.kill()
+            tasks = list(self.deps.swarm_tasks.values())
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            await self.deps.ctfd.configure("")
+            self.deps.settings.ctfd_url = ""
+            self.deps.settings.ctfd_token = ""
+            self.deps.settings.ctfd_user = ""
+            self.deps.settings.ctfd_pass = ""
+            self.deps.no_submit = True
+            await self.poller.reseed()
+            drain_events = getattr(self.poller, "drain_events", None)
+            if drain_events:
+                drain_events()
+
+            self.deps.swarms.clear()
+            self.deps.swarm_tasks.clear()
+            self.deps.results.clear()
+            self.deps.candidates.clear()
+            self.deps.challenge_dirs.clear()
+            self.deps.challenge_metas.clear()
+            self.cost_tracker.by_agent.clear()
+            _drain_queue(getattr(self.deps, "coordinator_inbox", None))
+            _drain_queue(getattr(self.deps, "operator_inbox", None))
+
+            removed = 0
+            retained: list[Path] = []
+            for root in sorted(roots, key=str):
+                root_removed, root_retained = await asyncio.to_thread(_clear_runtime_root, root)
+                removed += root_removed
+                retained.extend(root_retained)
+
+        return web.json_response(
+            {
+                "ok": True,
+                "removed_entries": removed,
+                "retained_locked_entries": len(retained),
+                "message": (
+                    "풀이 기록과 실행 환경을 초기화했습니다. "
+                    f"런타임 항목 {removed}개를 제거하고 독립 모드로 전환했습니다."
+                ),
+            }
+        )

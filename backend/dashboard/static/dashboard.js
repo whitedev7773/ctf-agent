@@ -11,6 +11,7 @@ const state = {
   ctfdInitialized: false,
   drawerReturnChallenge: null,
   localFiles: [],
+  candidateNotices: new Set(),
 };
 
 const byId = (id) => document.getElementById(id);
@@ -95,19 +96,25 @@ function modelShortName(spec) {
 }
 
 function statusLabel(status) {
-  return { active: "실행 중", solved: "해결", idle: "대기" }[status] || status;
+  return { active: "실행 중", solved: "해결", candidate: "후보", idle: "대기" }[status] || status;
 }
 
 function agentStatusLabel(status) {
   return {
     running: "RUNNING",
+    stopping: "BUDGET STOPPING",
+    compacting: "COMPACTING",
+    waiting: "HANDOFF WAIT",
     won: "WINNER",
     finished: "FINISHED",
     budget_exhausted: "BUDGET STOP",
     error: "ERROR",
     quota_error: "QUOTA STOP",
     cancelled: "CANCELLED",
+    candidate_found: "CANDIDATE",
+    handoff_complete: "HANDOFF READY",
     gave_up: "STOPPED",
+    progress_checkpoint: "CHECKPOINT",
   }[status] || status;
 }
 
@@ -128,10 +135,34 @@ async function api(path, options = {}) {
   return payload;
 }
 
+async function endpointAvailable(path) {
+  try {
+    const response = await fetch(path, { method: "OPTIONS", cache: "no-store" });
+    return response.status !== 404;
+  } catch (_error) {
+    return false;
+  }
+}
+
 function toast(message, type = "success") {
   const item = node("div", `toast ${type}`, message);
   byId("toast-region").append(item);
   window.setTimeout(() => item.remove(), 4200);
+}
+
+function notifyCandidateReviews(snapshot) {
+  const pending = snapshot.challenges.filter((challenge) => challenge.candidate_review_required);
+  document.title = pending.length ? `(${pending.length}) CTF 후보 검토 필요` : "CTF Agent";
+  for (const challenge of pending) {
+    const key = `${challenge.name}:${challenge.candidate}`;
+    if (state.candidateNotices.has(key)) continue;
+    state.candidateNotices.add(key);
+    const message = `${challenge.name}: Flag 후보 검토가 필요합니다 — ${challenge.candidate}`;
+    toast(message);
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification("CTF Agent 후보 검토 필요", { body: message });
+    }
+  }
 }
 
 function setConnection(online) {
@@ -152,7 +183,7 @@ function renderOverview() {
   byId("stat-agents").textContent = `${stats.active_agents}`;
   byId("stat-agent-total").textContent = `생성된 agent ${stats.total_agents}`;
   byId("stat-cost").textContent = formatMoney(stats.cost_usd);
-  byId("stat-tokens").textContent = `${formatTokens(stats.tokens)} tokens`;
+  byId("stat-tokens").textContent = `${formatTokens(stats.tokens)} raw · ${formatTokens(stats.effective_tokens)} effective`;
   const modePill = byId("mode-pill");
   const modes = {
     standalone: ["STANDALONE · 로컬 후보", "dry"],
@@ -162,6 +193,11 @@ function renderOverview() {
   const [modeText, modeClass] = modes[snapshot.submission_mode] || modes.dry_run;
   modePill.textContent = modeText;
   modePill.className = `mode-pill ${modeClass}`;
+  const restartPill = byId("restart-pill");
+  restartPill.hidden = !snapshot.restart_required;
+  restartPill.title = snapshot.restart_required
+    ? "실행 후 소스 또는 .env가 변경되었습니다. 현재 풀이가 끝난 뒤 coordinator를 재시작하세요."
+    : "";
 
   const ctfd = snapshot.ctfd || {};
   const sourceBadge = byId("ctfd-source-badge");
@@ -292,9 +328,9 @@ function renderDrawer() {
 
   const controls = node("div", "control-row");
   if (challenge.active) {
-    controls.append(button("Swarm 중단", "danger-button", () => stopChallenge(challenge.name)));
+    controls.append(button("풀이 중단", "danger-button", () => stopChallenge(challenge.name)));
   } else if (!challenge.solved) {
-    controls.append(button("Swarm 시작", "primary-button", () => spawnChallenge(challenge.name)));
+    controls.append(button("SOL 풀이 시작", "primary-button", () => spawnChallenge(challenge.name)));
   }
   controls.append(button("상태 새로고침", "secondary-button", () => refresh({ renderSelected: true })));
   content.append(controls);
@@ -305,25 +341,75 @@ function renderDrawer() {
     content.append(flagSection);
   }
 
+  if (challenge.candidate) {
+    const candidateSection = drawerSection("검증되지 않은 Flag 후보");
+    candidateSection.append(node("div", "flag-value", challenge.candidate));
+    if (challenge.candidate_review_required) {
+      const reviewControls = node("div", "control-row");
+      const accept = button("정답으로 확인", "primary-button", async () => {
+        if (!window.confirm(`${challenge.candidate}를 로컬 정답으로 확정할까요?`)) return;
+        await runCommand(
+          "/api/control/review-candidate",
+          { challenge: challenge.name, flag: challenge.candidate, accepted: true },
+          accept,
+        );
+      });
+      const reject = button("오답으로 거부", "danger-button", async () => {
+        if (!window.confirm(`${challenge.candidate}를 오답 후보로 제거할까요?`)) return;
+        await runCommand(
+          "/api/control/review-candidate",
+          { challenge: challenge.name, flag: challenge.candidate, accepted: false },
+          reject,
+        );
+      });
+      reviewControls.append(accept, reject);
+      candidateSection.append(reviewControls);
+    }
+    content.append(candidateSection);
+  }
+
+  const noteMetadata = /^(source agent|stop reason|attempt|tool steps|original handoff|handoff audit|requested deliverable):/i;
+  const approachNotes = (Array.isArray(challenge.approach_notes) ? challenge.approach_notes : [])
+    .filter((note) => note?.text && !noteMetadata.test(note.text.trim()));
+  const notesSection = drawerSection("지금까지의 접근 노트", `${approachNotes.length} NOTES`);
+  if (!approachNotes.length) {
+    notesSection.append(node("p", "approach-notes-empty", "아직 기록된 접근이 없습니다. 풀이가 진행되면 핵심 가설과 확인 결과가 여기에 요약됩니다."));
+  } else {
+    const notesList = node("ol", "approach-notes");
+    for (const note of approachNotes) {
+      const item = node("li", "approach-note");
+      item.append(
+        node("p", "approach-note-text", note.text || "기록된 내용 없음"),
+        node("span", "approach-note-source", note.source || "solver"),
+      );
+      notesList.append(item);
+    }
+    notesSection.append(notesList);
+  }
+  content.append(notesSection);
+
   const agentsSection = drawerSection("Solver agents", `${challenge.agents.length} AGENTS`);
   if (!challenge.agents.length) {
-    agentsSection.append(node("p", "agent-findings", "Swarm을 시작하면 agent 상태와 trace가 여기에 표시됩니다."));
+    agentsSection.append(node("p", "agent-findings", "SOL 풀이를 시작하면 주 solver와 동적 하위 agent 상태가 여기에 표시됩니다."));
   }
   for (const agent of challenge.agents) {
     const card = node("article", "agent-card");
     const header = node("div", "agent-card-header");
     header.append(
-      node("span", "agent-model", agent.model_spec),
+      node("span", "agent-model", `${agent.role ? agent.role.toUpperCase() + " · " : ""}${agent.model_spec}`),
       node("span", `status-badge ${agent.status === "running" ? "active" : agent.status === "won" ? "solved" : ""}`, agentStatusLabel(agent.status)),
     );
+    if (agent.role_title) header.title = agent.role_title;
     const stats = node("div", "agent-stats");
     stats.append(
       node("span", "", `${formatNumber(agent.steps)} steps`),
       node("span", "", `${formatTokens(agent.input_tokens)} in`),
       node("span", "", `${formatTokens(agent.output_tokens)} out`),
+      node("span", "", `${formatTokens(agent.effective_tokens)} / ${formatTokens(agent.effective_token_limit)} effective`),
       node("span", "", formatMoney(agent.cost_usd)),
     );
     card.append(header, stats);
+    if (agent.skill_path) card.append(node("p", "agent-skill", `Skill: ${agent.skill_path}`));
     if (agent.findings) card.append(node("p", "agent-findings", agent.findings));
     if (agent.stop_reason) card.append(node("p", "agent-stop-reason", `종료 사유: ${agent.stop_reason}`));
     if (agent.workspace_path) card.append(node("p", "agent-workspace", `산출물: ${agent.workspace_path}`));
@@ -456,6 +542,7 @@ async function refresh({ renderSelected = false } = {}) {
   byId("refresh-button").setAttribute("aria-busy", "true");
   try {
     state.snapshot = await api("/api/status");
+    notifyCandidateReviews(state.snapshot);
     setConnection(true);
     renderOverview();
     renderRows();
@@ -566,6 +653,44 @@ async function initialize() {
     }
   });
 
+  const resetDialog = byId("reset-dialog");
+  const resetInput = byId("reset-confirmation");
+  const resetSubmit = byId("reset-submit");
+  byId("reset-open").addEventListener("click", () => {
+    resetInput.value = "";
+    resetSubmit.disabled = true;
+    resetDialog.showModal();
+    resetInput.focus();
+  });
+  byId("reset-cancel").addEventListener("click", () => resetDialog.close());
+  resetDialog.addEventListener("click", (event) => {
+    if (event.target === resetDialog) resetDialog.close();
+  });
+  resetInput.addEventListener("input", () => {
+    resetSubmit.disabled = resetInput.value !== "초기화";
+  });
+  byId("reset-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (resetInput.value !== "초기화") return;
+    const success = await runCommand(
+      "/api/control/reset-runtime",
+      { confirmation: resetInput.value },
+      resetSubmit,
+    );
+    if (success) {
+      closeDrawer();
+      state.candidateNotices.clear();
+      state.ctfdInitialized = false;
+      byId("ctfd-url").value = "";
+      byId("ctfd-token").value = "";
+      byId("ctfd-username").value = "";
+      byId("ctfd-password").value = "";
+      resetDialog.close();
+      resetInput.value = "";
+      resetSubmit.disabled = true;
+    }
+  });
+
   byId("local-challenge-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
@@ -596,6 +721,14 @@ async function initialize() {
   try {
     const session = await api("/api/session");
     state.csrfToken = session.csrf_token;
+    const resetSupported = session.capabilities?.reset_runtime === true
+      || await endpointAvailable("/api/control/reset-runtime");
+    byId("reset-open").disabled = !resetSupported;
+    byId("reset-compatibility").hidden = resetSupported;
+    if (!resetSupported) {
+      byId("reset-open").textContent = "백엔드 재시작 필요";
+      byId("reset-open").title = "실행 중인 coordinator가 초기화 API를 지원하지 않습니다.";
+    }
     await refresh();
     state.refreshTimer = window.setInterval(refresh, 2500);
   } catch (error) {

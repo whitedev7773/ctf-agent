@@ -26,6 +26,7 @@ from backend.agents.coordinator_core import (
     do_submit_flag,
 )
 from backend.agents.coordinator_loop import build_deps, run_event_loop
+from backend.challenge_profiles import format_solver_roster
 from backend.config import Settings
 from backend.deps import CoordinatorDeps
 
@@ -39,7 +40,8 @@ Strategy:
 - Spawn swarms for unsolved challenges, prioritizing by solve count (easy first)
 - Use read_solver_trace to monitor what each solver is doing and where it's stuck
 - When agents are stuck, read their traces, then craft targeted bumps with specific technical guidance
-- Use broadcast to share cross-solver insights (e.g. flag format discovery, shared vulnerabilities)
+- Use broadcast for facts useful to every role; use bump_agent for one role's targeted next action
+- Treat SOL-xhigh as the primary solve owner; bounded Luna workers handle only narrow delegated tasks
 
 CRITICAL RULES:
 - Respect configured attempt, runtime, step, token, command, and submission budgets.
@@ -68,7 +70,7 @@ def _build_coordinator_mcp(deps: CoordinatorDeps):
     async def get_solve_status(args: dict) -> dict:
         return _text(await do_get_solve_status(deps))
 
-    @tool("spawn_swarm", "Launch all solver models on a challenge.", {"challenge_name": str})
+    @tool("spawn_swarm", "Launch the SOL-led adaptive solver on a challenge.", {"challenge_name": str})
     async def spawn_swarm(args: dict) -> dict:
         return _text(await do_spawn_swarm(deps, args["challenge_name"]))
 
@@ -146,7 +148,11 @@ async def run_claude_coordinator(
 
     options = ClaudeAgentOptions(
         model=resolved_model,
-        system_prompt=COORDINATOR_PROMPT,
+        system_prompt=(
+            COORDINATOR_PROMPT
+            + "\nConfigured solver roster:\n"
+            + format_solver_roster(deps.model_specs)
+        ),
         env={"CLAUDECODE": ""},
         mcp_servers={"coordinator": mcp_server},
         allowed_tools=list(allowed),

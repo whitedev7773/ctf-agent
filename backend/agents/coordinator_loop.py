@@ -15,6 +15,7 @@ from backend.deps import CoordinatorDeps
 from backend.models import DEFAULT_MODELS
 from backend.poller import CTFdPoller
 from backend.prompts import ChallengeMeta
+from backend.runtime_state import load_runtime_state
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,13 @@ def build_deps(
         challenge_dirs=challenge_dirs or {},
         challenge_metas=challenge_metas or {},
     )
+
+    # Standalone confirmations and pending review candidates survive a normal
+    # coordinator restart. A dashboard runtime reset removes this file together
+    # with the workspace tree.
+    persisted_results, persisted_candidates = load_runtime_state(settings)
+    deps.results.update(persisted_results)
+    deps.candidates.update(persisted_candidates)
 
     # Pre-load already-pulled challenges
     for d in Path(challenges_root).iterdir():
@@ -215,6 +223,7 @@ async def run_event_loop(
 
     return {
         "results": deps.results,
+        "candidates": deps.candidates,
         "total_cost_usd": cost_tracker.total_cost_usd,
         "total_tokens": cost_tracker.total_tokens,
     }

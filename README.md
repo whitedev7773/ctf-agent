@@ -128,9 +128,12 @@ Each solver gets an isolated Docker container pre-loaded with CTF tools:
 - **Specialist lanes** — rapid triage, systematic validation, and deep exploitation prompts per model
 - **Category playbooks** — Pwn, reversing, crypto, web, forensics, and misc-specific workflows
 - **Persistent recovery** — exploits, scripts, notes, and checkpoints survive container restarts
-- **Hard budgets** — bounded attempts, runtime, turns, tool steps, tokens, commands, and submissions
+- **Adaptive hard budgets** — cache-weighted token budgets, raw safety ceilings, productive checkpoint/compaction, and bounded attempts, runtime, tools, commands, and submissions
+- **Evidence-gated progress** — bulk extraction debris cannot unlock more turns; resumptions prioritize checkpoints, state ledgers, harnesses, and reproducible solvers
+- **Audited delegation** — overlapping tasks are rejected; interrupted workers report state to SOL, and one tiny postprocessor repairs only missing or unsafe handoffs
 - **Docker sandboxes** — isolated containers with full CTF tooling
 - **Operator messaging** — send hints to running solvers mid-competition
+- **Approach notes** — challenge details summarize persistent state, blockers, experiments, and audited handoffs without another model call
 
 ## Configuration
 

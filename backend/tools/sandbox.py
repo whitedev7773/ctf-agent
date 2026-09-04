@@ -15,7 +15,12 @@ from backend.tools.core import (
 )
 
 
-async def bash(ctx: RunContext[SolverDeps], command: str, timeout_seconds: int = 60) -> str:
+async def bash(
+    ctx: RunContext[SolverDeps],
+    command: str,
+    timeout_seconds: int = 60,
+    max_output_chars: int = 12_000,
+) -> str:
     """Execute a bash command inside the sandboxed Docker container.
 
     Distfiles are at /challenge/distfiles/ (read-only).
@@ -23,7 +28,7 @@ async def bash(ctx: RunContext[SolverDeps], command: str, timeout_seconds: int =
     Challenge services are reachable via host.docker.internal.
     Run `cat /tools.txt` to see all installed tools.
     """
-    return await do_bash(ctx.deps.sandbox, command, timeout_seconds)
+    return await do_bash(ctx.deps.sandbox, command, timeout_seconds, max_output_chars)
 
 
 async def read_file(ctx: RunContext[SolverDeps], path: str) -> str:

@@ -9,12 +9,19 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.toolsets.abstract import ToolsetTool
 from pydantic_ai.toolsets.wrapper import WrapperToolset
 
-from backend.artifacts import solver_workspace_path
+from backend.artifacts import (
+    challenge_shared_path,
+    solver_workspace_path,
+    workspace_resume_manifest,
+)
+from backend.budgets import solver_token_limits, token_metrics
+from backend.challenge_profiles import external_skill_path, solver_role
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.deps import SolverDeps
@@ -26,15 +33,15 @@ from backend.models import (
     resolve_model_settings,
     supports_vision,
 )
-from backend.output_types import FlagFound
+from backend.output_types import SolverTurnOutput, assess_solver_output
 from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
 from backend.solver_base import (
+    BUDGET_EXHAUSTED,
     CANCELLED,
     CORRECT_MARKERS,
     ERROR,
     FLAG_FOUND,
-    GAVE_UP,
     SolverResult,
     solver_agent_name,
 )
@@ -83,11 +90,17 @@ class TracingToolset(WrapperToolset[SolverDeps]):
         result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
 
         result_str = str(result) if result is not None else ""
+        outcome_status = self.loop_detector.record_result(name, tool_args, result_str)
         self.tracer.tool_result(name, result_str, step)
 
         # Inject loop warning alongside result on "warn" level
         if loop_status == "warn":
             result = f"{result}\n\n{LOOP_WARNING_MESSAGE}" if isinstance(result, str) else result
+        elif outcome_status == "warn" and isinstance(result, str):
+            result = (
+                f"{result}\n\nTwo consecutive emulator boots produced no usable signal. "
+                "The next boot is blocked until new coordinator guidance."
+            )
 
         # Check for confirmed flag
         if name == "submit_flag" and any(m in result_str for m in CORRECT_MARKERS):
@@ -145,6 +158,7 @@ class Solver:
             cpu_limit=getattr(settings, "container_cpu_limit", 2.0),
             max_exec_timeout_s=getattr(settings, "max_command_timeout_seconds", 600),
             workspace_dir=workspace_dir,
+            shared_workspace_dir=challenge_shared_path(settings, meta.name),
             keep_workspace=True,
         )
         self.use_vision = supports_vision(model_spec)
@@ -158,9 +172,13 @@ class Solver:
             cost_tracker=cost_tracker,
         )
         self.loop_detector = LoopDetector()
-        self.tracer = SolverTracer(meta.name, self.model_spec)
+        self.tracer = SolverTracer(
+            meta.name,
+            self.model_spec,
+            log_dir=getattr(settings, "logs_root", "logs"),
+        )
         self.agent_name = solver_agent_name(meta.name, self.model_spec)
-        self._agent: Agent[SolverDeps, FlagFound] | None = None
+        self._agent: Agent[SolverDeps, SolverTurnOutput] | None = None
         self._messages: list = []
         self._step_count = [0]  # mutable ref shared with TracingToolset
         self._flag: str | None = None
@@ -182,6 +200,10 @@ class Solver:
             distfile_names,
             container_arch=container_arch,
             model_spec=self.model_spec,
+            resume_manifest=workspace_resume_manifest(
+                self.sandbox.workspace_dir,
+                self.sandbox.shared_workspace_dir,
+            ),
         )
 
         model = resolve_model(self.model_spec, self.settings)
@@ -200,10 +222,16 @@ class Solver:
             system_prompt=system_prompt,
             model_settings=model_settings,
             toolsets=[toolset],
-            output_type=FlagFound,
+            output_type=SolverTurnOutput,
         )
 
-        self.tracer.event("start", challenge=self.meta.name, model=self.model_id)
+        self.tracer.event(
+            "start",
+            challenge=self.meta.name,
+            model=self.model_id,
+            role=solver_role(self.model_spec).key,
+            skill=external_skill_path(self.meta.category),
+        )
         logger.info(f"[{self.agent_name}] Solver started")
 
     async def run_until_done_or_gave_up(self) -> SolverResult:
@@ -215,15 +243,53 @@ class Solver:
         t0 = time.monotonic()
         try:
             from pydantic_ai.usage import UsageLimits
+            prior_usage = self.cost_tracker.by_agent.get(self.agent_name)
+            metrics = token_metrics(
+                prior_usage.usage.input_tokens if prior_usage else 0,
+                prior_usage.usage.output_tokens if prior_usage else 0,
+                prior_usage.usage.cache_read_tokens if prior_usage else 0,
+                getattr(self.settings, "solver_cached_token_weight", 0.10),
+            )
+            limits = solver_token_limits(self.settings, self.model_spec)
+            remaining_tokens = (
+                limits.raw_tokens - metrics.raw_tokens if limits.raw_tokens else None
+            )
+            max_steps = max(1, int(getattr(self.settings, "solver_max_steps", 240)))
+            remaining_steps = max_steps - self._step_count[0]
+            if (
+                limits.effective_tokens
+                and metrics.effective_tokens >= limits.effective_tokens
+            ):
+                reason = (
+                    f"effective token budget exhausted before turn "
+                    f"({metrics.effective_tokens}/{limits.effective_tokens})"
+                )
+                self._findings = reason
+                return self._result(BUDGET_EXHAUSTED, stop_reason=reason)
+            if remaining_tokens is not None and remaining_tokens <= 0:
+                reason = (
+                    f"raw token safety ceiling exhausted before turn "
+                    f"({metrics.raw_tokens}/{limits.raw_tokens})"
+                )
+                self._findings = reason
+                return self._result(BUDGET_EXHAUSTED, stop_reason=reason)
+            if remaining_steps <= 0:
+                reason = f"step budget exhausted before turn ({self._step_count[0]}/{max_steps})"
+                self._findings = reason
+                return self._result(BUDGET_EXHAUSTED, stop_reason=reason)
             result = await self._agent.run(
                 "Solve this CTF challenge." if not self._messages else "Continue solving.",
                 deps=self.deps,
                 message_history=self._messages if self._messages else None,
-                usage_limits=UsageLimits(request_limit=None),
+                usage_limits=UsageLimits(
+                    request_limit=None,
+                    tool_calls_limit=remaining_steps,
+                    total_tokens_limit=remaining_tokens,
+                ),
             )
 
             duration = time.monotonic() - t0
-            usage = result.usage()
+            usage = result.usage
 
             self.cost_tracker.record(
                 self.agent_name, usage, self.model_id,
@@ -254,23 +320,25 @@ class Solver:
                     )
 
             output = result.output
-            if isinstance(output, FlagFound):
-                self._flag = output.flag
-                self._findings = f"Flag found via {output.method}: {output.flag}"
-                # In dry-run mode, structured output is sufficient (can't verify via CTFd)
-                if self.deps.no_submit:
-                    self._confirmed = True
-            # CTFd confirmation always counts (the primary path when not in dry-run)
-            if self.deps.confirmed_flag:
-                self._confirmed = True
-                self._flag = self._flag or self.deps.confirmed_flag
-
-            if self._confirmed and self._flag:
-                return self._result(FLAG_FOUND)
-            return self._result(GAVE_UP)
+            assessment = assess_solver_output(
+                output_type=output.type,
+                flag=output.flag,
+                method=output.method,
+                confirmed_flag=self.deps.confirmed_flag,
+                flag_format=self.meta.flag_format,
+            )
+            self._confirmed = assessment.status == FLAG_FOUND
+            self._flag = assessment.flag
+            self._findings = assessment.findings
+            return self._result(assessment.status)
 
         except asyncio.CancelledError:
             return self._result(CANCELLED)
+        except UsageLimitExceeded as exc:
+            reason = f"provider usage budget exhausted during turn: {exc}"
+            self._findings = reason
+            self.tracer.event("budget_exhausted", reason=reason)
+            return self._result(BUDGET_EXHAUSTED, stop_reason=reason)
         except Exception as e:
             logger.error(f"[{self.agent_name}] Error: {e}", exc_info=True)
             self._findings = f"Error: {e}"
@@ -297,7 +365,13 @@ class Solver:
         self.tracer.event("bump", insights=insights[:500])
         logger.info(f"[{self.agent_name}] Bumped with sibling insights")
 
-    def _result(self, status: str, run_steps: int | None = None, run_cost: float | None = None) -> SolverResult:
+    def _result(
+        self,
+        status: str,
+        run_steps: int | None = None,
+        run_cost: float | None = None,
+        stop_reason: str = "",
+    ) -> SolverResult:
         agent_usage = self.cost_tracker.by_agent.get(self.agent_name)
         cost = agent_usage.cost_usd if agent_usage else 0.0
         self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed, cost_usd=round(cost, 4))
@@ -308,6 +382,7 @@ class Solver:
             step_count=run_steps if run_steps is not None else self._step_count[0],
             cost_usd=run_cost if run_cost is not None else cost,
             log_path=self.tracer.path,
+            stop_reason=stop_reason,
         )
 
     async def stop(self) -> None:
