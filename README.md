@@ -73,7 +73,7 @@ uv run ctf-solve \
   -v
 ```
 
-Open the local operations dashboard at [http://127.0.0.1:9400](http://127.0.0.1:9400). Enter a CTFd URL and token there, or stay in standalone mode and register one local challenge with its description, connection details, and attachments. The dashboard also shows live solver status, traces, cost, and swarm controls.
+Open the local operations dashboard at [http://127.0.0.1:9400](http://127.0.0.1:9400). Enter a CTFd URL and token there, or stay in standalone mode and register one local challenge with its description, connection details, and attachments. The dashboard also shows per-solver Docker CPU, memory, process and network usage, writeup evidence, traces, cost, and swarm controls.
 
 CTFd can still be configured ahead of time with `CTFD_URL`/`CTFD_TOKEN` or the `--ctfd-url`/`--ctfd-token` CLI options. It is no longer required.
 
@@ -134,6 +134,10 @@ Each solver gets an isolated Docker container pre-loaded with CTF tools:
 - **Docker sandboxes** — isolated containers with full CTF tooling
 - **Operator messaging** — send hints to running solvers mid-competition
 - **Approach notes** — challenge details summarize persistent state, blockers, experiments, and audited handoffs without another model call
+
+- **Persistent solve experience** — verified, flag-redacted lessons are promoted into a cross-challenge read-only knowledge store that survives runtime resets
+- **Evidence-backed Korean writeups** — confirmed solves produce a Korean-first canonical writeup, reproducible artifact list, and a gallery of valid screenshots while preserving clear English technical terms
+- **Live Docker telemetry** — CPU, memory, PID, network, block I/O, uptime, limits, peaks, and short history are tracked per solver container
 
 ## Configuration
 

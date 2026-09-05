@@ -25,6 +25,7 @@ from backend.challenge_profiles import external_skill_path, solver_role
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.deps import SolverDeps
+from backend.experience import experience_root
 from backend.loop_detect import LOOP_WARNING_MESSAGE, LoopDetector
 from backend.models import (
     model_id_from_spec,
@@ -159,7 +160,13 @@ class Solver:
             max_exec_timeout_s=getattr(settings, "max_command_timeout_seconds", 600),
             workspace_dir=workspace_dir,
             shared_workspace_dir=challenge_shared_path(settings, meta.name),
+            experience_dir=str(experience_root(settings)),
             keep_workspace=True,
+            resource_sample_interval_s=getattr(
+                settings,
+                "resource_sample_interval_seconds",
+                2.0,
+            ),
         )
         self.use_vision = supports_vision(model_spec)
         self.deps = SolverDeps(

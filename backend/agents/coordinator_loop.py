@@ -23,6 +23,13 @@ logger = logging.getLogger(__name__)
 TurnFn = Callable[[str], Coroutine[Any, Any, None]]
 
 
+def _unsolved_names(deps: CoordinatorDeps, poller: CTFdPoller) -> set[str]:
+    """Treat locally persisted confirmations as solved across restarts."""
+    known = poller.known_challenges | set(deps.challenge_metas)
+    solved = poller.known_solved | set(deps.results)
+    return known - solved
+
+
 def build_deps(
     settings: Settings,
     model_specs: list[str] | None = None,
@@ -115,11 +122,12 @@ async def run_event_loop(
     )
 
     known = poller.known_challenges | set(deps.challenge_metas)
-    unsolved = known - poller.known_solved
+    solved = poller.known_solved | set(deps.results)
+    unsolved = known - solved
     mode = "CTFd connected" if ctfd.is_configured else "standalone local mode"
     initial_msg = (
         f"CTF Agent started in {mode}. {len(known)} challenges, "
-        f"{len(poller.known_solved)} solved.\n"
+        f"{len(solved)} solved.\n"
         f"Unsolved: {sorted(unsolved) if unsolved else 'NONE'}\n"
         "Spawn swarms for available unsolved challenges."
     )
@@ -246,7 +254,6 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
 
 async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
     """Auto-spawn swarms for all unsolved challenges that don't have active swarms."""
-    unsolved = (poller.known_challenges | set(deps.challenge_metas)) - poller.known_solved
-    for name in sorted(unsolved):
+    for name in sorted(_unsolved_names(deps, poller)):
         await _auto_spawn_one(deps, name)
     return

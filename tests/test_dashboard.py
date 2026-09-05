@@ -14,6 +14,7 @@ from aiohttp import ClientSession, FormData
 from backend.ctfd import CTFdClient
 from backend.dashboard.server import DashboardServer, _clear_runtime_root
 from backend.prompts import ChallengeMeta, build_prompt
+from backend.writeups import finalize_writeup
 
 
 class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
@@ -23,7 +24,13 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.challenges_root = self.runtime_root / "challenges"
         self.workspace_root = self.runtime_root / "workspace"
         self.logs_root = self.runtime_root / "logs"
-        for root in (self.challenges_root, self.workspace_root, self.logs_root):
+        self.experience_root = Path(self.temp_dir.name) / "experience"
+        for root in (
+            self.challenges_root,
+            self.workspace_root,
+            self.logs_root,
+            self.experience_root,
+        ):
             root.mkdir(parents=True)
         settings = SimpleNamespace(
             ctfd_url="",
@@ -31,6 +38,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             ctfd_user="",
             ctfd_pass="",
             workspace_root=str(self.workspace_root),
+            experience_root=str(self.experience_root),
             logs_root=str(self.logs_root),
         )
         self.deps = SimpleNamespace(
@@ -43,7 +51,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             swarm_tasks={},
             results={},
             candidates={},
-            model_specs=["codex:gpt-5.6-luna"],
+            model_specs=["codex/gpt-5.6-luna/low"],
             max_concurrent_challenges=3,
             no_submit=True,
             force_no_submit=False,
@@ -94,7 +102,8 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["stats"]["total"], 1)
             self.assertEqual(payload["challenges"][0]["name"], "web/intro")
             self.assertEqual(payload["challenges"][0]["status"], "idle")
-            self.assertEqual(payload["runtime_revision"], 10)
+            self.assertEqual(payload["runtime_revision"], 15)
+            self.assertTrue(callable(self.deps.request_writeup_generation))
             self.assertFalse(payload["restart_required"])
             self.assertTrue(payload["runtime_policy"]["adaptive_delegation"])
             self.assertTrue(payload["runtime_policy"]["in_turn_budget_interrupt"])
@@ -109,11 +118,21 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
                 80_000,
             )
             self.assertEqual(payload["stats"]["effective_tokens"], 0)
+            self.assertEqual(payload["stats"]["documented"], 0)
+            self.assertEqual(payload["resources"]["container_count"], 0)
+            self.assertEqual(payload["experience"]["record_count"], 0)
             self.assertEqual(payload["challenges"][0]["approach_notes"], [])
+
+        async with self.client.get(f"{self.base_url}/api/resources") as response:
+            resources = await response.json()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(resources["resources"]["container_count"], 0)
 
         async with self.client.get(f"{self.base_url}/assets/dashboard.js") as response:
             javascript = await response.text()
             self.assertIn("지금까지의 접근 노트", javascript)
+            self.assertIn('writeup.status === "generating"', javascript)
+            self.assertIn("refresh({ renderSelected: true })", javascript)
 
     async def test_detail_notes_are_bounded_and_loaded_from_shared_state(self) -> None:
         from backend.artifacts import challenge_shared_path
@@ -152,6 +171,167 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("curl" in note["text"] for note in notes))
         self.assertFalse(any("Source agent" in note["text"] for note in notes))
         self.assertFalse(any("Tool steps" in note["text"] for note in notes))
+
+    async def test_cancelled_solver_without_outcome_is_not_labeled_winner(self) -> None:
+        model_spec = "codex/gpt-5.6-sol/xhigh"
+        cancelled = asyncio.Event()
+        cancelled.set()
+        self.deps.swarms["web/intro"] = SimpleNamespace(
+            model_specs=[model_spec],
+            solvers={model_spec: SimpleNamespace(
+                sandbox=SimpleNamespace(
+                    workspace_dir="workspace",
+                    resource_snapshot=lambda: {},
+                ),
+                tracer=SimpleNamespace(path=""),
+                _step_count=3,
+                _budget_stop_reason="",
+                _checkpoint_stop_reason="",
+            )},
+            outcomes={},
+            winner=None,
+            findings={},
+            waiting_models=set(),
+            cancel_event=cancelled,
+        )
+
+        async with self.client.get(f"{self.base_url}/api/status") as response:
+            payload = await response.json()
+
+        self.assertEqual(payload["challenges"][0]["agents"][0]["status"], "finished")
+
+    async def test_writeup_api_serves_text_but_rejects_artifact_traversal(self) -> None:
+        from backend.artifacts import challenge_shared_path
+
+        shared = Path(challenge_shared_path(self.deps.settings, "web/intro"))
+        lead = shared / "lead"
+        lead.mkdir(parents=True)
+        (lead / "SOLUTION.md").write_text(
+            "# 풀이\n\n## 증거\n조작한 요청을 전송하자 인증 검사 없이 관리자 응답이 반환되는 것을 확인했습니다.\n\n"
+            "## 재현\n```sh\npython3 solve.py\n```\n",
+            encoding="utf-8",
+        )
+        (lead / "solve.py").write_text("print('ok')\n", encoding="utf-8")
+        self.deps.results["web/intro"] = {"flag": "TEAM{done}"}
+        finalize_writeup(self.deps.settings, "web/intro", "Web", "TEAM{done}")
+
+        async with self.client.get(
+            f"{self.base_url}/api/writeup",
+            params={"challenge": "web/intro"},
+        ) as response:
+            payload = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertIn("## 검증", payload["content"])
+        self.assertTrue(payload["writeup"]["documented"])
+
+        async with self.client.get(
+            f"{self.base_url}/api/artifact",
+            params={"challenge": "web/intro", "path": "../../.env"},
+        ) as response:
+            self.assertEqual(response.status, 404)
+
+    async def test_writeup_can_be_requested_after_restart(self) -> None:
+        from backend.artifacts import challenge_shared_path
+
+        shared = Path(challenge_shared_path(self.deps.settings, "web/intro"))
+        lead = shared / "lead"
+        lead.mkdir(parents=True)
+        (lead / "SOLUTION.md").write_text(
+            "# 복구된 풀이\n\n"
+            "## 증거\n서버 재시작 뒤에도 보존된 요청을 사용해 인증 우회를 동일하게 재현했습니다.\n\n"
+            "## 재현\n```sh\npython solve.py\n```\n",
+            encoding="utf-8",
+        )
+        (lead / "solve.py").write_text("print('reproduced')\n", encoding="utf-8")
+        generation_started = asyncio.Event()
+        finish_generation = asyncio.Event()
+
+        class FakeWriteupSolver:
+            model_spec = "codex/gpt-5.6-luna/low"
+            agent_name = "web/intro/codex/gpt-5.6-luna/low/writeup"
+            _step_count = 1
+            tracer = SimpleNamespace(path="writeup-trace.jsonl")
+            sandbox = SimpleNamespace(
+                workspace_dir="writeup-workspace",
+                resource_snapshot=lambda: {"status": "running"},
+            )
+
+            async def run_until_done_or_gave_up(self):
+                generation_started.set()
+                await finish_generation.wait()
+                output = shared / "writeup"
+                evidence = output / "evidence"
+                evidence.mkdir(parents=True, exist_ok=True)
+                (output / "WRITEUP.md").write_text(
+                    "# web/intro 풀이\n\n"
+                    "## 요약\n인증 검사가 누락된 요청 경로를 이용해 관리자 전용 응답을 확인한 문제입니다.\n\n"
+                    "## 취약점 또는 핵심 원리\n서버가 요청의 권한 정보를 검증하지 않아 일반 사용자 입력이 관리자 처리 경로에 도달했습니다.\n\n"
+                    "## 풀이 과정\n보존된 요청과 응답을 비교해 권한 검사 누락 지점을 찾고 조작한 요청을 두 번 전송해 같은 결과를 확인했습니다.\n\n"
+                    "## 재현 방법\n```sh\npython solve.py\n```\n\n"
+                    "## 검증\n재현 스크립트 실행 결과 관리자 응답과 검증된 결과가 일치했습니다.\n",
+                    encoding="utf-8",
+                )
+                (evidence / "admin-response.png").write_bytes(
+                    b"\x89PNG\r\n\x1a\n" + b"0" * 24
+                )
+                return SimpleNamespace(status="gave_up")
+
+            async def stop(self):
+                return None
+
+        fake_solver = FakeWriteupSolver()
+        self.server._create_writeup_solver = MagicMock(return_value=fake_solver)
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+
+        endpoint = f"{self.base_url}/api/control/request-writeup"
+        async with self.client.post(
+            endpoint,
+            json={"challenge": "web/intro"},
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            self.assertEqual(response.status, 409)
+
+        # A fresh coordinator can know the solve from CTFd even when the local
+        # result record (including the submitted flag) was not persisted.
+        self.poller.known_solved.add("web/intro")
+        async with self.client.post(
+            endpoint,
+            json={"challenge": "web/intro"},
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            payload = await response.json()
+
+        self.assertEqual(response.status, 202)
+        self.assertEqual(payload["writeup"]["status"], "generating")
+        await generation_started.wait()
+        task = self.server._writeup_tasks["web/intro"]
+
+        async with self.client.get(f"{self.base_url}/api/status") as response:
+            generating = await response.json()
+        self.assertEqual(generating["challenges"][0]["writeup"]["status"], "generating")
+        self.assertTrue(generating["challenges"][0]["writeup"]["active"])
+
+        async with self.client.post(
+            endpoint,
+            json={"challenge": "web/intro"},
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            self.assertEqual(response.status, 409)
+
+        finish_generation.set()
+        await task
+
+        async with self.client.get(
+            f"{self.base_url}/api/writeup",
+            params={"challenge": "web/intro"},
+        ) as response:
+            recovered = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(recovered["writeup"]["documented"])
+        self.assertEqual(recovered["writeup"]["status"], "complete")
+        self.assertEqual(len(recovered["writeup"]["screenshots"]), 1)
+        self.assertIn("## 주요 스크린샷", recovered["content"])
 
     async def test_dashboard_mutation_requires_session_token(self) -> None:
         endpoint = f"{self.base_url}/api/operator/message"
@@ -324,6 +504,9 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         trace_file.write_text("{}\n", encoding="utf-8")
         preserved = Path(self.temp_dir.name) / ".env"
         preserved.write_text("OPENAI_API_KEY=preserved", encoding="utf-8")
+        experience_file = self.experience_root / "pwn" / "prior.md"
+        experience_file.parent.mkdir()
+        experience_file.write_text("persistent knowledge", encoding="utf-8")
 
         await self.deps.ctfd.configure("https://ctf.example.com", "secret")
         self.deps.settings.ctfd_url = "https://ctf.example.com"
@@ -358,6 +541,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(root.is_dir())
             self.assertEqual(list(root.iterdir()), [])
         self.assertEqual(preserved.read_text(encoding="utf-8"), "OPENAI_API_KEY=preserved")
+        self.assertEqual(experience_file.read_text(encoding="utf-8"), "persistent knowledge")
         self.assertFalse(self.deps.ctfd.is_configured)
         self.assertTrue(self.deps.no_submit)
         self.assertEqual(self.deps.swarms, {})
@@ -371,6 +555,35 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.deps.operator_inbox.empty())
         self.poller.reseed.assert_awaited_once()
         self.poller.drain_events.assert_called_once_with()
+
+    async def test_experience_reset_is_independent_and_requires_confirmation(self) -> None:
+        record = self.experience_root / "web" / "record.md"
+        record.parent.mkdir()
+        record.write_text("verified tactic", encoding="utf-8")
+        runtime_marker = self.workspace_root / "keep.txt"
+        runtime_marker.write_text("active workspace", encoding="utf-8")
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+
+        async with self.client.post(
+            f"{self.base_url}/api/control/reset-experience",
+            json={"confirmation": "wrong"},
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            self.assertEqual(response.status, 400)
+        self.assertTrue(record.is_file())
+
+        async with self.client.post(
+            f"{self.base_url}/api/control/reset-experience",
+            json={"confirmation": "경험 초기화"},
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(record.exists())
+        self.assertEqual(runtime_marker.read_text(encoding="utf-8"), "active workspace")
 
     def test_runtime_clear_retains_locked_file_and_continues(self) -> None:
         removable = self.logs_root / "old.log"

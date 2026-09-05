@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import re
 import secrets
 import shutil
@@ -16,13 +17,24 @@ from typing import TYPE_CHECKING, Any
 import yaml
 from aiohttp import web
 
-from backend.artifacts import challenge_approach_notes
+from backend.artifacts import challenge_approach_notes, challenge_workspace_path
 from backend.budgets import solver_token_limits, token_metrics
 from backend.challenge_profiles import external_skill_path, solver_role
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
+from backend.experience import experience_root, experience_summary
+from backend.model_specs import provider_from_spec
 from backend.prompts import ChallengeMeta
+from backend.runtime_state import persist_deps_state
 from backend.solver_base import solver_agent_name
+from backend.writeups import (
+    begin_writeup_generation,
+    fail_writeup_generation,
+    finalize_writeup,
+    interrupted_writeup_status,
+    read_writeup,
+    writeup_status,
+)
 
 if TYPE_CHECKING:
     from backend.deps import CoordinatorDeps
@@ -30,8 +42,10 @@ if TYPE_CHECKING:
 
 
 STATIC_DIR = Path(__file__).parent / "static"
+logger = logging.getLogger(__name__)
 RESET_CONFIRMATION = "초기화"
-RUNTIME_REVISION = 10
+RESET_EXPERIENCE_CONFIRMATION = "경험 초기화"
+RUNTIME_REVISION = 15
 
 
 def _runtime_source_fingerprint(project_root: Path | None = None) -> str:
@@ -182,6 +196,42 @@ def _usage_payload(
     }
 
 
+def _resource_totals(resources: list[dict[str, Any]]) -> dict[str, Any]:
+    available = [resource for resource in resources if resource.get("available")]
+    return {
+        "container_count": len(resources),
+        "available_count": len(available),
+        "stale_count": sum(bool(resource.get("stale")) for resource in resources),
+        "cpu_percent": round(
+            sum(float(resource.get("cpu_percent", 0) or 0) for resource in available),
+            2,
+        ),
+        "cpu_limit": round(
+            sum(float(resource.get("cpu_limit", 0) or 0) for resource in resources),
+            2,
+        ),
+        "memory_bytes": sum(
+            int(resource.get("memory_bytes", 0) or 0) for resource in available
+        ),
+        "memory_limit_bytes": sum(
+            int(resource.get("memory_limit_bytes", 0) or 0) for resource in resources
+        ),
+        "pids": sum(int(resource.get("pids", 0) or 0) for resource in available),
+        "network_rx_bytes": sum(
+            int(resource.get("network_rx_bytes", 0) or 0) for resource in available
+        ),
+        "network_tx_bytes": sum(
+            int(resource.get("network_tx_bytes", 0) or 0) for resource in available
+        ),
+        "block_read_bytes": sum(
+            int(resource.get("block_read_bytes", 0) or 0) for resource in available
+        ),
+        "block_write_bytes": sum(
+            int(resource.get("block_write_bytes", 0) or 0) for resource in available
+        ),
+    }
+
+
 class DashboardServer:
     """Serve dashboard assets and same-process coordinator controls."""
 
@@ -203,6 +253,10 @@ class DashboardServer:
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
         self._command_lock = asyncio.Lock()
+        self._writeup_lock = asyncio.Lock()
+        self._writeup_tasks: dict[str, asyncio.Task[None]] = {}
+        self._writeup_solvers: dict[str, Any] = {}
+        self.deps.request_writeup_generation = self.start_writeup_generation
 
     async def start(self) -> None:
         app = web.Application(client_max_size=256 * 1024 * 1024, middlewares=[self._headers])
@@ -214,6 +268,9 @@ class DashboardServer:
                 web.get("/api/health", self._health),
                 web.get("/api/session", self._session),
                 web.get("/api/status", self._status),
+                web.get("/api/resources", self._resources),
+                web.get("/api/writeup", self._writeup),
+                web.get("/api/artifact", self._artifact),
                 web.get("/api/trace", self._trace),
                 web.post("/api/settings/ctfd", self._configure_ctfd),
                 web.post("/api/challenges/local", self._create_local_challenge),
@@ -223,7 +280,9 @@ class DashboardServer:
                 web.post("/api/control/broadcast", self._broadcast),
                 web.post("/api/control/submit", self._submit),
                 web.post("/api/control/review-candidate", self._review_candidate),
+                web.post("/api/control/request-writeup", self._request_writeup),
                 web.post("/api/control/reset-runtime", self._reset_runtime),
+                web.post("/api/control/reset-experience", self._reset_experience),
                 # Backward-compatible endpoint used by the ctf-msg command.
                 web.post("/msg", self._legacy_message),
             ]
@@ -239,6 +298,12 @@ class DashboardServer:
             self.actual_port = sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
+        tasks = list(self._writeup_tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         if self._runner:
             await self._runner.cleanup()
         self._site = None
@@ -275,7 +340,11 @@ class DashboardServer:
                 "csrf_token": self.csrf_token,
                 "port": self.actual_port,
                 "no_submit": self.deps.no_submit,
-                "capabilities": {"reset_runtime": True},
+                "capabilities": {
+                    "reset_runtime": True,
+                    "reset_experience": True,
+                    "request_writeup": True,
+                },
             }
         )
 
@@ -314,6 +383,8 @@ class DashboardServer:
         challenges: list[dict[str, Any]] = []
         total_agents = 0
         active_agents = 0
+        live_resources: list[dict[str, Any]] = []
+        documented_count = 0
 
         for name in sorted(known, key=str.casefold):
             meta = self.deps.challenge_metas.get(name)
@@ -345,6 +416,9 @@ class DashboardServer:
                         self.deps.settings,
                         spec,
                     )
+                    sandbox = getattr(solver, "sandbox", None) if solver else None
+                    resource_reader = getattr(sandbox, "resource_snapshot", None)
+                    resource = resource_reader() if callable(resource_reader) else {}
                     agents.append(
                         {
                             "model_spec": spec,
@@ -356,7 +430,7 @@ class DashboardServer:
                             ) else "stopping" if (
                                 running and budget_stop_pending
                             ) else "running" if running else (
-                                "won" if outcome is swarm.winner else (
+                                "won" if outcome is not None and outcome is swarm.winner else (
                                     outcome.status if outcome else "finished"
                                 )
                             ),
@@ -373,11 +447,53 @@ class DashboardServer:
                                 outcome.workspace_path if outcome and outcome.workspace_path
                                 else getattr(getattr(solver, "sandbox", None), "workspace_dir", "")
                             ),
+                            "resource": resource,
                             **usage,
                         }
                     )
                     total_agents += 1
                     active_agents += int(running or waiting)
+
+            writeup_solver = self._writeup_solvers.get(name)
+            writeup_task = self._writeup_tasks.get(name)
+            if writeup_solver is not None and writeup_task is not None and not writeup_task.done():
+                spec = f"{writeup_solver.model_spec}/writeup"
+                resource_reader = getattr(writeup_solver.sandbox, "resource_snapshot", None)
+                resource = resource_reader() if callable(resource_reader) else {}
+                agents.append(
+                    {
+                        "model_spec": spec,
+                        "role": "writeup",
+                        "role_title": "Korean writeup generator",
+                        "skill_path": "",
+                        "status": "generating",
+                        "steps": getattr(writeup_solver, "_step_count", 0),
+                        "findings": "한국어 최종본과 주요 스크린샷을 구성하고 있습니다.",
+                        "trace": Path(
+                            getattr(getattr(writeup_solver, "tracer", None), "path", "")
+                        ).name,
+                        "stop_reason": "",
+                        "attempt": 1,
+                        "workspace_path": getattr(writeup_solver.sandbox, "workspace_dir", ""),
+                        "resource": resource,
+                        **_usage_payload(
+                            self.cost_tracker,
+                            writeup_solver.agent_name,
+                            self.deps.settings,
+                            writeup_solver.model_spec,
+                        ),
+                    }
+                )
+                total_agents += 1
+                active_agents += 1
+
+            agent_resources = [agent["resource"] for agent in agents if agent.get("resource")]
+            challenge_resources = _resource_totals(agent_resources)
+            live_resources.extend(
+                resource
+                for resource in agent_resources
+                if resource.get("status") != "stopped"
+            )
 
             status = (
                 "solved" if is_solved
@@ -390,6 +506,8 @@ class DashboardServer:
                 name,
                 live_findings=getattr(swarm, "findings", {}) if swarm else {},
             )
+            writeup = self._current_writeup_status(name, solved=is_solved)
+            documented_count += int(bool(writeup.get("documented")))
             challenges.append(
                 {
                     "name": name,
@@ -404,6 +522,9 @@ class DashboardServer:
                     "candidates": candidate.get("flags", []),
                     "candidate_review_required": bool(candidate.get("review_required")),
                     "approach_notes": approach_notes,
+                    "writeup": writeup,
+                    "documented": bool(writeup.get("documented")),
+                    "resources": challenge_resources,
                     "agents": agents,
                     "cost_usd": round(sum(a["cost_usd"] for a in agents), 6),
                 }
@@ -424,6 +545,7 @@ class DashboardServer:
         )
 
         current_source_fingerprint = _runtime_source_fingerprint()
+        resource_totals = _resource_totals(live_resources)
         return {
             "updated_at": datetime.now(UTC).isoformat(),
             "runtime_revision": RUNTIME_REVISION,
@@ -511,8 +633,13 @@ class DashboardServer:
                     400_000,
                 ),
                 "workspace_root": str(getattr(self.deps.settings, "workspace_root", "workspace")),
+                "experience_root": str(
+                    getattr(self.deps.settings, "experience_root", "experience")
+                ),
                 "logs_root": str(getattr(self.deps.settings, "logs_root", "logs")),
             },
+            "resources": resource_totals,
+            "experience": experience_summary(self.deps.settings),
             "stats": {
                 "total": len(known),
                 "solved": len(solved),
@@ -520,6 +647,7 @@ class DashboardServer:
                 "active_swarms": len(active_names),
                 "active_agents": active_agents,
                 "total_agents": total_agents,
+                "documented": documented_count,
                 "cost_usd": round(self.cost_tracker.total_cost_usd, 6),
                 "tokens": self.cost_tracker.total_tokens,
                 "effective_tokens": effective_total,
@@ -529,6 +657,255 @@ class DashboardServer:
 
     async def _status(self, _request: web.Request) -> web.Response:
         return web.json_response(self._snapshot())
+
+    async def _resources(self, _request: web.Request) -> web.Response:
+        challenges: list[dict[str, Any]] = []
+        live: list[dict[str, Any]] = []
+        names = set(self.deps.swarms) | set(self._writeup_solvers)
+        for name in names:
+            swarm = self.deps.swarms.get(name)
+            agents: list[dict[str, Any]] = []
+            if swarm:
+                for spec in swarm.model_specs:
+                    solver = swarm.solvers.get(spec)
+                    sandbox = getattr(solver, "sandbox", None) if solver else None
+                    reader = getattr(sandbox, "resource_snapshot", None)
+                    resource = reader() if callable(reader) else {}
+                    if not resource:
+                        continue
+                    agents.append(
+                        {
+                            "model_spec": spec,
+                            "role": solver_role(spec).key,
+                            "resource": resource,
+                        }
+                    )
+                    if resource.get("status") != "stopped":
+                        live.append(resource)
+            writeup_solver = self._writeup_solvers.get(name)
+            if writeup_solver is not None:
+                reader = getattr(writeup_solver.sandbox, "resource_snapshot", None)
+                resource = reader() if callable(reader) else {}
+                if resource:
+                    agents.append(
+                        {
+                            "model_spec": f"{writeup_solver.model_spec}/writeup",
+                            "role": "writeup",
+                            "resource": resource,
+                        }
+                    )
+                    if resource.get("status") != "stopped":
+                        live.append(resource)
+            if agents:
+                challenges.append(
+                    {
+                        "name": name,
+                        "resources": _resource_totals(
+                            [agent["resource"] for agent in agents]
+                        ),
+                        "agents": agents,
+                    }
+                )
+        return web.json_response(
+            {
+                "updated_at": datetime.now(UTC).isoformat(),
+                "resources": _resource_totals(live),
+                "challenges": challenges,
+            }
+        )
+
+    async def _writeup(self, request: web.Request) -> web.Response:
+        name = request.query.get("challenge", "").strip()
+        if name not in self.deps.challenge_metas and name not in self.deps.results:
+            raise web.HTTPNotFound(text="challenge not found")
+        try:
+            content, _status, _ = read_writeup(self.deps.settings, name)
+        except FileNotFoundError as exc:
+            raise web.HTTPNotFound(text=str(exc)) from exc
+        status = self._current_writeup_status(name, solved=True)
+        return web.json_response({"challenge": name, "content": content, "writeup": status})
+
+    def _current_writeup_status(self, name: str, *, solved: bool) -> dict[str, Any]:
+        status = writeup_status(self.deps.settings, name, solved=solved)
+        task = self._writeup_tasks.get(name)
+        if task is not None and not task.done():
+            status = dict(status)
+            status["status"] = "generating"
+            status["documented"] = False
+            status["active"] = True
+            solver = self._writeup_solvers.get(name)
+            resource_reader = getattr(getattr(solver, "sandbox", None), "resource_snapshot", None)
+            if callable(resource_reader):
+                status["resource"] = resource_reader()
+            return status
+        return interrupted_writeup_status(status)
+
+    def _writeup_model_spec(self) -> str:
+        return next(
+            (spec for spec in self.deps.model_specs if provider_from_spec(spec) == "codex"),
+            "",
+        )
+
+    def _create_writeup_solver(
+        self,
+        name: str,
+        meta: ChallengeMeta,
+        challenge_dir: str,
+        model_spec: str,
+        flag: str,
+    ):
+        from backend.agents.codex_solver import CodexSolver
+
+        return CodexSolver(
+            model_spec=model_spec,
+            challenge_dir=challenge_dir,
+            meta=meta,
+            ctfd=self.deps.ctfd,
+            cost_tracker=self.cost_tracker,
+            settings=self.deps.settings,
+            no_submit=True,
+            task_mode="writeup",
+            verified_flag=flag,
+        )
+
+    async def _run_writeup_generation(
+        self,
+        name: str,
+        meta: ChallengeMeta,
+        model_spec: str,
+        flag: str,
+    ) -> None:
+        challenge_dir = self.deps.challenge_dirs.get(name, self.deps.challenges_root)
+        solver = self._create_writeup_solver(
+            name,
+            meta,
+            challenge_dir,
+            model_spec,
+            flag,
+        )
+        self._writeup_solvers[name] = solver
+        try:
+            timeout = max(
+                60,
+                int(getattr(self.deps.settings, "writeup_generation_timeout_seconds", 1800)),
+            )
+            result = await asyncio.wait_for(solver.run_until_done_or_gave_up(), timeout=timeout)
+            status = finalize_writeup(
+                self.deps.settings,
+                name,
+                getattr(meta, "category", "Unknown"),
+                flag,
+                prefer_canonical=True,
+                require_screenshots=True,
+            )
+            if not status.get("documented") and result.status in {"error", "quota_error"}:
+                status = fail_writeup_generation(
+                    self.deps.settings,
+                    name,
+                    "AI 라이트업 생성기가 오류로 종료되었습니다. 다시 요청할 수 있습니다",
+                )
+        except asyncio.CancelledError:
+            fail_writeup_generation(
+                self.deps.settings,
+                name,
+                "라이트업 생성 작업이 서버 종료 또는 초기화로 중단되었습니다",
+            )
+            raise
+        except TimeoutError:
+            status = fail_writeup_generation(
+                self.deps.settings,
+                name,
+                "라이트업 생성 제한 시간을 초과했습니다. 다시 요청할 수 있습니다",
+            )
+        except Exception as exc:
+            logger.warning("Writeup generation failed for %s: %s", name, exc, exc_info=True)
+            status = fail_writeup_generation(
+                self.deps.settings,
+                name,
+                f"라이트업 생성 실패: {type(exc).__name__}: {exc}",
+            )
+        finally:
+            try:
+                await solver.stop()
+            except Exception as exc:
+                logger.warning("Could not stop writeup generator for %s: %s", name, exc)
+            self._writeup_solvers.pop(name, None)
+            self._writeup_tasks.pop(name, None)
+
+        if name in self.deps.results:
+            self.deps.results[name]["writeup"] = status
+        persist_deps_state(self.deps)
+
+    async def start_writeup_generation(self, name: str) -> dict[str, Any]:
+        """Schedule the same AI pipeline for automatic and manual requests."""
+        async with self._writeup_lock:
+            existing = self._writeup_tasks.get(name)
+            if existing is not None and not existing.done():
+                return self._current_writeup_status(name, solved=True)
+
+            model_spec = self._writeup_model_spec()
+            if not model_spec:
+                raise RuntimeError("writeup generation requires a configured Codex model")
+
+            meta = self.deps.challenge_metas.get(name)
+            if meta is None:
+                meta = ChallengeMeta(name=name, category="Unknown")
+            result = self.deps.results.get(name, {})
+            status = begin_writeup_generation(self.deps.settings, name, model_spec)
+            task = asyncio.create_task(
+                self._run_writeup_generation(
+                    name,
+                    meta,
+                    model_spec,
+                    str(result.get("flag", "")),
+                ),
+                name=f"writeup-{name}",
+            )
+            self._writeup_tasks[name] = task
+            return status
+
+    async def _request_writeup(self, request: web.Request) -> web.Response:
+        """Start a real asynchronous AI regeneration from preserved artifacts."""
+        self._require_csrf(request)
+        data = await self._json_body(request)
+        name = str(data.get("challenge", "")).strip()
+        known = self.poller.known_challenges | set(self.deps.challenge_metas) | set(self.deps.results)
+        if not name or name not in known:
+            raise web.HTTPNotFound(text="challenge not found")
+        solved = self.poller.known_solved | set(self.deps.results)
+        if name not in solved:
+            raise web.HTTPConflict(text="writeup can only be requested for a solved challenge")
+
+        existing = self._writeup_tasks.get(name)
+        if existing is not None and not existing.done():
+            raise web.HTTPConflict(text="writeup generation is already running")
+
+        try:
+            status = await self.start_writeup_generation(name)
+        except RuntimeError as exc:
+            raise web.HTTPConflict(text=str(exc)) from exc
+
+        message = f"{name} 라이트업 AI 재생성을 시작했습니다."
+        return web.json_response(
+            {"ok": True, "message": message, "challenge": name, "writeup": status},
+            status=202,
+        )
+
+    async def _artifact(self, request: web.Request) -> web.StreamResponse:
+        name = request.query.get("challenge", "").strip()
+        relative = request.query.get("path", "").strip()
+        if name not in self.deps.challenge_metas and name not in self.deps.results:
+            raise web.HTTPNotFound(text="challenge not found")
+        root = Path(challenge_workspace_path(self.deps.settings, name)).resolve()
+        path = (root / relative).resolve()
+        if (
+            not relative
+            or not path.is_relative_to(root)
+            or path.suffix.casefold() not in {".png", ".jpg", ".jpeg", ".webp"}
+            or not path.is_file()
+        ):
+            raise web.HTTPNotFound(text="artifact not found")
+        return web.FileResponse(path)
 
     async def _trace(self, request: web.Request) -> web.Response:
         from backend.agents.coordinator_core import do_read_solver_trace
@@ -775,13 +1152,29 @@ class DashboardServer:
             Path(getattr(self.deps.settings, "workspace_root", "workspace")).expanduser().resolve(),
             Path(getattr(self.deps.settings, "logs_root", "logs")).expanduser().resolve(),
         }
+        permanent_experience = Path(
+            getattr(self.deps.settings, "experience_root", "experience")
+        ).expanduser().resolve()
         try:
             for root in roots:
                 _validate_runtime_root(root, project_root)
+                if (
+                    root == permanent_experience
+                    or root.is_relative_to(permanent_experience)
+                    or permanent_experience.is_relative_to(root)
+                ):
+                    raise ValueError("runtime path overlaps permanent experience storage")
         except ValueError as exc:
             raise web.HTTPConflict(text=str(exc)) from exc
 
         async with self._command_lock:
+            writeup_tasks = list(self._writeup_tasks.values())
+            for task in writeup_tasks:
+                if not task.done():
+                    task.cancel()
+            if writeup_tasks:
+                await asyncio.gather(*writeup_tasks, return_exceptions=True)
+
             for swarm in list(self.deps.swarms.values()):
                 swarm.kill()
             tasks = list(self.deps.swarm_tasks.values())
@@ -828,5 +1221,44 @@ class DashboardServer:
                     "풀이 기록과 실행 환경을 초기화했습니다. "
                     f"런타임 항목 {removed}개를 제거하고 독립 모드로 전환했습니다."
                 ),
+            }
+        )
+
+    async def _reset_experience(self, request: web.Request) -> web.Response:
+        """Clear only the curated cross-challenge experience repository."""
+        self._require_csrf(request)
+        data = await self._json_body(request)
+        if data.get("confirmation") != RESET_EXPERIENCE_CONFIRMATION:
+            raise web.HTTPBadRequest(
+                text=f"Enter '{RESET_EXPERIENCE_CONFIRMATION}' exactly."
+            )
+
+        root = experience_root(self.deps.settings).resolve()
+        project_root = Path.cwd().resolve()
+        runtime_roots = {
+            Path(self.deps.challenges_root).expanduser().resolve(),
+            Path(getattr(self.deps.settings, "workspace_root", "workspace")).expanduser().resolve(),
+            Path(getattr(self.deps.settings, "logs_root", "logs")).expanduser().resolve(),
+        }
+        try:
+            _validate_runtime_root(root, project_root)
+            if any(
+                root == runtime_root
+                or root.is_relative_to(runtime_root)
+                or runtime_root.is_relative_to(root)
+                for runtime_root in runtime_roots
+            ):
+                raise ValueError("experience path overlaps a runtime directory")
+        except ValueError as exc:
+            raise web.HTTPConflict(text=str(exc)) from exc
+
+        async with self._command_lock:
+            removed, retained = await asyncio.to_thread(_clear_runtime_root, root)
+        return web.json_response(
+            {
+                "ok": True,
+                "removed_entries": removed,
+                "retained_locked_entries": len(retained),
+                "message": f"Stored solver experience was cleared ({removed} entries removed).",
             }
         )

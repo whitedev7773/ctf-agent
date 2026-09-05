@@ -92,6 +92,7 @@ class ChallengeSwarm:
     _delegate_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _triage_ready: asyncio.Event = field(default_factory=asyncio.Event)
     _solution_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    _primary_tasks: set[asyncio.Task] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         # A swarm may append live delegate aliases. Never mutate the coordinator's
@@ -921,6 +922,7 @@ class ChallengeSwarm:
             asyncio.create_task(self._run_solver(spec), name=f"solver-{spec}")
             for spec in list(self.model_specs)
         }
+        self._primary_tasks = set(tasks)
         tracked = set(tasks)
 
         async def cancel_workers(workers: set[asyncio.Task]) -> None:
@@ -978,7 +980,7 @@ class ChallengeSwarm:
     def kill(self) -> None:
         """Cancel all agents for this challenge."""
         self.cancel_event.set()
-        for worker in self.delegate_tasks.values():
+        for worker in (*self._primary_tasks, *self.delegate_tasks.values()):
             if not worker.done():
                 worker.cancel()
 

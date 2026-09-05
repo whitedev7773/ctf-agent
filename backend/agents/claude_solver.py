@@ -31,6 +31,7 @@ from backend.artifacts import (
 from backend.challenge_profiles import external_skill_path, solver_role
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
+from backend.experience import experience_root
 from backend.loop_detect import LoopDetector
 from backend.model_specs import effort_from_spec
 from backend.models import model_id_from_spec
@@ -89,7 +90,13 @@ class ClaudeSolver:
             max_exec_timeout_s=getattr(settings, "max_command_timeout_seconds", 600),
             workspace_dir=solver_workspace_path(settings, meta.name, model_spec),
             shared_workspace_dir=challenge_shared_path(settings, meta.name),
+            experience_dir=str(experience_root(settings)),
             keep_workspace=True,
+            resource_sample_interval_s=getattr(
+                settings,
+                "resource_sample_interval_seconds",
+                2.0,
+            ),
         )
         self.loop_detector = LoopDetector()
         self.tracer = SolverTracer(
@@ -122,6 +129,7 @@ class ClaudeSolver:
             "IMPORTANT: You are running inside a Docker sandbox. "
             "All files are under /challenge/ — distfiles at /challenge/distfiles/, "
             "workspace at /challenge/workspace/, shared handoffs at /challenge/shared/, "
+            "curated cross-challenge experience at /challenge/experience/ (read-only), "
             "and read-only tactical skills at /challenge/skills/. "
             "Do NOT use paths outside /challenge/. "
             "All bash commands run inside the container via docker exec. "

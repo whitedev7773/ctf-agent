@@ -59,3 +59,6 @@ class CoordinatorDeps:
     candidates: dict[str, dict] = field(default_factory=dict)
     challenge_dirs: dict[str, str] = field(default_factory=dict)
     challenge_metas: dict[str, Any] = field(default_factory=dict)
+    request_writeup_generation: (
+        Callable[[str], Coroutine[Any, Any, dict[str, Any]]] | None
+    ) = None

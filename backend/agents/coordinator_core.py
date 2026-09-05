@@ -8,11 +8,26 @@ import logging
 from pathlib import Path
 
 from backend.deps import CoordinatorDeps
+from backend.experience import promote_challenge_experience
 from backend.prompts import ChallengeMeta
 from backend.runtime_state import persist_deps_state
 from backend.solver_base import FLAG_FOUND
+from backend.writeups import finalize_writeup
 
 logger = logging.getLogger(__name__)
+
+
+async def _generate_or_finalize_writeup(
+    deps: CoordinatorDeps,
+    challenge_name: str,
+    category: str,
+    flag: str,
+) -> dict:
+    """Use the dashboard's AI generator when available, with a CLI fallback."""
+    generator = getattr(deps, "request_writeup_generation", None)
+    if callable(generator):
+        return await generator(challenge_name)
+    return finalize_writeup(deps.settings, challenge_name, category, flag)
 
 
 async def do_fetch_challenges(deps: CoordinatorDeps) -> str:
@@ -69,6 +84,9 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
         del deps.swarms[name]
         deps.swarm_tasks.pop(name, None)
 
+    if challenge_name in deps.results:
+        return f"Already solved: {challenge_name}. Refusing to start another solver swarm."
+
     active_count = len(deps.swarms)
     if active_count >= deps.max_concurrent_challenges:
         return f"At capacity ({active_count}/{deps.max_concurrent_challenges} challenges running). Wait for one to finish."
@@ -124,6 +142,22 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
                 "submit": "confirmed by solver",
             }
             deps.candidates.pop(challenge_name, None)
+            meta = deps.challenge_metas[challenge_name]
+            try:
+                deps.results[challenge_name]["writeup"] = await _generate_or_finalize_writeup(
+                    deps,
+                    challenge_name,
+                    meta.category,
+                    result.flag or "",
+                )
+                deps.results[challenge_name]["experience"] = promote_challenge_experience(
+                    deps.settings,
+                    challenge_name,
+                    meta.category,
+                    result.flag or "",
+                )
+            except Exception as exc:
+                logger.warning("Could not finalize documentation for %s: %s", challenge_name, exc)
         persist_deps_state(deps)
 
     task = asyncio.create_task(_run_and_cleanup(), name=f"swarm-{challenge_name}")
@@ -202,6 +236,24 @@ async def do_review_candidate(
             "submit": "operator confirmed local candidate",
         }
         deps.candidates.pop(challenge_name, None)
+        meta = deps.challenge_metas.get(challenge_name)
+        settings = getattr(deps, "settings", None)
+        if meta and settings:
+            try:
+                deps.results[challenge_name]["writeup"] = await _generate_or_finalize_writeup(
+                    deps,
+                    challenge_name,
+                    getattr(meta, "category", ""),
+                    candidate,
+                )
+                deps.results[challenge_name]["experience"] = promote_challenge_experience(
+                    settings,
+                    challenge_name,
+                    getattr(meta, "category", ""),
+                    candidate,
+                )
+            except Exception as exc:
+                logger.warning("Could not finalize documentation for %s: %s", challenge_name, exc)
         persist_deps_state(deps)
         return f'LOCAL CONFIRMED — recorded "{candidate}" as solved for {challenge_name}'
 

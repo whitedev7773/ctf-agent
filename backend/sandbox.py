@@ -8,7 +8,10 @@ import logging
 import shlex
 import tarfile
 import tempfile
+import time
+from collections import deque
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -86,10 +89,19 @@ class DockerSandbox:
     max_exec_timeout_s: int = 600
     workspace_dir: str = ""
     shared_workspace_dir: str = ""
+    experience_dir: str = ""
     keep_workspace: bool = False
+    resource_sample_interval_s: float = 2.0
     _container: Any = field(default=None, repr=False)
     _docker: Any = field(default=None, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _resource_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _resource_history: deque[dict[str, Any]] = field(
+        default_factory=lambda: deque(maxlen=60),
+        repr=False,
+    )
+    _resource_snapshot: dict[str, Any] = field(default_factory=dict, repr=False)
+    _started_monotonic: float = field(default=0.0, repr=False)
 
     @property
     def container_id(self) -> str:
@@ -109,6 +121,129 @@ class DockerSandbox:
         except (ValueError, IndexError):
             logger.warning("Invalid memory_limit %r, defaulting to 4GB", self.memory_limit)
             return 4 * 1024 * 1024 * 1024
+
+    @staticmethod
+    def _sum_block_io(entries: list[dict[str, Any]], operation: str) -> int:
+        return sum(
+            int(entry.get("value", 0) or 0)
+            for entry in entries
+            if str(entry.get("op", "")).casefold() == operation
+        )
+
+    def _parse_resource_stats(self, raw: dict[str, Any]) -> dict[str, Any]:
+        cpu_stats = raw.get("cpu_stats") or {}
+        previous_cpu = raw.get("precpu_stats") or {}
+        cpu_usage = cpu_stats.get("cpu_usage") or {}
+        previous_usage = previous_cpu.get("cpu_usage") or {}
+        cpu_delta = int(cpu_usage.get("total_usage", 0) or 0) - int(
+            previous_usage.get("total_usage", 0) or 0
+        )
+        system_delta = int(cpu_stats.get("system_cpu_usage", 0) or 0) - int(
+            previous_cpu.get("system_cpu_usage", 0) or 0
+        )
+        online_cpus = int(cpu_stats.get("online_cpus", 0) or 0)
+        if not online_cpus:
+            online_cpus = len(cpu_usage.get("percpu_usage") or []) or 1
+        cpu_percent = (
+            max(0.0, cpu_delta / system_delta * online_cpus * 100.0)
+            if cpu_delta > 0 and system_delta > 0
+            else 0.0
+        )
+
+        memory_stats = raw.get("memory_stats") or {}
+        memory_detail = memory_stats.get("stats") or {}
+        memory_total = int(memory_stats.get("usage", 0) or 0)
+        memory_cache = int(
+            memory_detail.get("inactive_file", memory_detail.get("cache", 0)) or 0
+        )
+        memory_used = max(0, memory_total - memory_cache)
+        memory_limit = int(memory_stats.get("limit", 0) or self._parse_memory_limit())
+
+        networks = raw.get("networks") or {}
+        network_rx = sum(int(item.get("rx_bytes", 0) or 0) for item in networks.values())
+        network_tx = sum(int(item.get("tx_bytes", 0) or 0) for item in networks.values())
+
+        block_entries = (
+            (raw.get("blkio_stats") or {}).get("io_service_bytes_recursive") or []
+        )
+        pids = int((raw.get("pids_stats") or {}).get("current", 0) or 0)
+        sampled_at = datetime.now(UTC).isoformat()
+        uptime_seconds = max(0.0, time.monotonic() - self._started_monotonic)
+        previous_peak_cpu = float(self._resource_snapshot.get("peak_cpu_percent", 0) or 0)
+        previous_peak_memory = int(self._resource_snapshot.get("peak_memory_bytes", 0) or 0)
+        return {
+            "available": True,
+            "stale": False,
+            "status": "running",
+            "container_id": self.container_id[:12],
+            "sampled_at": sampled_at,
+            "uptime_seconds": round(uptime_seconds, 1),
+            "cpu_percent": round(cpu_percent, 2),
+            "cpu_limit": self.cpu_limit,
+            "peak_cpu_percent": round(max(previous_peak_cpu, cpu_percent), 2),
+            "memory_bytes": memory_used,
+            "memory_limit_bytes": memory_limit,
+            "memory_percent": round(memory_used / memory_limit * 100.0, 2)
+            if memory_limit
+            else 0.0,
+            "peak_memory_bytes": max(previous_peak_memory, memory_used),
+            "pids": pids,
+            "network_rx_bytes": network_rx,
+            "network_tx_bytes": network_tx,
+            "block_read_bytes": self._sum_block_io(block_entries, "read"),
+            "block_write_bytes": self._sum_block_io(block_entries, "write"),
+            "error": "",
+        }
+
+    async def _sample_resources_once(self) -> None:
+        if not self._container:
+            return
+        payload = await asyncio.wait_for(
+            self._container.stats(stream=False, timeout=5),
+            timeout=6,
+        )
+        raw = payload[-1] if payload else {}
+        if not isinstance(raw, dict):
+            raise TypeError("Docker stats payload is not an object")
+        snapshot = self._parse_resource_stats(raw)
+        self._resource_history.append(
+            {
+                "sampled_at": snapshot["sampled_at"],
+                "cpu_percent": snapshot["cpu_percent"],
+                "memory_bytes": snapshot["memory_bytes"],
+            }
+        )
+        snapshot["history"] = list(self._resource_history)
+        self._resource_snapshot = snapshot
+
+    async def _monitor_resources(self) -> None:
+        interval = max(0.5, float(self.resource_sample_interval_s))
+        while self._container:
+            try:
+                await self._sample_resources_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                previous = dict(self._resource_snapshot)
+                previous.update(
+                    {
+                        "available": bool(previous),
+                        "stale": True,
+                        "status": "unavailable",
+                        "container_id": self._container.id[:12] if self._container else "",
+                        "sampled_at": datetime.now(UTC).isoformat(),
+                        "error": str(exc)[:240],
+                        "history": list(self._resource_history),
+                    }
+                )
+                self._resource_snapshot = previous
+            await asyncio.sleep(interval)
+
+    def resource_snapshot(self) -> dict[str, Any]:
+        """Return the latest non-blocking Docker resource sample."""
+        snapshot = dict(self._resource_snapshot)
+        snapshot["history"] = list(self._resource_history)
+        return snapshot
 
     async def start(self) -> None:
         sem = _start_semaphore or asyncio.Semaphore(50)
@@ -132,6 +267,11 @@ class DockerSandbox:
                 shared_workspace.mkdir(parents=True, exist_ok=True)
                 self.shared_workspace_dir = str(shared_workspace)
                 binds.append(f"{self.shared_workspace_dir}:/challenge/shared:rw")
+            if self.experience_dir:
+                experience = Path(self.experience_dir).expanduser().resolve()
+                experience.mkdir(parents=True, exist_ok=True)
+                self.experience_dir = str(experience)
+                binds.append(f"{self.experience_dir}:/challenge/experience:ro")
             if Path(distfiles).exists():
                 binds.append(f"{distfiles}:/challenge/distfiles:ro")
             if Path(meta_yml).exists():
@@ -157,10 +297,26 @@ class DockerSandbox:
             self._container = await self._docker.containers.create(config)
             await self._container.start()
             await _track_start()
+            self._started_monotonic = time.monotonic()
 
             info = await self._container.show()
             short_id = info["Id"][:12]
             logger.info("Sandbox started: %s", short_id)
+            self._resource_snapshot = {
+                "available": False,
+                "stale": False,
+                "status": "starting",
+                "container_id": short_id,
+                "sampled_at": datetime.now(UTC).isoformat(),
+                "cpu_limit": self.cpu_limit,
+                "memory_limit_bytes": self._parse_memory_limit(),
+                "history": [],
+                "error": "",
+            }
+            self._resource_task = asyncio.create_task(
+                self._monitor_resources(),
+                name=f"docker-stats-{short_id}",
+            )
 
     async def exec(self, command: str, timeout_s: int = 300) -> ExecResult:
         if not self._container:
@@ -286,7 +442,20 @@ class DockerSandbox:
         Path(host_path).write_bytes(data)
 
     async def stop(self) -> None:
+        if self._resource_task:
+            self._resource_task.cancel()
+            await asyncio.gather(self._resource_task, return_exceptions=True)
+            self._resource_task = None
+
         if self._container:
+            self._resource_snapshot.update(
+                {
+                    "stale": True,
+                    "status": "stopped",
+                    "sampled_at": datetime.now(UTC).isoformat(),
+                    "history": list(self._resource_history),
+                }
+            )
             try:
                 await self._container.delete(force=True)
             except Exception:

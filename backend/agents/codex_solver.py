@@ -31,11 +31,12 @@ from backend.challenge_profiles import external_skill_path, solver_role
 from backend.codex_cli import prepare_codex_cli
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
+from backend.experience import experience_root
 from backend.loop_detect import LoopDetector
 from backend.model_specs import effort_from_spec
 from backend.models import model_id_from_spec, supports_vision
 from backend.output_types import assess_solver_output, solver_output_json_schema
-from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
+from backend.prompts import ChallengeMeta, build_prompt, build_writeup_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
 from backend.solver_base import (
     BUDGET_EXHAUSTED,
@@ -188,6 +189,8 @@ class CodexSolver:
         delegate_task_fn=None,
         delegate_status_fn=None,
         task_directive: str = "",
+        task_mode: str = "solve",
+        verified_flag: str = "",
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
@@ -198,6 +201,10 @@ class CodexSolver:
         self.delegate_task_fn = delegate_task_fn
         self.delegate_status_fn = delegate_status_fn
         self.task_directive = task_directive.strip()[:6000]
+        if task_mode not in {"solve", "writeup"}:
+            raise ValueError(f"unsupported Codex task mode: {task_mode}")
+        self.task_mode = task_mode
+        self.verified_flag = verified_flag.strip()[:2000]
         self.ctfd = ctfd
         self.cost_tracker = cost_tracker
         self.settings = settings
@@ -211,9 +218,19 @@ class CodexSolver:
             memory_limit=getattr(settings, "container_memory_limit", "4g"),
             cpu_limit=getattr(settings, "container_cpu_limit", 2.0),
             max_exec_timeout_s=getattr(settings, "max_command_timeout_seconds", 600),
-            workspace_dir=solver_workspace_path(settings, meta.name, model_spec),
+            workspace_dir=solver_workspace_path(
+                settings,
+                meta.name,
+                f"{model_spec}/writeup" if task_mode == "writeup" else model_spec,
+            ),
             shared_workspace_dir=challenge_shared_path(settings, meta.name),
+            experience_dir=str(experience_root(settings)),
             keep_workspace=True,
+            resource_sample_interval_s=getattr(
+                settings,
+                "resource_sample_interval_seconds",
+                2.0,
+            ),
         )
         self.use_vision = supports_vision(model_spec)
         self.loop_detector = LoopDetector()
@@ -222,7 +239,10 @@ class CodexSolver:
             self.model_spec,
             log_dir=getattr(settings, "logs_root", "logs"),
         )
-        self.agent_name = solver_agent_name(meta.name, self.model_spec)
+        accounting_spec = (
+            f"{self.model_spec}/writeup" if task_mode == "writeup" else self.model_spec
+        )
+        self.agent_name = solver_agent_name(meta.name, accounting_spec)
 
         self._proc: asyncio.subprocess.Process | None = None
         self._thread_id: str | None = None
@@ -258,18 +278,21 @@ class CodexSolver:
         container_arch = arch_result.stdout.strip() or "unknown"
 
         distfile_names = list_distfiles(self.challenge_dir)
-        system_prompt = build_prompt(
-            self.meta, distfile_names, container_arch=container_arch,
-            has_named_tools=True,
-            model_spec=self.model_spec,
-            resume_manifest=workspace_resume_manifest(
-                self.sandbox.workspace_dir,
-                self.sandbox.shared_workspace_dir,
-            ),
-        )
-        if self.task_directive:
+        if self.task_mode == "writeup":
+            system_prompt = build_writeup_prompt(self.meta, self.verified_flag)
+        else:
+            system_prompt = build_prompt(
+                self.meta, distfile_names, container_arch=container_arch,
+                has_named_tools=True,
+                model_spec=self.model_spec,
+                resume_manifest=workspace_resume_manifest(
+                    self.sandbox.workspace_dir,
+                    self.sandbox.shared_workspace_dir,
+                ),
+            )
+        if self.task_directive and self.task_mode == "solve":
             system_prompt += "\n\n## Live delegated assignment\n" + self.task_directive
-        if self.delegate_task_fn:
+        if self.delegate_task_fn and self.task_mode == "solve":
             system_prompt += (
                 "\n\n## Adaptive delegation\n"
                 "You are the SOL-xhigh lead and retain end-to-end ownership. After initial "
@@ -301,8 +324,12 @@ class CodexSolver:
 
         # thread/start — system prompt is supplied through baseInstructions
         # Prepend sandbox path reminder to prevent models from using host paths
-        dynamic_tools = list(SANDBOX_TOOLS)
-        if self.delegate_task_fn:
+        if self.task_mode == "writeup":
+            allowed = {"bash", "read_file", "write_file", "list_files", "view_image", "web_fetch"}
+            dynamic_tools = [tool for tool in SANDBOX_TOOLS if tool["name"] in allowed]
+        else:
+            dynamic_tools = list(SANDBOX_TOOLS)
+        if self.delegate_task_fn and self.task_mode == "solve":
             dynamic_tools.extend(DELEGATION_TOOLS)
         tool_names = [str(t["name"]) for t in dynamic_tools]
         sandbox_preamble = (
@@ -754,6 +781,12 @@ class CodexSolver:
                 "Do not restart triage, bulk-extract again, or repeat completed experiments."
             )
             self._resume_after_checkpoint = False
+        elif self.task_mode == "writeup":
+            prompt_text = (
+                "Generate the final Korean writeup now. Read the preserved solver evidence, write "
+                "/challenge/shared/writeup/WRITEUP.md, and include real decisive screenshots when "
+                "available or reproducible. Do not re-solve or submit the challenge."
+            )
         elif self._step_count == 0:
             prompt_text = "Solve this CTF challenge."
         else:

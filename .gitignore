@@ -23,5 +23,6 @@ uv.lock
 
 # Runtime
 workspace/
+experience/
 codex-schema-*/
 .claude/scheduled_tasks.lock

@@ -84,6 +84,14 @@ def solver_workspace_path(settings: object, challenge_name: str, model_spec: str
     return str(path)
 
 
+def challenge_workspace_path(settings: object, challenge_name: str) -> str:
+    """Return the persistent host root shared by every lane of one challenge."""
+    root = Path(getattr(settings, "workspace_root", "workspace")).expanduser().resolve()
+    path = root / _safe_segment(challenge_name)
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 def challenge_shared_path(settings: object, challenge_name: str) -> str:
     """Create the challenge-level artifact exchange shared by every solver lane."""
     root = Path(getattr(settings, "workspace_root", "workspace")).expanduser().resolve()

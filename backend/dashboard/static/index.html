@@ -29,7 +29,7 @@
     </div>
   </header>
 
-  <main class="shell">
+  <main class="shell dashboard-view" id="dashboard-view">
     <section class="stats-grid" aria-label="대회 요약">
       <article class="stat-card accent-green">
         <span class="stat-label">SOLVED</span>
@@ -51,6 +51,18 @@
         <strong id="stat-cost">$—</strong>
         <small id="stat-tokens">— raw · — effective</small>
       </article>
+    </section>
+
+    <section class="live-resources" aria-label="실시간 Docker 리소스">
+      <div class="live-resource-title">
+        <span class="live-dot" aria-hidden="true"></span>
+        <div><strong>LIVE RESOURCES</strong><small id="resource-updated">샘플 대기 중</small></div>
+      </div>
+      <div class="live-resource-metric"><span>CONTAINERS</span><strong id="resource-containers">0</strong></div>
+      <div class="live-resource-metric"><span>CPU</span><strong id="resource-cpu">0%</strong></div>
+      <div class="live-resource-metric"><span>MEMORY</span><strong id="resource-memory">0 B</strong></div>
+      <div class="live-resource-metric"><span>PROCESSES</span><strong id="resource-pids">0</strong></div>
+      <div class="live-resource-metric"><span>NETWORK</span><strong id="resource-network">0 B</strong></div>
     </section>
 
     <section class="workspace" aria-labelledby="challenge-title">
@@ -182,6 +194,19 @@
       </div>
     </section>
 
+    <section class="experience-panel" aria-labelledby="experience-title">
+      <div>
+        <p class="eyebrow">PERSISTENT SOLVER MEMORY</p>
+        <h2 id="experience-title">공유 풀이 경험</h2>
+        <p id="experience-copy">검증된 풀이에서 승격된 경험을 다음 문제의 모든 솔버가 읽습니다.</p>
+      </div>
+      <div class="experience-stats">
+        <strong id="experience-records">0</strong><span>records</span>
+        <strong id="experience-size">0 B</strong><span>stored</span>
+      </div>
+      <button id="experience-reset-open" class="destructive-button" type="button">경험 초기화</button>
+    </section>
+
     <section class="maintenance-section" aria-labelledby="maintenance-title">
       <article class="danger-zone">
         <div>
@@ -197,19 +222,19 @@
     </section>
   </main>
 
-  <aside class="detail-drawer" id="detail-drawer" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="drawer-title">
-    <button class="drawer-backdrop" id="drawer-backdrop" type="button" aria-label="상세 화면 닫기"></button>
-    <div class="drawer-panel">
-      <header class="drawer-header">
-        <div>
-          <p class="eyebrow" id="drawer-category">CHALLENGE</p>
-          <h2 id="drawer-title">문제 상세</h2>
-        </div>
-        <button class="icon-button" id="drawer-close" type="button" aria-label="상세 화면 닫기">×</button>
-      </header>
-      <div class="drawer-content" id="drawer-content"></div>
-    </div>
-  </aside>
+  <main class="detail-page" id="detail-page" hidden aria-labelledby="detail-title">
+    <header class="detail-hero">
+      <button class="detail-back" id="detail-back" type="button" aria-label="문제 목록으로 돌아가기">
+        <span aria-hidden="true">←</span>
+        <span>문제 목록</span>
+      </button>
+      <div class="detail-heading">
+        <p class="eyebrow" id="detail-category">CHALLENGE</p>
+        <h1 id="detail-title">문제 상세</h1>
+      </div>
+    </header>
+    <div class="detail-content" id="detail-content"></div>
+  </main>
 
   <dialog class="reset-dialog" id="reset-dialog" aria-labelledby="reset-dialog-title">
     <form id="reset-form">
@@ -223,6 +248,22 @@
       <div class="reset-actions">
         <button class="secondary-button" id="reset-cancel" type="button">취소</button>
         <button class="destructive-button" id="reset-submit" type="submit" disabled>영구적으로 초기화</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="reset-dialog" id="experience-reset-dialog" aria-labelledby="experience-reset-dialog-title">
+    <form id="experience-reset-form">
+      <header>
+        <p class="eyebrow">DESTRUCTIVE ACTION</p>
+        <h2 id="experience-reset-dialog-title">공유 풀이 경험 초기화</h2>
+      </header>
+      <p>문제·로그·현재 실행 상태는 유지하고, 문제 간에 축적된 검증 풀이 경험만 삭제합니다.</p>
+      <label for="experience-reset-confirmation">계속하려면 <strong>경험 초기화</strong>를 입력하세요.</label>
+      <input id="experience-reset-confirmation" autocomplete="off" spellcheck="false" placeholder="경험 초기화" required>
+      <div class="reset-actions">
+        <button class="secondary-button" id="experience-reset-cancel" type="button">취소</button>
+        <button class="destructive-button" id="experience-reset-submit" type="submit" disabled>경험 초기화</button>
       </div>
     </form>
   </dialog>

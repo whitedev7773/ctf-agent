@@ -8,8 +8,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from backend.agents.codex_solver import CodexSolver
-from backend.agents.coordinator_core import do_review_candidate
+from backend.agents.coordinator_core import (
+    _generate_or_finalize_writeup,
+    do_review_candidate,
+    do_spawn_swarm,
+)
 from backend.agents.coordinator_core import do_submit_flag as coordinator_submit_flag
+from backend.agents.coordinator_loop import _unsolved_names
 from backend.agents.swarm import ChallengeSwarm
 from backend.artifacts import (
     challenge_shared_path,
@@ -412,6 +417,72 @@ class _CheckpointSolver(_CandidateSolver):
 
 
 class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_solved_challenge_starts_ai_writeup_generation(self) -> None:
+        requested: list[str] = []
+
+        async def request_writeup(challenge_name: str) -> dict[str, object]:
+            requested.append(challenge_name)
+            return {"status": "generating", "active": True}
+
+        deps = SimpleNamespace(request_writeup_generation=request_writeup)
+        status = await _generate_or_finalize_writeup(
+            deps,
+            "solved challenge",
+            "pwn",
+            "TEAM{done}",
+        )
+
+        self.assertEqual(requested, ["solved challenge"])
+        self.assertEqual(status["status"], "generating")
+        self.assertTrue(status["active"])
+
+    async def test_persisted_solution_is_not_auto_spawned_after_restart(self) -> None:
+        deps = SimpleNamespace(
+            challenge_metas={"already solved": object(), "new challenge": object()},
+            results={"already solved": {"flag": "TEAM{done}"}},
+        )
+        poller = SimpleNamespace(
+            known_challenges={"already solved", "new challenge"},
+            known_solved=set(),
+        )
+
+        self.assertEqual(_unsolved_names(deps, poller), {"new challenge"})
+
+        spawn_deps = SimpleNamespace(
+            swarms={},
+            swarm_tasks={},
+            results={"already solved": {"flag": "TEAM{done}"}},
+            max_concurrent_challenges=3,
+        )
+        message = await do_spawn_swarm(spawn_deps, "already solved")
+        self.assertIn("Already solved", message)
+
+    async def test_kill_cancels_primary_solver_task_immediately(self) -> None:
+        swarm = ChallengeSwarm(
+            challenge_dir=".",
+            meta=ChallengeMeta(name="stop-now", category="pwn"),
+            ctfd=SimpleNamespace(),
+            cost_tracker=CostTracker(),
+            settings=Settings(_env_file=None),
+            model_specs=["codex/gpt-5.6-sol/xhigh"],
+        )
+        started = asyncio.Event()
+        blocked = asyncio.Event()
+
+        async def primary() -> None:
+            started.set()
+            await blocked.wait()
+
+        task = asyncio.create_task(primary())
+        swarm._primary_tasks.add(task)
+        await started.wait()
+
+        swarm.kill()
+        await asyncio.gather(task, return_exceptions=True)
+
+        self.assertTrue(swarm.cancel_event.is_set())
+        self.assertTrue(task.cancelled())
+
     async def test_cached_long_context_gets_checkpoint_not_global_budget_stop(self) -> None:
         class FakeStdout:
             def __init__(self, lines: list[bytes]) -> None:

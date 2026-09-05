@@ -140,7 +140,9 @@ MAX_CONCURRENT_CHALLENGES=1
 | `CONTAINER_CPU_LIMIT` | `2.0` | solver 컨테이너 하나의 CPU limit |
 | `MAX_CONCURRENT_CHALLENGES` | `1` | 동시에 실행할 문제 swarm 수 |
 | `WORKSPACE_ROOT` | `workspace` | 영구 exploit·solver·checkpoint 저장 경로 |
+| `EXPERIENCE_ROOT` | `experience` | 검증된 문제에서 승격한 문제 간 공유 풀이 경험 저장 경로 |
 | `LOGS_ROOT` | `logs` | Solver JSONL trace 저장 경로 |
+| `RESOURCE_SAMPLE_INTERVAL_SECONDS` | `2.0` | Docker CPU·메모리·PID·네트워크 계측 주기(초) |
 | `SOLVER_TURN_TIMEOUT_SECONDS` | `1800` | model turn 하나의 최대 실행 시간 |
 | `SOLVER_MAX_RUNTIME_SECONDS` | `10800` | solver 하나의 전체 최대 실행 시간 |
 | `SOLVER_HANDOFF_WAIT_SECONDS` | `180` | 여러 primary 모델을 직접 지정했을 때 단계별 handoff 대기 시간 |
@@ -389,7 +391,11 @@ http://127.0.0.1:9400
 
 CTFd를 연결하지 않은 독립 모드에서는 flag를 외부에 제출하지 않는다. Solver가 찾은 flag와 수동 입력한 값은 검증되지 않은 후보로 기록되고 운영자 확인 뒤에만 로컬 해결로 바뀐다. 후보와 확인된 로컬 결과는 `WORKSPACE_ROOT/.ctf-agent-runtime.json`에 원자적으로 저장되어 coordinator를 정상 재시작해도 유지된다. 대시보드에서 입력한 CTFd 인증 정보는 `.env`에 저장되지 않고 현재 coordinator 프로세스가 종료되면 사라진다.
 
-대시보드는 coordinator와 같은 프로세스에서 실행되며 `127.0.0.1`에만 bind된다. 상태는 약 2.5초마다 갱신된다. 쓰기 요청은 브라우저가 같은 origin에서 받은 세션별 token을 요구한다.
+대시보드는 coordinator와 같은 프로세스에서 실행되며 `127.0.0.1`에만 bind된다. 문제 상태는 약 2.5초마다, 각 solver Docker의 CPU·메모리·PID·network 통계는 기본 1초마다 화면에 반영된다. 쓰기 요청은 브라우저가 같은 origin에서 받은 세션별 token을 요구한다.
+
+Flag 확인 뒤 같은 Codex 문서화 pipeline이 자동으로 시작되어 `_shared/writeup/WRITEUP.md`와 manifest를 생성한다. Lead가 남긴 `SOLUTION.md` 또는 `WRITEUP.md`, 재현 스크립트와 실제 PNG/JPEG/WebP 증거가 사용되며 근거가 부족하면 문제는 `SOLVED`이지만 `DOCUMENTED`가 아닌 상태로 표시된다. `라이트업 생성 요청/재개/재생성` 버튼도 저장 파일을 다시 조립하는 데 그치지 않고, 동일한 Codex 문서화 작업을 비동기로 새로 실행한다. 실행 중에는 `생성 중` 상태가 표시되고 같은 문제의 중복 요청은 차단된다. 서버 종료로 작업이 중단되면 다음 실행에서 재요청 가능한 `보강 필요` 상태로 복구된다. Solver의 중간 기록 언어는 제한하지 않으며 최종 라이트업의 설명과 절별 서술만 한국어로 편집한다. Challenge 이름, vulnerability 용어, protocol, command, code, path 같은 기술 표기는 영어를 그대로 사용할 수 있다. 최종본에 충분한 한국어 설명, 재현 근거, 실제 주요 스크린샷이 없으면 완료 처리되지 않는다. 주요 스크린샷은 문제 상세의 evidence gallery에서 볼 수 있다.
+
+검증된 풀이의 `lead/EXPERIENCE.md` 또는 solution은 flag와 명백한 credential을 제거한 뒤 `EXPERIENCE_ROOT`로 승격된다. 이 저장소는 모든 solver container의 `/challenge/experience`에 읽기 전용으로 mount된다. 일반 런타임 초기화로는 삭제되지 않으며, 별도 `경험 초기화` 버튼에서 같은 문구를 정확히 입력해야만 삭제된다.
 
 `지금까지의 접근 노트`는 별도 LLM 호출 없이 실행 중 findings와 `STATE.md`, `SOLUTION.md`, `TRIAGE.md`, delegate/recovery handoff에서 생성된다. 최대 6개 문장만 표시하고 코드 블록·명령·표는 제외하므로 token 비용이 없으며 workspace가 보존되는 한 재시작 뒤에도 유지된다.
 

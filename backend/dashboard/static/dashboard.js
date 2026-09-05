@@ -7,11 +7,14 @@ const state = {
   query: "",
   selectedChallenge: null,
   refreshTimer: null,
+  resourceTimer: null,
+  resourceRefreshing: false,
   refreshing: false,
   ctfdInitialized: false,
-  drawerReturnChallenge: null,
+  detailReturnChallenge: null,
   localFiles: [],
   candidateNotices: new Set(),
+  writeups: new Map(),
 };
 
 const byId = (id) => document.getElementById(id);
@@ -56,6 +59,21 @@ function formatFileSize(bytes) {
   if (size >= 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
   if (size >= 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${size} B`;
+}
+
+function formatResourceBytes(bytes) {
+  const size = Number(bytes || 0);
+  if (size >= 1024 ** 3) return `${(size / 1024 ** 3).toFixed(1)} GB`;
+  if (size >= 1024 ** 2) return `${(size / 1024 ** 2).toFixed(1)} MB`;
+  if (size >= 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${Math.round(size)} B`;
+}
+
+function formatDuration(seconds) {
+  const value = Math.max(0, Number(seconds || 0));
+  if (value >= 3600) return `${Math.floor(value / 3600)}h ${Math.floor(value % 3600 / 60)}m`;
+  if (value >= 60) return `${Math.floor(value / 60)}m ${Math.floor(value % 60)}s`;
+  return `${Math.floor(value)}s`;
 }
 
 function syncLocalFiles(files) {
@@ -115,6 +133,7 @@ function agentStatusLabel(status) {
     handoff_complete: "HANDOFF READY",
     gave_up: "STOPPED",
     progress_checkpoint: "CHECKPOINT",
+    generating: "WRITING",
   }[status] || status;
 }
 
@@ -177,13 +196,20 @@ function renderOverview() {
   if (!snapshot) return;
   const { stats } = snapshot;
   byId("stat-solved").textContent = `${stats.solved}`;
-  byId("stat-total").textContent = `전체 ${stats.total} 문제`;
+  byId("stat-total").textContent = `전체 ${stats.total} 문제 · 문서화 ${stats.documented || 0}`;
   byId("stat-swarms").textContent = `${stats.active_swarms}`;
   byId("stat-capacity").textContent = `동시 실행 한도 ${snapshot.max_concurrent_challenges}`;
   byId("stat-agents").textContent = `${stats.active_agents}`;
   byId("stat-agent-total").textContent = `생성된 agent ${stats.total_agents}`;
   byId("stat-cost").textContent = formatMoney(stats.cost_usd);
   byId("stat-tokens").textContent = `${formatTokens(stats.tokens)} raw · ${formatTokens(stats.effective_tokens)} effective`;
+  renderGlobalResources(snapshot.resources || {});
+  const experience = snapshot.experience || {};
+  byId("experience-records").textContent = formatNumber(experience.record_count || 0);
+  byId("experience-size").textContent = formatResourceBytes(experience.total_bytes || 0);
+  byId("experience-copy").textContent = experience.updated_at
+    ? `${experience.category_count || 0}개 카테고리 · 마지막 승격 ${new Date(experience.updated_at).toLocaleString("ko-KR")}`
+    : "검증된 풀이에서 승격된 경험을 다음 문제의 모든 솔버가 읽습니다.";
   const modePill = byId("mode-pill");
   const modes = {
     standalone: ["STANDALONE · 로컬 후보", "dry"],
@@ -214,6 +240,21 @@ function renderOverview() {
   }
 }
 
+function renderGlobalResources(resources) {
+  byId("resource-containers").textContent = formatNumber(resources.container_count || 0);
+  byId("resource-cpu").textContent = `${Number(resources.cpu_percent || 0).toFixed(1)}%`;
+  const memory = formatResourceBytes(resources.memory_bytes || 0);
+  const limit = resources.memory_limit_bytes ? ` / ${formatResourceBytes(resources.memory_limit_bytes)}` : "";
+  byId("resource-memory").textContent = `${memory}${limit}`;
+  byId("resource-pids").textContent = formatNumber(resources.pids || 0);
+  byId("resource-network").textContent = formatResourceBytes(
+    Number(resources.network_rx_bytes || 0) + Number(resources.network_tx_bytes || 0),
+  );
+  byId("resource-updated").textContent = resources.stale_count
+    ? `${resources.stale_count}개 샘플 지연`
+    : "1초 간격으로 갱신";
+}
+
 function filteredChallenges() {
   if (!state.snapshot) return [];
   const query = state.query.trim().toLocaleLowerCase("ko-KR");
@@ -224,9 +265,98 @@ function filteredChallenges() {
   });
 }
 
+function currentChallenge(name) {
+  return state.snapshot?.challenges.find((challenge) => challenge.name === name);
+}
+
+function createChallengeRow(challengeName) {
+  const row = node("tr");
+  row.dataset.challengeName = challengeName;
+  row.tabIndex = 0;
+  row.addEventListener("click", () => openChallengeDetail(row.dataset.challengeName));
+  row.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openChallengeDetail(row.dataset.challengeName);
+    }
+  });
+
+  const nameCell = node("td", "challenge-name-cell");
+  const statusCell = node("td", "challenge-status-cell");
+  const agentsCell = node("td", "challenge-agents-cell");
+  const progressCell = node("td", "progress-copy challenge-progress-cell");
+  const costCell = node("td", "cost-cell challenge-cost-cell");
+  const actionCell = node("td", "challenge-action-cell");
+  const action = node("button", "row-action");
+  action.type = "button";
+  action.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const challenge = currentChallenge(row.dataset.challengeName);
+    if (!challenge) return;
+    if (challenge.active) stopChallenge(challenge.name);
+    else if (challenge.solved) openChallengeDetail(challenge.name);
+    else spawnChallenge(challenge.name);
+  });
+  actionCell.append(action);
+  row.append(nameCell, statusCell, agentsCell, progressCell, costCell, actionCell);
+  return row;
+}
+
+function updateChallengeRow(row, challenge) {
+  row.dataset.challengeName = challenge.name;
+  row.setAttribute("aria-label", `${challenge.name} 상세 보기`);
+
+  const nameCell = row.querySelector(".challenge-name-cell");
+  nameCell.replaceChildren(node("span", "challenge-name", challenge.name));
+  const meta = node("span", "challenge-meta");
+  meta.append(node("span", "", challenge.category));
+  meta.append(node("span", "", `${formatNumber(challenge.value)} pts`));
+  if (challenge.solves) meta.append(node("span", "", `${formatNumber(challenge.solves)} solves`));
+  if (challenge.documented) meta.append(node("span", "documented-badge", "DOCUMENTED"));
+  nameCell.append(meta);
+
+  const statusCell = row.querySelector(".challenge-status-cell");
+  statusCell.replaceChildren(node("span", `status-badge ${challenge.status}`, statusLabel(challenge.status)));
+
+  const agentsCell = row.querySelector(".challenge-agents-cell");
+  const stack = node("div", "agent-stack");
+  for (const agent of challenge.agents.slice(0, 4)) {
+    const chip = node("span", `agent-chip ${agent.status}`, modelShortName(agent.model_spec));
+    chip.title = `${agent.model_spec} · ${agentStatusLabel(agent.status)}`;
+    stack.append(chip);
+  }
+  if (!challenge.agents.length) stack.append(node("span", "progress-copy", "아직 없음"));
+  agentsCell.replaceChildren(stack);
+
+  const steps = challenge.agents.reduce((sum, agent) => sum + Number(agent.steps || 0), 0);
+  const progressCell = row.querySelector(".challenge-progress-cell");
+  const resources = challenge.resources || {};
+  progressCell.replaceChildren(node("strong", "", formatNumber(steps)), document.createTextNode(" steps"));
+  progressCell.append(
+    node(
+      "span",
+      "row-resource-copy",
+      resources.container_count
+        ? ` · ${Number(resources.cpu_percent || 0).toFixed(1)}% CPU · ${formatResourceBytes(resources.memory_bytes || 0)}`
+        : "",
+    ),
+  );
+
+  row.querySelector(".challenge-cost-cell").textContent = formatMoney(challenge.cost_usd);
+  const action = row.querySelector(".row-action");
+  action.textContent = challenge.active ? "중단" : challenge.solved ? "보기" : "시작";
+  action.setAttribute(
+    "aria-label",
+    challenge.active
+      ? `${challenge.name} 풀이 중단`
+      : challenge.solved
+        ? `${challenge.name} 상세 보기`
+        : `${challenge.name} 풀이 시작`,
+  );
+}
+
 function renderRows() {
   const tbody = byId("challenge-rows");
-  tbody.replaceChildren();
   const challenges = filteredChallenges();
   byId("empty-state").hidden = challenges.length !== 0;
   const hasRegisteredChallenges = Boolean(state.snapshot?.challenges.length);
@@ -237,56 +367,23 @@ function renderRows() {
     ? "검색어나 상태 필터를 바꿔보세요."
     : "아래에서 CTFd를 연결하거나 로컬 문제를 추가하세요.";
 
-  for (const challenge of challenges) {
-    const row = node("tr");
-    row.dataset.challengeName = challenge.name;
-    row.tabIndex = 0;
-    row.setAttribute("aria-label", `${challenge.name} 상세 보기`);
-    row.addEventListener("click", () => openDrawer(challenge.name));
-    row.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        openDrawer(challenge.name);
-      }
-    });
+  const rowsByName = new Map(
+    [...tbody.querySelectorAll("tr")].map((row) => [row.dataset.challengeName, row]),
+  );
+  const visibleNames = new Set(challenges.map((challenge) => challenge.name));
+  for (const row of rowsByName.values()) {
+    if (!visibleNames.has(row.dataset.challengeName)) row.remove();
+  }
 
-    const nameCell = node("td");
-    nameCell.append(node("span", "challenge-name", challenge.name));
-    const meta = node("span", "challenge-meta");
-    meta.append(node("span", "", challenge.category));
-    meta.append(node("span", "", `${formatNumber(challenge.value)} pts`));
-    if (challenge.solves) meta.append(node("span", "", `${formatNumber(challenge.solves)} solves`));
-    nameCell.append(meta);
+  challenges.forEach((challenge, index) => {
+    const row = rowsByName.get(challenge.name) || createChallengeRow(challenge.name);
+    updateChallengeRow(row, challenge);
+    const current = tbody.children[index];
+    if (current !== row) tbody.insertBefore(row, current || null);
+  });
 
-    const statusCell = node("td");
-    statusCell.append(node("span", `status-badge ${challenge.status}`, statusLabel(challenge.status)));
-
-    const agentsCell = node("td");
-    const stack = node("div", "agent-stack");
-    for (const agent of challenge.agents.slice(0, 4)) {
-      const chip = node("span", `agent-chip ${agent.status}`, modelShortName(agent.model_spec));
-      chip.title = `${agent.model_spec} · ${agentStatusLabel(agent.status)}`;
-      stack.append(chip);
-    }
-    if (!challenge.agents.length) stack.append(node("span", "progress-copy", "아직 없음"));
-    agentsCell.append(stack);
-
-    const steps = challenge.agents.reduce((sum, agent) => sum + Number(agent.steps || 0), 0);
-    const progressCell = node("td", "progress-copy");
-    progressCell.append(node("strong", "", formatNumber(steps)));
-    progressCell.append(document.createTextNode(" steps"));
-
-    const costCell = node("td", "cost-cell", formatMoney(challenge.cost_usd));
-    const actionCell = node("td");
-    const actionLabel = challenge.active ? "중단" : challenge.solved ? "보기" : "시작";
-    actionCell.append(button(actionLabel, "row-action", () => {
-      if (challenge.active) stopChallenge(challenge.name);
-      else if (challenge.solved) openDrawer(challenge.name);
-      else spawnChallenge(challenge.name);
-    }));
-
-    row.append(nameCell, statusCell, agentsCell, progressCell, costCell, actionCell);
-    tbody.append(row);
+  while (tbody.children.length > challenges.length) {
+    tbody.lastElementChild.remove();
   }
 }
 
@@ -296,53 +393,225 @@ function metric(label, value) {
   return item;
 }
 
-function drawerSection(title, sideText = "") {
-  const section = node("section", "drawer-section");
-  const heading = node("div", "drawer-section-title");
+function detailSection(title, sideText = "") {
+  const section = node("section", "detail-section");
+  const heading = node("div", "detail-section-title");
   heading.append(node("h3", "", title));
   if (sideText) heading.append(node("span", "", sideText));
   section.append(heading);
   return section;
 }
 
-function renderDrawer() {
+function sparkline(history, key) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "sparkline");
+  svg.setAttribute("viewBox", "0 0 240 34");
+  svg.setAttribute("aria-hidden", "true");
+  const values = (Array.isArray(history) ? history : [])
+    .map((item) => Number(item?.[key] || 0))
+    .slice(-60);
+  const maximum = Math.max(1, ...values);
+  const points = values.map((value, index) => {
+    const x = values.length <= 1 ? 0 : index / (values.length - 1) * 240;
+    const y = 32 - value / maximum * 30;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+  line.setAttribute("points", points.join(" "));
+  svg.append(line);
+  return svg;
+}
+
+function buildResourcePanel(challenge) {
+  const resources = challenge.resources || {};
+  const section = detailSection("실시간 Docker 리소스", `${resources.container_count || 0} CONTAINERS`);
+  section.id = "detail-resource-section";
+  const grid = node("div", "resource-grid");
+  grid.append(
+    metric("CPU", `${Number(resources.cpu_percent || 0).toFixed(1)}%`),
+    metric("MEMORY", formatResourceBytes(resources.memory_bytes || 0)),
+    metric("PROCESSES", formatNumber(resources.pids || 0)),
+  );
+  section.append(grid);
+
+  for (const agent of challenge.agents) {
+    const resource = agent.resource || {};
+    if (!Object.keys(resource).length) continue;
+    const item = node("article", "resource-agent");
+    const head = node("div", "resource-agent-head");
+    head.append(
+      node("span", "", `${agent.role?.toUpperCase() || "SOLVER"} · ${resource.container_id || "starting"}`),
+      node("span", "", resource.stale ? "STALE" : String(resource.status || "UNKNOWN").toUpperCase()),
+    );
+    const memoryPercent = Math.min(100, Math.max(0, Number(resource.memory_percent || 0)));
+    const bar = node("div", "resource-bar");
+    const fill = node("span");
+    fill.style.width = `${memoryPercent}%`;
+    bar.append(fill);
+    const details = node("div", "resource-agent-meta");
+    details.append(
+      node("span", "", `${Number(resource.cpu_percent || 0).toFixed(1)}% CPU`),
+      node("span", "", `${formatResourceBytes(resource.memory_bytes || 0)} / ${formatResourceBytes(resource.memory_limit_bytes || 0)}`),
+      node("span", "", `${formatNumber(resource.pids || 0)} PIDs`),
+      node("span", "", `RX ${formatResourceBytes(resource.network_rx_bytes || 0)}`),
+      node("span", "", `TX ${formatResourceBytes(resource.network_tx_bytes || 0)}`),
+      node("span", "", formatDuration(resource.uptime_seconds || 0)),
+    );
+    item.append(head, sparkline(resource.history, "cpu_percent"), bar, details);
+    if (resource.error) item.append(node("p", "agent-stop-reason", resource.error));
+    section.append(item);
+  }
+  return section;
+}
+
+function buildWriteupSection(challenge) {
+  const writeup = challenge.writeup || {};
+  const isGenerating = writeup.status === "generating" && writeup.active !== false;
+  const writeupStatusLabel = {
+    generating: "생성 중",
+    complete: "완료",
+    needs_attention: "보강 필요",
+    pending: "대기",
+    not_started: "미생성",
+    invalid: "오류",
+  }[writeup.status] || String(writeup.status || "미생성");
+  const section = detailSection("Writeup & evidence", writeupStatusLabel);
+  const status = node("div", `writeup-status${isGenerating ? " is-generating" : ""}`);
+  const copy = node("div");
+  copy.append(
+    node(
+      "strong",
+      "",
+      isGenerating
+        ? "라이트업 생성 중"
+        : challenge.documented
+          ? "DOCUMENTED"
+          : challenge.solved
+            ? "WRITEUP PENDING"
+            : "SOLVE IN PROGRESS",
+    ),
+    node(
+      "span",
+      "",
+      isGenerating
+        ? `${writeup.model_spec || "AI"}가 한국어 최종본과 스크린샷을 구성하고 있습니다.`
+        : `${(writeup.reproducers || []).length} reproducers · ${(writeup.screenshots || []).length} screenshots`,
+    ),
+  );
+  const actions = node("div", "writeup-actions");
+  if (writeup.writeup_path) {
+    actions.append(button("Writeup 보기", "secondary-button", () => loadWriteup(challenge.name)));
+  }
+  if (challenge.solved) {
+    const requestLabel = isGenerating
+      ? "라이트업 생성 중…"
+      : challenge.documented
+      ? "라이트업 재생성"
+      : writeup.status === "needs_attention" || writeup.status === "pending"
+        ? "라이트업 생성 재개"
+        : "라이트업 생성 요청";
+    const request = button(
+      requestLabel,
+      "primary-button",
+      () => requestWriteup(challenge.name, request),
+      isGenerating,
+    );
+    if (isGenerating) request.setAttribute("aria-busy", "true");
+    actions.append(request);
+  }
+  status.append(copy, actions);
+  section.append(status);
+  if (writeup.issues?.length) {
+    const issues = node("ul", "writeup-issues");
+    writeup.issues.forEach((issue) => issues.append(node("li", "", issue)));
+    section.append(issues);
+  }
+  const loaded = state.writeups.get(challenge.name);
+  if (loaded) section.append(node("pre", "writeup-preview", loaded.content || ""));
+  if (writeup.screenshots?.length) {
+    const gallery = node("div", "screenshot-gallery");
+    for (const shot of writeup.screenshots) {
+      const figure = node("figure");
+      const img = node("img");
+      const params = new URLSearchParams({ challenge: challenge.name, path: shot.path });
+      img.src = `/api/artifact?${params}`;
+      img.alt = shot.caption || "Writeup evidence";
+      img.loading = "lazy";
+      figure.append(img, node("figcaption", "", shot.caption || shot.path));
+      gallery.append(figure);
+    }
+    section.append(gallery);
+  }
+  return section;
+}
+
+async function loadWriteup(challengeName) {
+  try {
+    const params = new URLSearchParams({ challenge: challengeName });
+    state.writeups.set(challengeName, await api(`/api/writeup?${params}`));
+    renderDetailPage();
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function requestWriteup(challengeName, control) {
+  const success = await runCommand(
+    "/api/control/request-writeup",
+    { challenge: challengeName },
+    control,
+  );
+  if (!success) return;
+  state.writeups.delete(challengeName);
+  await refresh({ renderSelected: true });
+}
+
+function renderDetailPage() {
   const challenge = state.snapshot?.challenges.find((item) => item.name === state.selectedChallenge);
   if (!challenge) {
-    closeDrawer();
+    closeChallengeDetail({ replaceHistory: true });
     return;
   }
   const isStandalone = state.snapshot.submission_mode === "standalone";
 
-  byId("drawer-title").textContent = challenge.name;
-  byId("drawer-category").textContent = `${challenge.category.toUpperCase()} · ${formatNumber(challenge.value)} PTS`;
-  const content = byId("drawer-content");
+  document.title = `${challenge.name} · CTF Agent`;
+  byId("detail-title").textContent = challenge.name;
+  byId("detail-category").textContent = `${challenge.category.toUpperCase()} · ${formatNumber(challenge.value)} PTS`;
+  const content = byId("detail-content");
   content.replaceChildren();
 
+  const overview = node("div", "detail-overview");
   const summary = node("div", "detail-summary");
   summary.append(
     metric("STATUS", statusLabel(challenge.status)),
     metric("AGENTS", String(challenge.agents.length)),
     metric("COST", formatMoney(challenge.cost_usd)),
+    metric("WRITEUP", challenge.documented ? "DONE" : challenge.solved ? "PENDING" : "WAITING"),
   );
-  content.append(summary);
-
-  const controls = node("div", "control-row");
+  const controls = node("div", "control-row detail-actions");
   if (challenge.active) {
     controls.append(button("풀이 중단", "danger-button", () => stopChallenge(challenge.name)));
   } else if (!challenge.solved) {
     controls.append(button("SOL 풀이 시작", "primary-button", () => spawnChallenge(challenge.name)));
   }
   controls.append(button("상태 새로고침", "secondary-button", () => refresh({ renderSelected: true })));
-  content.append(controls);
+  overview.append(summary, controls);
+  content.append(overview);
+
+  const layout = node("div", "detail-layout");
+  const mainColumn = node("div", "detail-main-column");
+  const sideColumn = node("aside", "detail-side-column");
+  layout.append(mainColumn, sideColumn);
+  content.append(layout);
 
   if (challenge.flag) {
-    const flagSection = drawerSection(isStandalone ? "로컬 Flag 결과" : "확인된 Flag");
+    const flagSection = detailSection(isStandalone ? "로컬 Flag 결과" : "확인된 Flag");
     flagSection.append(node("div", "flag-value", challenge.flag));
-    content.append(flagSection);
+    mainColumn.append(flagSection);
   }
 
   if (challenge.candidate) {
-    const candidateSection = drawerSection("검증되지 않은 Flag 후보");
+    const candidateSection = detailSection("검증되지 않은 Flag 후보");
     candidateSection.append(node("div", "flag-value", challenge.candidate));
     if (challenge.candidate_review_required) {
       const reviewControls = node("div", "control-row");
@@ -365,13 +634,16 @@ function renderDrawer() {
       reviewControls.append(accept, reject);
       candidateSection.append(reviewControls);
     }
-    content.append(candidateSection);
+    mainColumn.append(candidateSection);
   }
+
+  mainColumn.append(buildWriteupSection(challenge));
+  sideColumn.append(buildResourcePanel(challenge));
 
   const noteMetadata = /^(source agent|stop reason|attempt|tool steps|original handoff|handoff audit|requested deliverable):/i;
   const approachNotes = (Array.isArray(challenge.approach_notes) ? challenge.approach_notes : [])
     .filter((note) => note?.text && !noteMetadata.test(note.text.trim()));
-  const notesSection = drawerSection("지금까지의 접근 노트", `${approachNotes.length} NOTES`);
+  const notesSection = detailSection("지금까지의 접근 노트", `${approachNotes.length} NOTES`);
   if (!approachNotes.length) {
     notesSection.append(node("p", "approach-notes-empty", "아직 기록된 접근이 없습니다. 풀이가 진행되면 핵심 가설과 확인 결과가 여기에 요약됩니다."));
   } else {
@@ -386,9 +658,9 @@ function renderDrawer() {
     }
     notesSection.append(notesList);
   }
-  content.append(notesSection);
+  mainColumn.append(notesSection);
 
-  const agentsSection = drawerSection("Solver agents", `${challenge.agents.length} AGENTS`);
+  const agentsSection = detailSection("Solver agents", `${challenge.agents.length} AGENTS`);
   if (!challenge.agents.length) {
     agentsSection.append(node("p", "agent-findings", "SOL 풀이를 시작하면 주 solver와 동적 하위 agent 상태가 여기에 표시됩니다."));
   }
@@ -417,11 +689,11 @@ function renderDrawer() {
     card.append(traceButton);
     agentsSection.append(card);
   }
-  content.append(agentsSection);
+  sideColumn.append(agentsSection);
 
   if (challenge.active) {
-    const broadcastSection = drawerSection("전체 solver에 힌트 전달");
-    const form = node("form", "drawer-form");
+    const broadcastSection = detailSection("전체 solver에 힌트 전달");
+    const form = node("form", "detail-form");
     const textarea = node("textarea");
     textarea.name = "message";
     textarea.maxLength = 4000;
@@ -436,12 +708,12 @@ function renderDrawer() {
       textarea.value = "";
     });
     broadcastSection.append(form);
-    content.append(broadcastSection);
+    sideColumn.append(broadcastSection);
   }
 
   if (!challenge.solved) {
-    const submitSection = drawerSection(isStandalone ? "로컬 Flag 후보 기록" : state.snapshot.no_submit ? "Flag 후보 기록" : "Flag 수동 제출");
-    const form = node("form", "drawer-form");
+    const submitSection = detailSection(isStandalone ? "로컬 Flag 후보 기록" : state.snapshot.no_submit ? "Flag 후보 기록" : "Flag 수동 제출");
+    const form = node("form", "detail-form");
     const input = node("input");
     input.name = "flag";
     input.maxLength = 2000;
@@ -457,32 +729,89 @@ function renderDrawer() {
       input.value = "";
     });
     submitSection.append(form);
-    content.append(submitSection);
+    sideColumn.append(submitSection);
   }
 }
 
-function openDrawer(name) {
-  if (!state.selectedChallenge) state.drawerReturnChallenge = name;
-  state.selectedChallenge = name;
-  renderDrawer();
-  const drawer = byId("detail-drawer");
-  drawer.classList.add("open");
-  drawer.setAttribute("aria-hidden", "false");
-  document.body.style.overflow = "hidden";
-  byId("drawer-close").focus();
+function challengeUrl(name = "") {
+  const url = new URL(window.location.href);
+  if (name) url.searchParams.set("challenge", name);
+  else url.searchParams.delete("challenge");
+  return url;
 }
 
-function closeDrawer() {
-  const returnChallenge = state.drawerReturnChallenge;
+function transitionAppView(showDetail, { animate = true, returnChallenge = "" } = {}) {
+  const dashboard = byId("dashboard-view");
+  const detail = byId("detail-page");
+  document.documentElement.dataset.navDirection = showDetail ? "forward" : "back";
+  const update = () => {
+    dashboard.hidden = showDetail;
+    detail.hidden = !showDetail;
+    window.scrollTo(0, 0);
+    if (showDetail) {
+      byId("detail-back").focus({ preventScroll: true });
+      return;
+    }
+    const returnRow = [...byId("challenge-rows").querySelectorAll("tr")]
+      .find((row) => row.dataset.challengeName === returnChallenge);
+    if (returnRow) returnRow.focus({ preventScroll: true });
+  };
+
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (animate && !reduceMotion && typeof document.startViewTransition === "function") {
+    try {
+      const transition = document.startViewTransition(update);
+      transition.finished.catch(() => {});
+      return;
+    } catch (_error) {
+      // Fall through to the CSS animation when another transition is active.
+    }
+  }
+
+  update();
+  if (animate && !reduceMotion) {
+    const target = showDetail ? detail : dashboard;
+    target.classList.remove("page-enter");
+    void target.offsetWidth;
+    target.classList.add("page-enter");
+    target.addEventListener("animationend", () => target.classList.remove("page-enter"), { once: true });
+  }
+}
+
+function openChallengeDetail(name, { updateHistory = true, animate = true } = {}) {
+  if (!currentChallenge(name)) return;
+  if (!state.selectedChallenge) state.detailReturnChallenge = name;
+  state.selectedChallenge = name;
+  renderDetailPage();
+  if (updateHistory) {
+    window.history.pushState({ ctfView: "detail", challenge: name }, "", challengeUrl(name));
+  }
+  transitionAppView(true, { animate });
+}
+
+function closeChallengeDetail({ fromHistory = false, replaceHistory = false, animate = true } = {}) {
+  if (!fromHistory && !replaceHistory && window.history.state?.ctfView === "detail") {
+    window.history.back();
+    return;
+  }
+
+  const returnChallenge = state.detailReturnChallenge || state.selectedChallenge || "";
   state.selectedChallenge = null;
-  state.drawerReturnChallenge = null;
-  const drawer = byId("detail-drawer");
-  drawer.classList.remove("open");
-  drawer.setAttribute("aria-hidden", "true");
-  document.body.style.overflow = "";
-  const returnRow = [...byId("challenge-rows").querySelectorAll("tr")]
-    .find((row) => row.dataset.challengeName === returnChallenge);
-  if (returnRow) returnRow.focus();
+  state.detailReturnChallenge = null;
+  document.title = "CTF Agent Command Center";
+  if (replaceHistory || (!fromHistory && new URL(window.location.href).searchParams.has("challenge"))) {
+    window.history.replaceState({ ctfView: "dashboard" }, "", challengeUrl());
+  }
+  transitionAppView(false, { animate, returnChallenge });
+}
+
+function syncViewFromLocation({ animate = true } = {}) {
+  const requested = new URL(window.location.href).searchParams.get("challenge");
+  if (requested && currentChallenge(requested)) {
+    openChallengeDetail(requested, { updateHistory: false, animate });
+    return;
+  }
+  closeChallengeDetail({ fromHistory: true, replaceHistory: Boolean(requested), animate });
 }
 
 async function loadTrace(challenge, model, card) {
@@ -546,7 +875,7 @@ async function refresh({ renderSelected = false } = {}) {
     setConnection(true);
     renderOverview();
     renderRows();
-    if (state.selectedChallenge && renderSelected) renderDrawer();
+    if (state.selectedChallenge && renderSelected) renderDetailPage();
   } catch (error) {
     setConnection(false);
   } finally {
@@ -556,28 +885,53 @@ async function refresh({ renderSelected = false } = {}) {
   }
 }
 
+async function refreshResources() {
+  if (state.resourceRefreshing || !state.snapshot) return;
+  state.resourceRefreshing = true;
+  try {
+    const payload = await api("/api/resources");
+    state.snapshot.resources = payload.resources || {};
+    const byChallenge = new Map((payload.challenges || []).map((item) => [item.name, item]));
+    for (const challenge of state.snapshot.challenges) {
+      const live = byChallenge.get(challenge.name);
+      if (!live) continue;
+      challenge.resources = live.resources || {};
+      const byAgent = new Map((live.agents || []).map((agent) => [agent.model_spec, agent.resource]));
+      for (const agent of challenge.agents) {
+        if (byAgent.has(agent.model_spec)) agent.resource = byAgent.get(agent.model_spec);
+      }
+    }
+    renderGlobalResources(state.snapshot.resources);
+    for (const row of byId("challenge-rows").querySelectorAll("tr")) {
+      const challenge = state.snapshot.challenges.find(
+        (item) => item.name === row.dataset.challengeName,
+      );
+      const copy = row.querySelector(".row-resource-copy");
+      if (!challenge || !copy) continue;
+      const resources = challenge.resources || {};
+      copy.textContent = resources.container_count
+        ? ` · ${Number(resources.cpu_percent || 0).toFixed(1)}% CPU · ${formatResourceBytes(resources.memory_bytes || 0)}`
+        : "";
+    }
+    if (state.selectedChallenge) {
+      const challenge = state.snapshot.challenges.find((item) => item.name === state.selectedChallenge);
+      const current = byId("detail-resource-section");
+      if (challenge && current) current.replaceWith(buildResourcePanel(challenge));
+    }
+  } catch (_error) {
+    // The slower status poll owns the global connection indicator.
+  } finally {
+    state.resourceRefreshing = false;
+  }
+}
+
 async function initialize() {
   byId("refresh-button").addEventListener("click", refresh);
-  byId("drawer-close").addEventListener("click", closeDrawer);
-  byId("drawer-backdrop").addEventListener("click", closeDrawer);
+  byId("detail-back").addEventListener("click", () => closeChallengeDetail());
+  window.addEventListener("popstate", () => syncViewFromLocation());
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && state.selectedChallenge) {
-      closeDrawer();
-      return;
-    }
-    if (event.key !== "Tab" || !state.selectedChallenge) return;
-    const panel = byId("detail-drawer").querySelector(".drawer-panel");
-    const focusable = [...panel.querySelectorAll("button, input, textarea, [tabindex]:not([tabindex='-1'])")]
-      .filter((element) => !element.disabled && element.offsetParent !== null);
-    if (!focusable.length) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
+      closeChallengeDetail();
     }
   });
 
@@ -678,7 +1032,7 @@ async function initialize() {
       resetSubmit,
     );
     if (success) {
-      closeDrawer();
+      closeChallengeDetail({ replaceHistory: true });
       state.candidateNotices.clear();
       state.ctfdInitialized = false;
       byId("ctfd-url").value = "";
@@ -688,6 +1042,37 @@ async function initialize() {
       resetDialog.close();
       resetInput.value = "";
       resetSubmit.disabled = true;
+    }
+  });
+
+  const experienceDialog = byId("experience-reset-dialog");
+  const experienceInput = byId("experience-reset-confirmation");
+  const experienceSubmit = byId("experience-reset-submit");
+  byId("experience-reset-open").addEventListener("click", () => {
+    experienceInput.value = "";
+    experienceSubmit.disabled = true;
+    experienceDialog.showModal();
+    experienceInput.focus();
+  });
+  byId("experience-reset-cancel").addEventListener("click", () => experienceDialog.close());
+  experienceDialog.addEventListener("click", (event) => {
+    if (event.target === experienceDialog) experienceDialog.close();
+  });
+  experienceInput.addEventListener("input", () => {
+    experienceSubmit.disabled = experienceInput.value !== "경험 초기화";
+  });
+  byId("experience-reset-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (experienceInput.value !== "경험 초기화") return;
+    const success = await runCommand(
+      "/api/control/reset-experience",
+      { confirmation: experienceInput.value },
+      experienceSubmit,
+    );
+    if (success) {
+      experienceDialog.close();
+      experienceInput.value = "";
+      experienceSubmit.disabled = true;
     }
   });
 
@@ -730,7 +1115,9 @@ async function initialize() {
       byId("reset-open").title = "실행 중인 coordinator가 초기화 API를 지원하지 않습니다.";
     }
     await refresh();
-    state.refreshTimer = window.setInterval(refresh, 2500);
+    syncViewFromLocation({ animate: false });
+    state.refreshTimer = window.setInterval(() => refresh({ renderSelected: true }), 2500);
+    state.resourceTimer = window.setInterval(refreshResources, 1000);
   } catch (error) {
     setConnection(false);
     toast(`초기화 실패: ${error.message}`, "error");
