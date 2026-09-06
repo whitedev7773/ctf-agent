@@ -8,6 +8,7 @@ import json
 import logging
 from pathlib import Path
 
+from backend.artifacts import challenge_shared_path
 from backend.deps import CoordinatorDeps
 from backend.experience import promote_challenge_experience
 from backend.prompts import ChallengeMeta
@@ -75,7 +76,11 @@ async def do_get_solve_status(deps: CoordinatorDeps) -> str:
     )
 
 
-async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
+async def do_spawn_swarm(
+    deps: CoordinatorDeps,
+    challenge_name: str,
+    feedback: str = "",
+) -> str:
     # Retire ALL finished swarms before checking capacity
     finished = [
         name for name, swarm in deps.swarms.items()
@@ -130,6 +135,7 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
         model_specs=list(deps.model_specs),
         no_submit=deps.no_submit,
         coordinator_inbox=deps.coordinator_inbox,
+        feedback_directive=feedback,
     )
     deps.swarms[challenge_name] = swarm
 
@@ -269,14 +275,68 @@ async def do_review_candidate(
         persist_deps_state(deps)
         return f'LOCAL CONFIRMED — recorded "{candidate}" as solved for {challenge_name}'
 
-    deps.candidates.pop(challenge_name, None)
+    record = dict(record)
+    rejected_flags = list(record.get("rejected_flags", []))
+    if candidate not in rejected_flags:
+        rejected_flags.append(candidate)
+    rejected_flags = rejected_flags[-50:]
+    remaining_flags = [
+        item for item in record.get("flags", [])
+        if isinstance(item, str) and item != candidate
+    ]
+    feedback = (
+        "CANDIDATE REJECTED BY OPERATOR. Treat this as hard negative evidence: "
+        f"the candidate `{candidate}` is incorrect. Do not reuse it or merely "
+        "reformat it. Re-check the verifier and pivot from the assumptions that "
+        "produced this candidate. Reproduce the next candidate before reporting it."
+    )
+    record.update(
+        {
+            "flag": "",
+            "flags": remaining_flags,
+            "rejected_flags": rejected_flags,
+            "feedback": feedback,
+            "source": "operator review",
+            "status": "rejected",
+            "review_required": False,
+        }
+    )
+    deps.candidates[challenge_name] = record
+
+    settings = getattr(deps, "settings", None)
+    if settings is not None:
+        shared_dir = Path(challenge_shared_path(settings, challenge_name))
+        feedback_path = shared_dir / "REJECTED_CANDIDATES.md"
+        prior = feedback_path.read_text(encoding="utf-8") if feedback_path.exists() else ""
+        entry = (
+            f"\n\n## Conflicts\n\n- The operator rejected candidate `{candidate}` as incorrect.\n"
+            f"\n## Next experiment\n\n- {feedback}\n"
+        )
+        feedback_path.write_text((prior + entry)[-30_000:], encoding="utf-8")
+
     swarm = getattr(deps, "swarms", {}).get(challenge_name)
-    if swarm:
-        swarm.candidates.clear()
+    task = getattr(deps, "swarm_tasks", {}).get(challenge_name)
+    if swarm and task and not task.done():
+        await swarm.message_bus.broadcast(feedback, source="operator-review")
+        for solver in swarm.solvers.values():
+            bump = getattr(solver, "bump", None)
+            if callable(bump):
+                bump(feedback)
+        persist_deps_state(deps)
+        return (
+            f'LOCAL REJECTED — removed "{candidate}" for {challenge_name}. '
+            "The rejection was sent to the active solver as hard negative evidence."
+        )
+
+    restart_message = ""
+    if settings is not None and challenge_name in getattr(deps, "challenge_dirs", {}):
+        restart_message = await do_spawn_swarm(deps, challenge_name, feedback=feedback)
     persist_deps_state(deps)
     return (
         f'LOCAL REJECTED — removed "{candidate}" for {challenge_name}. '
-        "Restart the swarm to continue solving."
+        + ("A new solver swarm was started with the rejection as feedback. " + restart_message
+           if restart_message
+           else "The rejection was saved; start a new swarm to continue solving.")
     )
 
 

@@ -8,19 +8,23 @@ const state = {
   selectedChallenge: null,
   refreshTimer: null,
   resourceTimer: null,
+  codexUsageTimer: null,
   resourceRefreshing: false,
+  codexUsageRefreshing: false,
   refreshing: false,
   ctfdInitialized: false,
   detailReturnChallenge: null,
   localFiles: [],
   candidateNotices: new Set(),
   writeups: new Map(),
+  traces: new Map(),
   detailSignature: "",
   deleteChallengeSupported: false,
   deleteChallengeName: "",
   runtimeSettingsInitialized: false,
   runtimeSettingsDirty: false,
   runtimeModels: [],
+  codexUsage: null,
 };
 
 const runtimeNumericFields = [
@@ -109,6 +113,30 @@ function formatDuration(seconds) {
   if (value >= 3600) return `${Math.floor(value / 3600)}h ${Math.floor(value % 3600 / 60)}m`;
   if (value >= 60) return `${Math.floor(value / 60)}m ${Math.floor(value % 60)}s`;
   return `${Math.floor(value)}s`;
+}
+
+function formatResetTime(unixSeconds) {
+  if (!unixSeconds) return "초기화 시각 미제공";
+  const reset = new Date(Number(unixSeconds) * 1000);
+  if (Number.isNaN(reset.getTime())) return "초기화 시각 미제공";
+  const remainingSeconds = Math.max(0, Math.floor((reset.getTime() - Date.now()) / 1000));
+  const days = Math.floor(remainingSeconds / 86_400);
+  const hours = Math.floor((remainingSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((remainingSeconds % 3_600) / 60);
+  const relative = days
+    ? `${days}일 ${hours}시간 후`
+    : hours
+      ? `${hours}시간 ${minutes}분 후`
+      : remainingSeconds > 0
+        ? `${Math.max(1, minutes)}분 후`
+        : "곧 초기화";
+  const absolute = reset.toLocaleString("ko-KR", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `${absolute} · ${relative}`;
 }
 
 function syncLocalFiles(files) {
@@ -239,6 +267,7 @@ function renderOverview() {
   byId("stat-agent-total").textContent = `생성된 agent ${stats.total_agents}`;
   byId("stat-cost").textContent = formatMoney(stats.cost_usd);
   byId("stat-tokens").textContent = `${formatTokens(stats.tokens)} raw · ${formatTokens(stats.effective_tokens)} effective`;
+  if (state.codexUsage) renderCodexUsage(state.codexUsage);
   renderGlobalResources(snapshot.resources || {});
   const experience = snapshot.experience || {};
   byId("experience-records").textContent = formatNumber(experience.record_count || 0);
@@ -275,6 +304,101 @@ function renderOverview() {
     state.ctfdInitialized = true;
   }
   renderRuntimeSettings(snapshot.runtime_settings || {});
+}
+
+function renderCodexUsage(usage) {
+  const badge = byId("codex-usage-badge");
+  const copy = byId("codex-usage-copy");
+  const container = byId("codex-usage-windows");
+  if (!usage?.available) {
+    badge.textContent = "사용 불가";
+    badge.className = "source-badge error";
+    copy.textContent = "로그인된 Codex 계정의 사용 한도를 확인할 수 없습니다.";
+    const empty = node("div", "codex-usage-empty");
+    empty.append(
+      node("strong", "", "사용량을 불러오지 못했습니다."),
+      node("span", "", usage?.error || "잠시 후 다시 시도해 주세요."),
+    );
+    container.replaceChildren(empty);
+    return;
+  }
+
+  const plan = usage.plan_type ? String(usage.plan_type).toUpperCase() : "CODEX";
+  badge.textContent = plan;
+  badge.className = "source-badge connected";
+  const details = [];
+  if (Number.isInteger(usage.available_resets)) {
+    details.push(`사용 가능 리셋 ${usage.available_resets}개`);
+  }
+  if (usage.credits?.unlimited) details.push("크레딧 무제한");
+  else if (usage.credits?.balance) details.push(`크레딧 ${usage.credits.balance}`);
+  copy.textContent = details.length
+    ? `계정 전체 사용량 · ${details.join(" · ")}`
+    : "로그인된 계정 전체의 Codex 사용량입니다.";
+
+  const windows = Array.isArray(usage.windows) ? [...usage.windows] : [];
+  const order = { five_hour: 0, weekly: 1 };
+  windows.sort((left, right) => (order[left.kind] ?? 2) - (order[right.kind] ?? 2));
+  if (!windows.length) {
+    const empty = node("div", "codex-usage-empty");
+    empty.append(
+      node("strong", "", "표시할 사용 한도 창이 없습니다."),
+      node("span", "", "현재 인증 방식이나 플랜에서는 사용률이 제공되지 않을 수 있습니다."),
+    );
+    container.replaceChildren(empty);
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const windowUsage of windows) {
+    const used = Math.max(0, Math.min(100, Number(windowUsage.used_percent || 0)));
+    const severity = used >= 90 ? " is-critical" : used >= 70 ? " is-warning" : "";
+    const card = node("article", `codex-limit-card${severity}`);
+    const head = node("div", "codex-limit-card-head");
+    head.append(
+      node("span", "", `${windowUsage.label || "사용량"} 한도`),
+      node("strong", "", `${Math.round(used)}%`),
+    );
+    const bar = node("div", "codex-limit-bar");
+    bar.setAttribute("role", "progressbar");
+    bar.setAttribute("aria-label", `${windowUsage.label || "Codex"} 사용량`);
+    bar.setAttribute("aria-valuemin", "0");
+    bar.setAttribute("aria-valuemax", "100");
+    bar.setAttribute("aria-valuenow", String(Math.round(used)));
+    const fill = node("span");
+    fill.style.width = `${used}%`;
+    bar.append(fill);
+    const meta = node("div", "codex-limit-meta");
+    meta.append(node("span", "", `${Math.round(100 - used)}% 남음`));
+    const reset = node("time", "", formatResetTime(windowUsage.resets_at));
+    if (windowUsage.resets_at) {
+      reset.dateTime = new Date(Number(windowUsage.resets_at) * 1000).toISOString();
+    }
+    meta.append(reset);
+    card.append(head, bar, meta);
+    fragment.append(card);
+  }
+  container.replaceChildren(fragment);
+}
+
+async function refreshCodexUsage({ force = false } = {}) {
+  if (state.codexUsageRefreshing) return;
+  state.codexUsageRefreshing = true;
+  const control = byId("codex-usage-refresh");
+  control.disabled = true;
+  control.setAttribute("aria-busy", "true");
+  try {
+    state.codexUsage = await api(`/api/codex/usage${force ? "?refresh=1" : ""}`);
+    renderCodexUsage(state.codexUsage);
+  } catch (error) {
+    state.codexUsage = { available: false, error: error.message, windows: [] };
+    renderCodexUsage(state.codexUsage);
+    if (force) toast(error.message, "error");
+  } finally {
+    state.codexUsageRefreshing = false;
+    control.disabled = false;
+    control.removeAttribute("aria-busy");
+  }
 }
 
 function splitModelSpec(spec, fallbackBase, fallbackEffort) {
@@ -864,6 +988,8 @@ function renderDetailPage({ preserveScroll = false } = {}) {
   }
   for (const agent of challenge.agents) {
     const card = node("article", "agent-card");
+    card.dataset.challengeName = challenge.name;
+    card.dataset.agentModel = agent.model_spec;
     const header = node("div", "agent-card-header");
     header.append(
       node("span", "agent-model", `${agent.role ? agent.role.toUpperCase() + " · " : ""}${agent.model_spec}`),
@@ -896,6 +1022,8 @@ function renderDetailPage({ preserveScroll = false } = {}) {
     if (agent.workspace_path) card.append(node("p", "agent-workspace", `산출물: ${agent.workspace_path}`));
     const traceButton = button("최근 trace 보기 →", "trace-button", () => loadTrace(challenge.name, agent.model_spec, card));
     card.append(traceButton);
+    const cachedTrace = state.traces.get(challenge.name)?.get(agent.model_spec);
+    if (cachedTrace !== undefined) card.append(node("pre", "trace-output", cachedTrace));
     agentsSection.append(card);
   }
   sideColumn.append(agentsSection);
@@ -1029,20 +1157,34 @@ function syncViewFromLocation({ animate = true } = {}) {
 }
 
 async function loadTrace(challenge, model, card) {
+  let challengeTraces = state.traces.get(challenge);
+  if (!challengeTraces) {
+    challengeTraces = new Map();
+    state.traces.set(challenge, challengeTraces);
+  }
+  const loadingText = "trace를 불러오는 중…";
+  challengeTraces.set(model, loadingText);
   let output = card.querySelector(".trace-output");
   if (!output) {
-    output = node("pre", "trace-output", "trace를 불러오는 중…");
+    output = node("pre", "trace-output", loadingText);
     card.append(output);
   } else {
-    output.textContent = "trace를 새로 불러오는 중…";
+    output.textContent = loadingText;
   }
+  let traceText;
   try {
     const query = new URLSearchParams({ challenge, model, last_n: "60" });
     const result = await api(`/api/trace?${query}`);
-    output.textContent = result.trace || "기록된 trace가 없습니다.";
+    traceText = result.trace || "기록된 trace가 없습니다.";
   } catch (error) {
-    output.textContent = `Trace 오류: ${error.message}`;
+    traceText = `Trace 오류: ${error.message}`;
   }
+  challengeTraces.set(model, traceText);
+  const currentCard = [...byId("detail-content").querySelectorAll(".agent-card")].find(
+    (item) => item.dataset.challengeName === challenge && item.dataset.agentModel === model,
+  );
+  const currentOutput = currentCard?.querySelector(".trace-output");
+  if (currentOutput) currentOutput.textContent = traceText;
 }
 
 async function runCommand(path, body, control = null) {
@@ -1159,6 +1301,9 @@ async function refreshResources() {
 
 async function initialize() {
   byId("refresh-button").addEventListener("click", refresh);
+  byId("codex-usage-refresh").addEventListener("click", () => {
+    refreshCodexUsage({ force: true });
+  });
   byId("detail-back").addEventListener("click", () => closeChallengeDetail());
   window.addEventListener("popstate", () => syncViewFromLocation());
   document.addEventListener("keydown", (event) => {
@@ -1347,6 +1492,7 @@ async function initialize() {
     );
     if (success) {
       state.writeups.delete(name);
+      state.traces.delete(name);
       deleteDialog.close();
       deleteInput.value = "";
       deleteSubmit.disabled = true;
@@ -1394,9 +1540,11 @@ async function initialize() {
       byId("reset-open").title = "실행 중인 coordinator가 초기화 API를 지원하지 않습니다.";
     }
     await refresh();
+    void refreshCodexUsage();
     syncViewFromLocation({ animate: false });
     state.refreshTimer = window.setInterval(() => refresh({ renderSelected: true }), 2500);
     state.resourceTimer = window.setInterval(refreshResources, 1000);
+    state.codexUsageTimer = window.setInterval(refreshCodexUsage, 30_000);
   } catch (error) {
     setConnection(false);
     toast(`초기화 실패: ${error.message}`, "error");

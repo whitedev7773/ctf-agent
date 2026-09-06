@@ -73,7 +73,7 @@ uv run ctf-solve \
   -v
 ```
 
-Open the local operations dashboard at [http://127.0.0.1:9400](http://127.0.0.1:9400). Enter a CTFd URL and token there, or stay in standalone mode and register one local challenge with its description, connection details, and attachments. The dashboard also shows per-solver Docker CPU, memory, process and network usage, writeup evidence, traces, cost, and swarm controls.
+Open the local operations dashboard at [http://127.0.0.1:9400](http://127.0.0.1:9400). Enter a CTFd URL and token there, or stay in standalone mode and register one local challenge with its description, connection details, and attachments. The dashboard also shows account-wide Codex five-hour and weekly usage windows with reset times, plus per-solver Docker CPU, memory, process and network usage, writeup evidence, traces, cost, and swarm controls.
 
 CTFd can still be configured ahead of time with `CTFD_URL`/`CTFD_TOKEN` or the `--ctfd-url`/`--ctfd-token` CLI options. It is no longer required.
 

@@ -24,6 +24,7 @@ from backend.budgets import (
     token_metrics,
 )
 from backend.challenge_profiles import external_skill_path, solver_role
+from backend.codex_usage import CodexUsageMonitor
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.experience import experience_root, experience_summary
@@ -57,7 +58,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 logger = logging.getLogger(__name__)
 RESET_CONFIRMATION = "초기화"
 RESET_EXPERIENCE_CONFIRMATION = "경험 초기화"
-RUNTIME_REVISION = 19
+RUNTIME_REVISION = 20
 
 
 def _runtime_source_fingerprint(project_root: Path | None = None) -> str:
@@ -268,6 +269,9 @@ class DashboardServer:
         self._writeup_lock = asyncio.Lock()
         self._writeup_tasks: dict[str, asyncio.Task[None]] = {}
         self._writeup_solvers: dict[str, Any] = {}
+        self.codex_usage_monitor = CodexUsageMonitor(
+            getattr(self.deps.settings, "codex_cli_path", ""),
+        )
         self.deps.request_writeup_generation = self.start_writeup_generation
 
     async def start(self) -> None:
@@ -280,6 +284,7 @@ class DashboardServer:
                 web.get("/api/health", self._health),
                 web.get("/api/session", self._session),
                 web.get("/api/status", self._status),
+                web.get("/api/codex/usage", self._codex_usage),
                 web.get("/api/resources", self._resources),
                 web.get("/api/writeup", self._writeup),
                 web.get("/api/artifact", self._artifact),
@@ -320,6 +325,7 @@ class DashboardServer:
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self.codex_usage_monitor.stop()
         if self._runner:
             await self._runner.cleanup()
         self._site = None
@@ -350,6 +356,10 @@ class DashboardServer:
     async def _health(self, _request: web.Request) -> web.Response:
         return web.json_response({"ok": True})
 
+    async def _codex_usage(self, request: web.Request) -> web.Response:
+        force = request.query.get("refresh") == "1"
+        return web.json_response(await self.codex_usage_monitor.snapshot(force=force))
+
     async def _session(self, _request: web.Request) -> web.Response:
         return web.json_response(
             {
@@ -362,6 +372,7 @@ class DashboardServer:
                     "request_writeup": True,
                     "delete_challenge": True,
                     "runtime_settings": True,
+                    "codex_usage": True,
                 },
             }
         )

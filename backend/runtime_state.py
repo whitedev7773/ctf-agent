@@ -39,6 +39,11 @@ def _clean_records(value: Any) -> dict[str, dict]:
         flags = raw_record.get("flags")
         if isinstance(flags, list):
             record["flags"] = [item[:4000] for item in flags if isinstance(item, str)][:20]
+        rejected_flags = raw_record.get("rejected_flags")
+        if isinstance(rejected_flags, list):
+            record["rejected_flags"] = [
+                item[:4000] for item in rejected_flags if isinstance(item, str)
+            ][:50]
         sources = raw_record.get("sources")
         if isinstance(sources, list):
             record["sources"] = [item[:500] for item in sources if isinstance(item, str)][:20]
@@ -46,6 +51,9 @@ def _clean_records(value: Any) -> dict[str, dict]:
             item = raw_record.get(key)
             if isinstance(item, bool):
                 record[key] = item
+        feedback = raw_record.get("feedback")
+        if isinstance(feedback, str):
+            record["feedback"] = feedback[:6000]
         if record:
             cleaned[name] = record
     return cleaned

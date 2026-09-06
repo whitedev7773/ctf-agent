@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from backend.agents.codex_solver import CodexSolver
 from backend.agents.coordinator_core import (
@@ -1308,11 +1308,25 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("local", deps.candidates)
 
         deps.challenge_metas["local-retry"] = SimpleNamespace(flag_format="TEAM{...}")
-        await coordinator_submit_flag(deps, "local-retry", "TEAM{wrong}")
-        rejected = await do_review_candidate(deps, "local-retry", "TEAM{wrong}", False)
+        with tempfile.TemporaryDirectory() as workspace:
+            deps.settings = SimpleNamespace(workspace_root=workspace)
+            deps.challenge_dirs = {"local-retry": workspace}
+            deps.swarms = {}
+            deps.swarm_tasks = {}
+            with patch(
+                "backend.agents.coordinator_core.do_spawn_swarm",
+                new=AsyncMock(return_value="SOL-led swarm spawned with rejection feedback"),
+            ) as spawn:
+                await coordinator_submit_flag(deps, "local-retry", "TEAM{wrong}")
+                rejected = await do_review_candidate(deps, "local-retry", "TEAM{wrong}", False)
+            spawn.assert_awaited_once()
+            self.assertIn("TEAM{wrong}", spawn.await_args.kwargs["feedback"])
+            feedback_file = Path(challenge_shared_path(deps.settings, "local-retry")) / "REJECTED_CANDIDATES.md"
+            self.assertIn("TEAM{wrong}", feedback_file.read_text(encoding="utf-8"))
         self.assertIn("LOCAL REJECTED", rejected)
+        self.assertIn("new solver swarm", rejected)
         self.assertNotIn("local-retry", deps.results)
-        self.assertNotIn("local-retry", deps.candidates)
+        self.assertEqual(deps.candidates["local-retry"]["rejected_flags"], ["TEAM{wrong}"])
 
 
 if __name__ == "__main__":

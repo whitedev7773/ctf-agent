@@ -71,6 +71,7 @@ class ChallengeSwarm:
     model_specs: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
     no_submit: bool = False
     coordinator_inbox: asyncio.Queue | None = None
+    feedback_directive: str = ""
 
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     solvers: dict[str, SolverProtocol] = field(default_factory=dict)
@@ -580,7 +581,9 @@ class ChallengeSwarm:
             if self.cancel_event.is_set():
                 return None
 
-            solver = self._create_solver(model_spec, task_directive=task_directive)
+            directive_parts = [self.feedback_directive.strip(), task_directive.strip()]
+            directive = "\n\n".join(part for part in directive_parts if part)
+            solver = self._create_solver(model_spec, task_directive=directive)
             self.solvers[model_spec] = solver
             result, final_solver = await self._run_solver_loop(solver, model_spec)
             solver = final_solver

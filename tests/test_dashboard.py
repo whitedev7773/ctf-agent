@@ -108,7 +108,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["stats"]["total"], 1)
             self.assertEqual(payload["challenges"][0]["name"], "web/intro")
             self.assertEqual(payload["challenges"][0]["status"], "idle")
-            self.assertEqual(payload["runtime_revision"], 19)
+            self.assertEqual(payload["runtime_revision"], 20)
             self.assertTrue(callable(self.deps.request_writeup_generation))
             self.assertFalse(payload["restart_required"])
             self.assertTrue(payload["runtime_policy"]["adaptive_delegation"])
@@ -119,6 +119,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         async with self.client.get(f"{self.base_url}/api/session") as response:
             session = await response.json()
             self.assertTrue(session["capabilities"]["delete_challenge"])
+            self.assertTrue(session["capabilities"]["codex_usage"])
             self.assertEqual(payload["runtime_policy"]["turn_idle_timeout_seconds"], 300)
             self.assertEqual(payload["runtime_policy"]["max_raw_tokens"], 12_000_000)
             self.assertEqual(payload["runtime_policy"]["delegate_max_attempts"], 4)
@@ -148,6 +149,28 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("captureDetailViewState", javascript)
             self.assertIn("document.createDocumentFragment()", javascript)
             self.assertIn("if (changed && !editing)", javascript)
+            self.assertIn("refreshCodexUsage", javascript)
+            self.assertIn("traces: new Map()", javascript)
+            self.assertIn(
+                "state.traces.get(challenge.name)?.get(agent.model_spec)",
+                javascript,
+            )
+            self.assertIn("state.traces.delete(name)", javascript)
+
+        async with self.client.get(f"{self.base_url}/assets/dashboard.css") as response:
+            stylesheet = await response.text()
+            self.assertEqual(response.status, 200)
+            self.assertIn("input, select, textarea { font-size: 16px; }", stylesheet)
+            self.assertIn("minmax(280px, .618fr) minmax(0, 1fr)", stylesheet)
+            self.assertIn("minmax(0, 1.618fr) minmax(340px, 1fr)", stylesheet)
+            self.assertIn(".setup-form input.sr-only", stylesheet)
+            self.assertIn(".file-remove { flex: 0 0 auto; width: 36px; height: 36px", stylesheet)
+            self.assertIn(".segmented button { min-height: 36px", stylesheet)
+
+        async with self.client.get(f"{self.base_url}/") as response:
+            html = await response.text()
+            self.assertIn('id="codex-usage-windows"', html)
+            self.assertIn('id="codex-usage-refresh"', html)
 
         html_ids = re.findall(r'\bid="([^"]+)"', html)
         javascript_refs = {
@@ -155,8 +178,49 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             for item in re.findall(r'byId\("([^"]+)"\)', javascript)
             if item.startswith("runtime-")
         }
+        codex_usage_refs = {
+            item
+            for item in re.findall(r'byId\("([^"]+)"\)', javascript)
+            if item.startswith("codex-usage-")
+        }
         self.assertEqual(len(html_ids), len(set(html_ids)))
         self.assertEqual(javascript_refs - set(html_ids), set())
+        self.assertEqual(codex_usage_refs - set(html_ids), set())
+
+    async def test_codex_usage_endpoint_supports_cached_and_forced_reads(self) -> None:
+        await self.server.codex_usage_monitor.stop()
+        fake_monitor = SimpleNamespace(
+            snapshot=AsyncMock(
+                return_value={
+                    "available": True,
+                    "plan_type": "plus",
+                    "windows": [
+                        {
+                            "kind": "five_hour",
+                            "label": "5시간",
+                            "used_percent": 25,
+                            "remaining_percent": 75,
+                            "window_minutes": 300,
+                            "resets_at": 1_800_000_000,
+                        }
+                    ],
+                }
+            ),
+            stop=AsyncMock(),
+        )
+        self.server.codex_usage_monitor = fake_monitor
+
+        async with self.client.get(f"{self.base_url}/api/codex/usage") as response:
+            payload = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["windows"][0]["used_percent"], 25)
+        fake_monitor.snapshot.assert_awaited_once_with(force=False)
+
+        async with self.client.get(
+            f"{self.base_url}/api/codex/usage?refresh=1"
+        ) as response:
+            self.assertEqual(response.status, 200)
+        fake_monitor.snapshot.assert_awaited_with(force=True)
 
     async def test_detail_notes_are_bounded_and_loaded_from_shared_state(self) -> None:
         from backend.artifacts import challenge_shared_path

@@ -55,7 +55,7 @@ echo [Mode] Configure CTFd in the dashboard or use a local challenge.
 echo [Stop] Press Ctrl+C in this window.
 echo.
 
-uv run ctf-solve --dashboard-port %CTF_AGENT_PORT% --max-challenges %CTF_AGENT_MAX_CHALLENGES% %*
+".venv\Scripts\python.exe" -m backend.cli --dashboard-port %CTF_AGENT_PORT% --max-challenges %CTF_AGENT_MAX_CHALLENGES% %*
 set "CTF_AGENT_EXIT_CODE=%ERRORLEVEL%"
 
 if not "%CTF_AGENT_EXIT_CODE%"=="0" (
