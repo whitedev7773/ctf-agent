@@ -24,5 +24,6 @@ uv.lock
 # Runtime
 workspace/
 experience/
+.ctf-agent-settings.json
 codex-schema-*/
 .claude/scheduled_tasks.lock

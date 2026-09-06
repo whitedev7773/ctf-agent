@@ -12,7 +12,7 @@
 1. Codex coordinator가 `codex app-server`와 JSON-RPC로 연결된다.
 2. CTFd가 연결된 경우 poller가 5초마다 문제 및 풀이 상태를 확인한다. 연결하지 않으면 로컬 독립 모드로 동작한다.
 3. CTFd의 새 문제 또는 대시보드에서 등록한 로컬 문제의 설명과 첨부 파일을 `challenges/`에서 관리한다.
-4. 문제마다 SOL-xhigh 주 solver 하나를 시작한다. SOL은 초기 분석 뒤 독립적으로 분리할 가치가 있는 좁은 작업만 Luna-low 하위 agent에 실시간 위임한다.
+4. 문제마다 SOL-high 주 solver 하나를 시작한다. SOL은 초기 분석 뒤 독립적으로 분리할 가치가 있는 좁은 작업만 Luna-low 하위 agent에 실시간 위임한다.
 5. 각 solver는 별도의 Docker 컨테이너에서 분석 도구를 사용한다.
 6. 한 solver가 flag를 찾으면 같은 문제의 나머지 solver를 중단한다. CTFd 연결 시에는 사이트에 제출해 확인하고, 독립 모드에서는 후보로 멈춘 뒤 운영자 확인을 기다린다.
 7. coordinator는 solver trace와 중간 결과를 읽고 필요한 힌트를 다시 전달한다.
@@ -21,7 +21,7 @@
 
 | 역할 | 모델 스펙 | 용도 |
 |---|---|---|
-| 주 풀이 | `codex/gpt-5.6-sol/xhigh` | 전체 풀이 경로, 작업 분할, 결과 통합과 최종 검증 |
+| 주 풀이 | `codex/gpt-5.6-sol/high` | 전체 풀이 경로, 작업 분할, 결과 통합과 최종 검증 |
 | 동적 하위 agent | `codex/gpt-5.6-luna/low` | SOL이 지정한 하나의 좁고 검증 가능한 보조 작업 |
 
 Coordinator의 기본 모델은 `gpt-5.6-terra`, reasoning effort는 `medium`이다. OpenAI는 Sol을 flagship, Terra를 성능·비용 균형형, Luna를 효율적인 대량 작업용 모델로 안내한다.
@@ -144,6 +144,7 @@ MAX_CONCURRENT_CHALLENGES=1
 | `LOGS_ROOT` | `logs` | Solver JSONL trace 저장 경로 |
 | `RESOURCE_SAMPLE_INTERVAL_SECONDS` | `2.0` | Docker CPU·메모리·PID·네트워크 계측 주기(초) |
 | `SOLVER_TURN_TIMEOUT_SECONDS` | `1800` | model turn 하나의 최대 실행 시간 |
+| `SOLVER_TURN_IDLE_TIMEOUT_SECONDS` | `300` | model/tool 활동이 없을 때 현재 turn만 회수하고 재개하는 시간, `0`이면 비활성화 |
 | `SOLVER_MAX_RUNTIME_SECONDS` | `10800` | solver 하나의 전체 최대 실행 시간 |
 | `SOLVER_HANDOFF_WAIT_SECONDS` | `180` | 여러 primary 모델을 직접 지정했을 때 단계별 handoff 대기 시간 |
 | `MAX_ATTEMPTS_PER_CHALLENGE` | `8` | SOL LEAD 최대 turn/slice 수; 역할별 배율 적용 |
@@ -163,6 +164,7 @@ MAX_CONCURRENT_CHALLENGES=1
 | `DELEGATE_MAX_ATTEMPTS` | `4` | 하위 agent 최대 turn/slice 수 |
 | `DELEGATE_MAX_RUNTIME_SECONDS` | `1800` | 하위 agent 전체 실행 시간 상한 |
 | `DELEGATE_TURN_TIMEOUT_SECONDS` | `600` | 하위 agent turn 하나의 상한 |
+| `DELEGATE_TURN_IDLE_TIMEOUT_SECONDS` | `180` | 하위 agent의 무활동 turn 회수 시간 |
 | `DELEGATE_MAX_STEPS` | `96` | 하위 agent tool step 상한 |
 | `DELEGATE_MAX_TOKENS` | `250000` | 하위 agent 캐시 가중 유효 token 상한 |
 | `DELEGATE_MAX_RAW_TOKENS` | `1200000` | 하위 agent raw token 안전 상한 |
@@ -277,7 +279,7 @@ hints: []
 
 ### 8.1 단일 문제
 
-기본적으로 SOL-xhigh 하나를 실행하고, SOL이 필요하다고 판단한 경우에만 Luna-low 하위 agent를 생성한다.
+기본적으로 SOL-high 하나를 실행하고, SOL이 필요하다고 판단한 경우에만 Luna-low 하위 agent를 생성한다.
 
 ```powershell
 uv run ctf-solve `
@@ -323,7 +325,7 @@ uv run ctf-solve `
 
 ```powershell
 uv run ctf-solve `
-  --models codex/gpt-5.6-sol/xhigh `
+  --models codex/gpt-5.6-sol/high `
   --models codex/gpt-5.6-terra/high `
   --max-challenges 3 `
   --dashboard-port 9400 `
@@ -345,7 +347,7 @@ codex/<model-id>/<reasoning-effort>
 | 어려운 결승 문제 | Sol `xhigh` + Terra `high` |
 | 최고 품질 단일 시도 | `codex/gpt-5.6-sol/max` |
 
-높은 reasoning effort가 항상 더 좋은 것은 아니다. 높은 단계는 지연 시간과 사용량이 늘 수 있으므로 실제 문제에서 측정해 선택한다. 대회 중 기본 조합을 바꿀 때는 실행 중인 프로세스를 종료하고 새 옵션으로 다시 시작한다.
+높은 reasoning effort가 항상 더 좋은 것은 아니다. 높은 단계는 지연 시간과 사용량이 늘 수 있으므로 실제 문제에서 측정해 선택한다. 대시보드에서 실행 설정을 저장하면 이미 실행 중인 swarm은 기존 정책을 유지하고 이후 시작하는 swarm부터 새 정책을 사용한다.
 
 ## 9. 자원 계획
 
@@ -386,10 +388,14 @@ http://127.0.0.1:9400
 - Swarm 시작 및 중단
 - 같은 문제의 모든 solver에 힌트 broadcast
 - Coordinator에 운영자 메시지 전송
+- Sol 모델의 reasoning effort, 동시 문제 수, 비용·token·timeout 한도 조정
+- 동적 Luna 위임, delegate 예산, 컨테이너 CPU·메모리 한도 조정
 - Flag 후보 dry-run 또는 CTFd 수동 제출
 - 기존 풀이 기록과 런타임 환경 초기화
 
 CTFd를 연결하지 않은 독립 모드에서는 flag를 외부에 제출하지 않는다. Solver가 찾은 flag와 수동 입력한 값은 검증되지 않은 후보로 기록되고 운영자 확인 뒤에만 로컬 해결로 바뀐다. 후보와 확인된 로컬 결과는 `WORKSPACE_ROOT/.ctf-agent-runtime.json`에 원자적으로 저장되어 coordinator를 정상 재시작해도 유지된다. 대시보드에서 입력한 CTFd 인증 정보는 `.env`에 저장되지 않고 현재 coordinator 프로세스가 종료되면 사라진다.
+
+대시보드의 실행 설정은 프로젝트 루트의 `.ctf-agent-settings.json`에 저장된다. 이 파일에는 모델과 비밀값이 아닌 실행 정책만 기록되며 API key와 CTFd 인증 정보는 포함되지 않는다. 설정을 저장해도 실행 중인 swarm은 생성 당시 정책을 유지하고, 이후 시작하는 swarm부터 새 모델·예산·컨테이너 한도를 사용한다. 동시 문제 수를 현재 실행 수보다 작게 낮춰도 기존 swarm은 종료되지 않으며 실행 수가 새 한도 아래로 내려갈 때까지 새 문제 시작만 제한된다.
 
 대시보드는 coordinator와 같은 프로세스에서 실행되며 `127.0.0.1`에만 bind된다. 문제 상태는 약 2.5초마다, 각 solver Docker의 CPU·메모리·PID·network 통계는 기본 1초마다 화면에 반영된다. 쓰기 요청은 브라우저가 같은 origin에서 받은 세션별 token을 요구한다.
 
@@ -564,7 +570,7 @@ Windows에서는 Docker Desktop이 실행 중이고 Linux container 모드인지
 Codex CLI를 업데이트한 뒤 현재 계정에서 제공되는 모델을 확인한다. 우선 기본 스펙으로 되돌린다.
 
 ```text
-codex/gpt-5.6-sol/xhigh
+codex/gpt-5.6-sol/high
 codex/gpt-5.6-terra/high
 codex/gpt-5.6-luna/medium
 ```
@@ -673,21 +679,23 @@ uv run ctf-msg --help
 
 ## 18. 모델 역할과 외부 CTF 스킬
 
-기본 실행은 SOL-xhigh가 문제 전체의 소유권을 갖고 필요할 때만 작업을 분할한다.
+기본 실행은 SOL-high가 문제 전체의 소유권을 갖고 필요할 때만 작업을 분할한다.
 
 | 모델 | 역할 | 주요 산출물 |
 |---|---|---|
-| `codex/gpt-5.6-sol/xhigh` | LEAD: 주 풀이, 작업 분할, 증거 통합, 최종 검증 | `/challenge/shared/lead/SOLUTION.md` |
+| `codex/gpt-5.6-sol/high` | LEAD: 주 풀이, 작업 분할, 증거 통합, 최종 검증 | `/challenge/shared/lead/SOLUTION.md` |
 | `codex/gpt-5.6-luna/low/.../delegate-NN` | DELEGATE: 지정된 단일 가설의 저비용 검증 | `/challenge/shared/delegates/delegate-NN.md` |
 | `codex/gpt-5.6-luna/low/.../postprocess` | POSTPROCESS: 중단된 불완전 handoff 정리·충돌 검증 | `/challenge/shared/recovery/` |
 
-SOL은 초기 triage를 직접 수행한 뒤 `delegate_task`로 좁고 독립적인 질문과 필요한 산출물을 지정한다. 하위 agent 생성은 즉시 반환되므로 SOL은 기다리지 않고 주 경로를 계속 푼다. SOL은 `/challenge/shared/lead/STATE.md`에 확인된 사실, 충돌, 현재 blocker, 다음 실험을 유지한다. 정적 primitive가 구체화되면 추가적인 전체 추출보다 최소 harness·debugger 측정을 우선한다.
+SOL은 초기 triage를 직접 수행한 뒤 `delegate_task`로 좁고 독립적인 질문과 필요한 산출물을 지정한다. 여러 artifact나 subsystem을 함께 분석해야 하면 깊은 선형 분석 전에 서로 겹치지 않는 작업을 최대 두 개까지 조기에 병렬화한다. 하위 agent 생성은 즉시 반환되므로 SOL은 기다리지 않고 주 경로를 계속 푼다. Delegate의 `/challenge/workspace/`는 SOL이 볼 수 없으므로 재현에 필요한 script와 capture는 `/challenge/shared/delegates/<delegate-id>/`에 저장해야 하며, private workspace 경로를 참조하는 handoff는 evidence audit에서 거부된다. SOL은 `/challenge/shared/lead/STATE.md`에 확인된 사실, 충돌, 현재 blocker, 다음 실험을 유지한다. 정적 primitive가 구체화되면 추가적인 전체 추출보다 최소 harness·debugger 측정을 우선한다.
+
+실행 중인 Codex turn에 coordinator 지시나 audit를 통과한 Delegate handoff가 도착하면 현재 turn을 즉시 interrupt하고 누적된 지시를 다음 turn에 반영한다. model/tool protocol 활동이 기본 300초 동안 없을 때도 idle watchdog이 같은 방식으로 현재 turn만 회수한다. 실행 중인 sandbox command는 해당 command timeout이 담당하므로 idle watchdog이 중간에 끊지 않는다. 대시보드의 agent card에는 현재 idle 시간과 적용되는 limit이 표시된다.
 
 각 delegate handoff에는 `Conclusion`, `Evidence`, `Reproduction`, `Assumptions and conflicts` 절이 필요하다. `check_delegates`는 이를 검사해 `passed` 또는 `UNSAFE`를 표시한다. SOL은 `UNSAFE` 결과를 그대로 통합하지 않고 상충하는 offset·allocator·수식 등을 가장 작은 판별 실험으로 확인한다. 표현만 바꾼 유사 작업의 중복 위임, 문제 전체 위임, 동시·누적 한도 초과 요청은 거부된다. `--models`를 여러 번 지정하면 해당 모델들은 처음부터 실행되는 고정 primary roster가 되므로 기본 적응형 구성이 더 효율적이다.
 
 Delegate가 token·step·시간·시도 한도로 중단되면 runtime은 중단 사유, 마지막 findings, 원래 요청과 handoff 감사를 `/challenge/shared/recovery/*-budget-stop.md`에 먼저 저장하고 SOL 전용 메시지로 전달한다. 원래 handoff가 감사를 통과하면 추가 모델을 만들지 않는다. handoff가 없거나 `UNSAFE`일 때만 80K 유효 token·1회 시도의 후처리 Luna를 최대 한 개 생성한다. 후처리 worker는 새로운 풀이를 시작하지 않고 기존 증거의 모순을 정리하며, 다시 중단돼도 다른 후처리 worker를 재귀적으로 만들지 않는다.
 
-Coordinator 실행 후 backend 소스나 `.env`가 변경되면 대시보드 상단에 **재시작 필요**가 표시된다. 현재 활성 풀이가 끝난 뒤 재시작해야 변경된 예산과 추론 정책이 적용된다.
+Coordinator 실행 후 backend 소스나 `.env`가 변경되면 대시보드 상단에 **재시작 필요**가 표시된다. 소스, coordinator backend/model, port, 저장 경로처럼 대시보드에서 바꿀 수 없는 항목은 현재 활성 풀이가 끝난 뒤 재시작해야 적용된다.
 
 Sandbox에는 [ljagiello/ctf-skills](https://github.com/ljagiello/ctf-skills)의 검토·고정된
 revision이 `/challenge/skills/`에 설치된다. Solver는 문제 카테고리에 해당하는 `SKILL.md`를

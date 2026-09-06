@@ -41,7 +41,7 @@ Strategy:
 - Use read_solver_trace to monitor what each solver is doing and where it's stuck
 - When agents are stuck, read their traces, then craft targeted bumps with specific technical guidance
 - Use broadcast for facts useful to every role; use bump_agent for one role's targeted next action
-- Treat SOL-xhigh as the primary solve owner; bounded Luna workers handle only narrow delegated tasks
+- Treat SOL as the primary solve owner; bounded Luna workers handle only narrow delegated tasks
 
 CRITICAL RULES:
 - Respect configured attempt, runtime, step, token, command, and submission budgets.

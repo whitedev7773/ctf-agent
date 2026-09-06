@@ -22,6 +22,7 @@ from backend.budgets import (
     solver_runtime_limit,
     solver_step_limit,
     solver_token_limits,
+    solver_turn_idle_timeout_limit,
     solver_turn_timeout_limit,
     token_metrics,
 )
@@ -260,6 +261,10 @@ class ChallengeSwarm:
                 f"Delegate ID: {delegate_id}\n"
                 f"Assigned task: {task}\n"
                 f"Required deliverable: {deliverable}\n"
+                f"Your private `/challenge/workspace/` is not visible to SOL. Put every script, "
+                f"capture, or machine-readable artifact needed for reproduction under "
+                f"`/challenge/shared/delegates/{delegate_id}/`, and reference only those shared "
+                f"paths in the handoff. "
                 f"Write the result to `{handoff}` using exactly these sections: "
                 "`## Conclusion` (SUPPORTED/REFUTED/INCONCLUSIVE), `## Evidence`, "
                 "`## Reproduction`, and `## Assumptions and conflicts`. Include commands or scripts "
@@ -605,6 +610,7 @@ class ChallengeSwarm:
         started_at = time.monotonic()
         max_attempts = solver_token_limits(self.settings, model_spec).attempts
         turn_timeout = solver_turn_timeout_limit(self.settings, model_spec)
+        idle_timeout = solver_turn_idle_timeout_limit(self.settings, model_spec)
         max_runtime = max(turn_timeout, solver_runtime_limit(self.settings, model_spec))
         result = SolverResult(
             flag=None, status=CANCELLED, findings_summary="",
@@ -634,8 +640,54 @@ class ChallengeSwarm:
                 solver.run_until_done_or_gave_up(),
                 name=f"turn-{self.meta.name}-{model_spec}-{attempt}",
             )
+            turn_deadline = time.monotonic() + allowed
+            idle_interrupt_requested = False
+            idle_interrupt_deadline = 0.0
             try:
-                done, _ = await asyncio.wait({run_task}, timeout=allowed)
+                while True:
+                    remaining = turn_deadline - time.monotonic()
+                    if remaining <= 0:
+                        done = set()
+                        break
+                    done, _ = await asyncio.wait(
+                        {run_task},
+                        timeout=min(1.0, remaining),
+                    )
+                    if done:
+                        break
+
+                    idle_reader = getattr(solver, "activity_idle_seconds", None)
+                    tool_active = bool(getattr(solver, "tool_call_active", False))
+                    idle_seconds = float(idle_reader()) if callable(idle_reader) else 0.0
+                    if (
+                        idle_timeout
+                        and callable(idle_reader)
+                        and not tool_active
+                        and idle_seconds >= idle_timeout
+                        and not idle_interrupt_requested
+                    ):
+                        reason = (
+                            f"idle watchdog observed {int(idle_seconds)}s without model/tool "
+                            f"activity (limit {idle_timeout}s)"
+                        )
+                        interrupter = getattr(solver, "request_resume_interrupt", None)
+                        if callable(interrupter) and interrupter(reason):
+                            idle_interrupt_requested = True
+                            idle_interrupt_deadline = min(
+                                turn_deadline,
+                                time.monotonic() + 30.0,
+                            )
+                            logger.warning("[%s/%s] %s", self.meta.name, model_spec, reason)
+                        else:
+                            idle_interrupt_requested = True
+                            idle_interrupt_deadline = time.monotonic()
+                    if (
+                        idle_interrupt_deadline
+                        and time.monotonic() >= idle_interrupt_deadline
+                        and not run_task.done()
+                    ):
+                        done = set()
+                        break
             except asyncio.CancelledError:
                 # asyncio.wait() does not propagate cancellation to its children.
                 # Reap the active model turn so swarm cancellation cannot leave a
@@ -646,9 +698,14 @@ class ChallengeSwarm:
             if not done:
                 run_task.cancel()
                 await asyncio.gather(run_task, return_exceptions=True)
+                reason = (
+                    "idle watchdog interrupt did not complete within 30s"
+                    if idle_interrupt_requested
+                    else f"turn timeout exceeded ({int(allowed)}s)"
+                )
                 result = self._budget_result(
                     solver, model_spec, result, attempt,
-                    f"turn timeout exceeded ({int(allowed)}s)",
+                    reason,
                 )
                 self._checkpoint(solver, model_spec, result, attempt)
                 break
@@ -717,6 +774,9 @@ class ChallengeSwarm:
                         message,
                         target=lead_spec,
                     )
+                    lead_solver = self.solvers.get(lead_spec) if lead_spec else None
+                    if lead_solver is not None:
+                        lead_solver.bump(message)
                     if self.coordinator_inbox:
                         self.coordinator_inbox.put_nowait(f"[{self.meta.name}] {message}")
                     return result, cast(SolverProtocol, solver)
@@ -728,6 +788,21 @@ class ChallengeSwarm:
                 break
 
             if result.status == PROGRESS_CHECKPOINT:
+                if result.stop_reason.startswith("resume interrupt:"):
+                    if "idle watchdog" in result.stop_reason:
+                        insights = self._gather_sibling_insights(model_spec)
+                        solver.bump(
+                            f"{result.stop_reason}. The prior turn stalled without a tool call. "
+                            "Resume from the saved evidence, choose the cheapest discriminating "
+                            "experiment, and avoid broad dumps. "
+                            f"Sibling evidence: {insights}"
+                        )
+                    logger.info(
+                        "[%s/%s] Guidance/idle interrupt completed; resuming immediately",
+                        self.meta.name,
+                        model_spec,
+                    )
+                    continue
                 if progress_after == progress_before:
                     result = self._budget_result(
                         solver,

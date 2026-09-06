@@ -38,7 +38,7 @@ Strategy:
 - Use read_solver_trace to monitor what each solver is doing and where it's stuck
 - When agents are stuck, read traces and persistent-workspace notes, then craft targeted technical guidance
 - Use broadcast for facts useful to every role; use bump_agent for one role's targeted next action
-- Treat SOL-xhigh as the primary solve owner. It may create bounded Luna-low delegates
+- Treat SOL as the primary solve owner. It may create bounded Luna-low delegates
   for narrow parallel questions and remains responsible for integration and verification
 
 CRITICAL RULES:
@@ -67,7 +67,7 @@ COORDINATOR_TOOLS = [
     },
     {
         "name": "spawn_swarm",
-        "description": "Launch the SOL-xhigh lead; it creates bounded workers only when useful.",
+        "description": "Launch the SOL lead; it creates bounded workers only when useful.",
         "inputSchema": {
             "type": "object",
             "properties": {"challenge_name": {"type": "string"}},

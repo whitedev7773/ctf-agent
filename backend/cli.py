@@ -13,6 +13,7 @@ from rich.console import Console
 from backend.codex_cli import CodexCLIError, prepare_codex_cli
 from backend.config import Settings
 from backend.models import DEFAULT_MODELS
+from backend.runtime_settings import load_runtime_settings
 
 console = Console()
 
@@ -76,6 +77,7 @@ def main(
     _setup_logging(verbose)
 
     settings = Settings(sandbox_image=image)
+    saved_runtime = load_runtime_settings(settings, list(DEFAULT_MODELS), challenges_dir)
     if ctfd_url:
         settings.ctfd_url = ctfd_url
     if ctfd_token:
@@ -84,7 +86,7 @@ def main(
         settings.max_concurrent_challenges = max_challenges
     max_challenges = settings.max_concurrent_challenges
 
-    model_specs = list(models) if models else list(DEFAULT_MODELS)
+    model_specs = list(models) if models else list(saved_runtime.models)
 
     console.print("[bold]CTF Agent v2[/bold]")
     console.print(f"  CTFd: {settings.ctfd_url or 'not configured (standalone/dashboard setup)'}")

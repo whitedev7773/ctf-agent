@@ -16,6 +16,19 @@ def _sanitize(s: str) -> str:
     return f"{readable[:80]}-{digest}"
 
 
+def challenge_trace_paths(log_dir: str | Path, challenge_name: str) -> list[Path]:
+    """Return exact trace files belonging to one challenge."""
+    root = Path(log_dir).expanduser().resolve()
+    prefix = f"trace-{_sanitize(challenge_name)}-"
+    if not root.is_dir():
+        return []
+    return [
+        path
+        for path in root.iterdir()
+        if path.is_file() and path.name.startswith(prefix) and path.suffix == ".jsonl"
+    ]
+
+
 class SolverTracer:
     """Append-only JSONL event tracer. Flushes every write for tail -f streaming."""
 

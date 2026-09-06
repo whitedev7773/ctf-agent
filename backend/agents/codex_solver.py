@@ -258,8 +258,12 @@ class CodexSolver:
         self._turn_error: str | None = None
         self._budget_stop_reason = ""
         self._checkpoint_stop_reason = ""
+        self._resume_stop_reason = ""
         self._interrupt_requested = False
         self._interrupt_task: asyncio.Task[None] | None = None
+        self._turn_active = False
+        self._active_tool_calls = 0
+        self._last_activity_at = time.monotonic()
         self._latest_raw_tokens = 0
         self._turn_start_raw_tokens = 0
         self._pending_responses: dict[int, asyncio.Future] = {}
@@ -295,9 +299,11 @@ class CodexSolver:
         if self.delegate_task_fn and self.task_mode == "solve":
             system_prompt += (
                 "\n\n## Adaptive delegation\n"
-                "You are the SOL-xhigh lead and retain end-to-end ownership. After initial "
+                "You are the SOL lead and retain end-to-end ownership. After initial "
                 "triage, use `delegate_task` only when a narrow independent question can run "
-                "in parallel. Continue the critical path yourself, use `check_delegates` at "
+                "in parallel. For multi-artifact or multi-subsystem challenges, launch up to two "
+                "non-overlapping workers before deep linear analysis, ideally within the first ten "
+                "tool calls. Continue the critical path yourself, use `check_delegates` at "
                 "decision points, and integrate only evidence written to shared handoffs. "
                 "Do not delegate broad solving, final candidate verification, or work you can "
                 "finish with one cheap experiment."
@@ -407,6 +413,40 @@ class CodexSolver:
         """End an oversized turn so it can be compacted and resumed cheaply."""
         self._request_turn_interrupt(reason, turn_id, budget=False)
 
+    def request_resume_interrupt(self, reason: str) -> bool:
+        """Interrupt one live turn but preserve the solver for an immediate retry."""
+        if not self._turn_active or self._interrupt_requested:
+            return False
+        clean_reason = " ".join(reason.split())[:1000]
+        self._interrupt_requested = True
+        self._resume_stop_reason = f"resume interrupt: {clean_reason}"
+        self.tracer.event(
+            "resume_interrupt_requested",
+            reason=clean_reason,
+            step=self._step_count,
+            idle_seconds=round(self.activity_idle_seconds(), 1),
+        )
+        self._interrupt_task = asyncio.create_task(
+            self._interrupt_turn(
+                self._current_turn_id,
+                clean_reason,
+                event_prefix="resume",
+            ),
+            name=f"resume-interrupt-{self.agent_name}",
+        )
+        return True
+
+    def activity_idle_seconds(self) -> float:
+        """Return elapsed wall time since the last app-server or tool activity."""
+        return max(0.0, time.monotonic() - self._last_activity_at)
+
+    @property
+    def tool_call_active(self) -> bool:
+        return self._active_tool_calls > 0
+
+    def _mark_activity(self) -> None:
+        self._last_activity_at = time.monotonic()
+
     def _request_turn_interrupt(
         self,
         reason: str,
@@ -431,7 +471,12 @@ class CodexSolver:
             name=f"budget-interrupt-{self.agent_name}",
         )
 
-    async def _interrupt_turn(self, turn_id: str | None, reason: str) -> None:
+    async def _interrupt_turn(
+        self,
+        turn_id: str | None,
+        reason: str,
+        event_prefix: str = "budget",
+    ) -> None:
         if not self._thread_id or not turn_id:
             logger.warning(
                 "[%s] Could not interrupt over-budget turn: missing turn id",
@@ -444,10 +489,10 @@ class CodexSolver:
                 {"threadId": self._thread_id, "turnId": turn_id},
             )
             logger.warning("[%s] Turn interrupted: %s", self.agent_name, reason)
-            self.tracer.event("budget_interrupt_sent", reason=reason, turn_id=turn_id)
+            self.tracer.event(f"{event_prefix}_interrupt_sent", reason=reason, turn_id=turn_id)
         except Exception as exc:
             logger.warning("[%s] Turn interrupt failed: %s", self.agent_name, exc)
-            self.tracer.event("budget_interrupt_failed", reason=reason, error=str(exc))
+            self.tracer.event(f"{event_prefix}_interrupt_failed", reason=reason, error=str(exc))
 
     async def _compact_between_turns(self) -> bool:
         """Compact after an interrupted turn and report whether it completed."""
@@ -479,6 +524,7 @@ class CodexSolver:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            self._mark_activity()
 
             msg_id = msg.get("id")
             if msg_id is not None and ("result" in msg or "error" in msg):
@@ -659,7 +705,12 @@ class CodexSolver:
             self.tracer.event("loop_break", tool=tool_name, step=self._step_count)
             result = "Loop detected — try a completely different approach."
         else:
-            result = await self._exec_tool(tool_name, args)
+            self._active_tool_calls += 1
+            try:
+                result = await self._exec_tool(tool_name, args)
+            finally:
+                self._active_tool_calls = max(0, self._active_tool_calls - 1)
+                self._mark_activity()
             outcome_status = self.loop_detector.record_result(tool_name, args, result)
             if loop_status == "warn" and isinstance(result, str):
                 from backend.loop_detect import LOOP_WARNING_MESSAGE
@@ -802,6 +853,7 @@ class CodexSolver:
             self._turn_error = None
             self._budget_stop_reason = ""
             self._checkpoint_stop_reason = ""
+            self._resume_stop_reason = ""
             self._interrupt_requested = False
             self._interrupt_task = None
             self._current_turn_id = None
@@ -814,15 +866,23 @@ class CodexSolver:
             # Current App Server exposes reasoning as `effort` on turn/start.
             if self._reasoning_effort:
                 turn_params["effort"] = self._reasoning_effort
+            self._mark_activity()
             turn_response = await self._rpc("turn/start", turn_params)
             self._current_turn_id = (
                 turn_response.get("result", {}).get("turn", {}).get("id")
             )
-
-            await self._turn_done.wait()
+            self._turn_active = True
+            try:
+                await self._turn_done.wait()
+            finally:
+                self._turn_active = False
 
             duration = time.monotonic() - t0
             self.tracer.event("turn_complete", duration=round(duration, 1), steps=self._step_count)
+
+            if self._resume_stop_reason:
+                self._findings = self._findings or self._resume_stop_reason
+                return self._result(PROGRESS_CHECKPOINT, self._resume_stop_reason)
 
             if self._budget_stop_reason:
                 self._findings = self._findings or self._budget_stop_reason
@@ -880,10 +940,15 @@ class CodexSolver:
             return self._result(ERROR)
 
     def bump(self, insights: str) -> None:
-        self._bump_insights = insights
+        clean = " ".join(insights.split())[:6000]
+        if self._bump_insights:
+            clean = f"{self._bump_insights}\n\n{clean}"[-6000:]
+        self._bump_insights = clean
         self._resume_after_checkpoint = False
         self.loop_detector.reset()
         self.tracer.event("bump", insights=insights[:500])
+        if self._turn_active:
+            self.request_resume_interrupt("new coordinator or delegate guidance arrived")
 
     def _result(self, status: str, stop_reason: str = "") -> SolverResult:
         self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed)

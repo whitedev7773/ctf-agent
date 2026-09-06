@@ -15,7 +15,42 @@ const state = {
   localFiles: [],
   candidateNotices: new Set(),
   writeups: new Map(),
+  detailSignature: "",
+  deleteChallengeSupported: false,
+  deleteChallengeName: "",
+  runtimeSettingsInitialized: false,
+  runtimeSettingsDirty: false,
+  runtimeModels: [],
 };
+
+const runtimeNumericFields = [
+  "max-concurrent-challenges",
+  "container-cpu-limit",
+  "max-attempts-per-challenge",
+  "solver-turn-timeout-seconds",
+  "solver-turn-idle-timeout-seconds",
+  "solver-max-runtime-seconds",
+  "solver-max-steps",
+  "solver-max-tokens",
+  "solver-max-raw-tokens",
+  "solver-cached-token-weight",
+  "solver-turn-slice-tokens",
+  "solver-max-estimated-cost-usd",
+  "max-flag-submissions-per-challenge",
+  "max-command-timeout-seconds",
+  "delegate-max-agents",
+  "delegate-max-concurrent",
+  "delegate-max-attempts",
+  "delegate-max-runtime-seconds",
+  "delegate-turn-timeout-seconds",
+  "delegate-turn-idle-timeout-seconds",
+  "delegate-max-steps",
+  "delegate-max-tokens",
+  "delegate-max-raw-tokens",
+  "delegate-turn-slice-tokens",
+];
+
+const runtimeFieldKey = (field) => field.replaceAll("-", "_");
 
 const byId = (id) => document.getElementById(id);
 
@@ -134,6 +169,7 @@ function agentStatusLabel(status) {
     gave_up: "STOPPED",
     progress_checkpoint: "CHECKPOINT",
     generating: "WRITING",
+    redirecting: "REDIRECTING",
   }[status] || status;
 }
 
@@ -237,6 +273,105 @@ function renderOverview() {
   if (!state.ctfdInitialized) {
     byId("ctfd-url").value = ctfd.url || "";
     state.ctfdInitialized = true;
+  }
+  renderRuntimeSettings(snapshot.runtime_settings || {});
+}
+
+function splitModelSpec(spec, fallbackBase, fallbackEffort) {
+  const parts = String(spec || "").split("/");
+  return {
+    base: parts.length >= 2 ? parts.slice(0, 2).join("/") : fallbackBase,
+    effort: parts.length >= 3 ? parts[2] : fallbackEffort,
+  };
+}
+
+function selectValue(select, value) {
+  if (![...select.options].some((option) => option.value === value)) {
+    select.add(new Option(value, value));
+  }
+  select.value = value;
+}
+
+function renderRuntimeSettings(settings) {
+  if (state.runtimeSettingsInitialized && state.runtimeSettingsDirty) return;
+  const models = Array.isArray(settings.models) && settings.models.length
+    ? [...settings.models]
+    : ["codex/gpt-5.6-sol/high"];
+  const primary = splitModelSpec(models[0], "codex/gpt-5.6-sol", "high");
+  const delegate = splitModelSpec(
+    settings.delegate_model_spec,
+    "codex/gpt-5.6-luna",
+    "low",
+  );
+  state.runtimeModels = models;
+  selectValue(byId("runtime-primary-model"), primary.base);
+  selectValue(byId("runtime-primary-effort"), primary.effort);
+  selectValue(byId("runtime-delegate-model"), delegate.base);
+  selectValue(byId("runtime-delegate-effort"), delegate.effort);
+  byId("runtime-container-memory-limit").value = settings.container_memory_limit ?? "4g";
+  byId("runtime-dynamic-delegation-enabled").checked = Boolean(
+    settings.dynamic_delegation_enabled,
+  );
+  for (const field of runtimeNumericFields) {
+    const input = byId(`runtime-${field}`);
+    const value = settings[runtimeFieldKey(field)];
+    if (input && value !== undefined) input.value = value;
+  }
+  state.runtimeSettingsInitialized = true;
+  state.runtimeSettingsDirty = false;
+  const badge = byId("runtime-settings-badge");
+  badge.textContent = "저장됨";
+  badge.className = "source-badge connected";
+  const active = Number(state.snapshot?.stats?.active_swarms || 0);
+  byId("runtime-settings-copy").textContent = active
+    ? `실행 중인 swarm ${active}개는 시작 당시 설정을 유지합니다.`
+    : "저장하면 이후 시작하는 swarm과 solver에 적용됩니다.";
+}
+
+function runtimeSettingsFromForm() {
+  const models = state.runtimeModels.length ? [...state.runtimeModels] : [];
+  const primary = `${byId("runtime-primary-model").value}/${byId("runtime-primary-effort").value}`;
+  if (models.length) models[0] = primary;
+  else models.push(primary);
+  const result = {
+    models,
+    container_memory_limit: byId("runtime-container-memory-limit").value.trim(),
+    dynamic_delegation_enabled: byId("runtime-dynamic-delegation-enabled").checked,
+    delegate_model_spec: `${byId("runtime-delegate-model").value}/${byId("runtime-delegate-effort").value}`,
+  };
+  for (const field of runtimeNumericFields) {
+    result[runtimeFieldKey(field)] = Number(byId(`runtime-${field}`).value);
+  }
+  return result;
+}
+
+function markRuntimeSettingsDirty() {
+  state.runtimeSettingsDirty = true;
+  const badge = byId("runtime-settings-badge");
+  badge.textContent = "저장 안 됨";
+  badge.className = "source-badge dirty";
+  byId("runtime-settings-copy").textContent = "변경사항은 저장 전까지 적용되지 않습니다.";
+}
+
+async function submitRuntimeSettings(path, body, control) {
+  const originalLabel = control.textContent;
+  control.disabled = true;
+  control.setAttribute("aria-busy", "true");
+  control.textContent = "저장 중…";
+  try {
+    const result = await api(path, { method: "POST", body: JSON.stringify(body) });
+    toast(result.message || "실행 설정을 저장했습니다.");
+    state.runtimeSettingsDirty = false;
+    state.runtimeSettingsInitialized = false;
+    await refresh();
+    return true;
+  } catch (error) {
+    toast(error.message, "error");
+    return false;
+  } finally {
+    control.disabled = false;
+    control.removeAttribute("aria-busy");
+    control.textContent = originalLabel;
   }
 }
 
@@ -549,7 +684,7 @@ async function loadWriteup(challengeName) {
   try {
     const params = new URLSearchParams({ challenge: challengeName });
     state.writeups.set(challengeName, await api(`/api/writeup?${params}`));
-    renderDetailPage();
+    renderDetailPage({ preserveScroll: true });
   } catch (error) {
     toast(error.message, "error");
   }
@@ -563,10 +698,62 @@ async function requestWriteup(challengeName, control) {
   );
   if (!success) return;
   state.writeups.delete(challengeName);
-  await refresh({ renderSelected: true });
+  renderDetailPage({ preserveScroll: true });
 }
 
-function renderDetailPage() {
+function detailRenderSignature(challenge) {
+  if (!challenge) return "";
+  const { resources: _resources, agents = [], ...stableChallenge } = challenge;
+  return JSON.stringify({
+    ...stableChallenge,
+    agents: agents.map(({ resource: _resource, ...agent }) => agent),
+  });
+}
+
+function captureDetailViewState(content) {
+  const scrolling = document.scrollingElement;
+  const maximum = Math.max(0, (scrolling?.scrollHeight || 0) - window.innerHeight);
+  return {
+    left: window.scrollX,
+    top: window.scrollY,
+    atBottom: maximum - window.scrollY < 32,
+    fields: [...content.querySelectorAll("input, textarea")].map((field) => ({
+      name: field.name,
+      value: field.value,
+    })),
+    nestedScroll: [...content.querySelectorAll(".writeup-preview, .trace-output")].map((item) => ({
+      className: item.className,
+      left: item.scrollLeft,
+      top: item.scrollTop,
+    })),
+  };
+}
+
+function restoreDetailViewState(content, saved) {
+  const fields = [...content.querySelectorAll("input, textarea")];
+  saved.fields.forEach((field, index) => {
+    const current = fields[index];
+    if (current && current.name === field.name) current.value = field.value;
+  });
+
+  const nestedScroll = [...content.querySelectorAll(".writeup-preview, .trace-output")];
+  saved.nestedScroll.forEach((item, index) => {
+    const current = nestedScroll[index];
+    if (!current || current.className !== item.className) return;
+    current.scrollLeft = item.left;
+    current.scrollTop = item.top;
+  });
+
+  const restoreWindow = () => {
+    const scrolling = document.scrollingElement;
+    const maximum = Math.max(0, (scrolling?.scrollHeight || 0) - window.innerHeight);
+    window.scrollTo(saved.left, saved.atBottom ? maximum : Math.min(saved.top, maximum));
+  };
+  restoreWindow();
+  window.requestAnimationFrame(restoreWindow);
+}
+
+function renderDetailPage({ preserveScroll = false } = {}) {
   const challenge = state.snapshot?.challenges.find((item) => item.name === state.selectedChallenge);
   if (!challenge) {
     closeChallengeDetail({ replaceHistory: true });
@@ -578,7 +765,8 @@ function renderDetailPage() {
   byId("detail-title").textContent = challenge.name;
   byId("detail-category").textContent = `${challenge.category.toUpperCase()} · ${formatNumber(challenge.value)} PTS`;
   const content = byId("detail-content");
-  content.replaceChildren();
+  const savedView = preserveScroll ? captureDetailViewState(content) : null;
+  const nextContent = document.createDocumentFragment();
 
   const overview = node("div", "detail-overview");
   const summary = node("div", "detail-summary");
@@ -595,14 +783,24 @@ function renderDetailPage() {
     controls.append(button("SOL 풀이 시작", "primary-button", () => spawnChallenge(challenge.name)));
   }
   controls.append(button("상태 새로고침", "secondary-button", () => refresh({ renderSelected: true })));
+  const deleteButton = button(
+    "문제 삭제",
+    "destructive-button",
+    () => openDeleteChallengeDialog(challenge.name),
+    !state.deleteChallengeSupported,
+  );
+  if (!state.deleteChallengeSupported) {
+    deleteButton.title = "새 삭제 API를 사용하려면 coordinator를 재시작해야 합니다.";
+  }
+  controls.append(deleteButton);
   overview.append(summary, controls);
-  content.append(overview);
+  nextContent.append(overview);
 
   const layout = node("div", "detail-layout");
   const mainColumn = node("div", "detail-main-column");
   const sideColumn = node("aside", "detail-side-column");
   layout.append(mainColumn, sideColumn);
-  content.append(layout);
+  nextContent.append(layout);
 
   if (challenge.flag) {
     const flagSection = detailSection(isStandalone ? "로컬 Flag 결과" : "확인된 Flag");
@@ -678,8 +876,19 @@ function renderDetailPage() {
       node("span", "", `${formatTokens(agent.input_tokens)} in`),
       node("span", "", `${formatTokens(agent.output_tokens)} out`),
       node("span", "", `${formatTokens(agent.effective_tokens)} / ${formatTokens(agent.effective_token_limit)} effective`),
-      node("span", "", formatMoney(agent.cost_usd)),
     );
+    if (["running", "redirecting"].includes(agent.status) && agent.idle_limit_seconds) {
+      stats.append(
+        node(
+          "span",
+          "",
+          agent.tool_call_active
+            ? "tool active"
+            : `idle ${formatDuration(agent.idle_seconds || 0)} / ${formatDuration(agent.idle_limit_seconds)}`,
+        ),
+      );
+    }
+    stats.append(node("span", "", formatMoney(agent.cost_usd)));
     card.append(header, stats);
     if (agent.skill_path) card.append(node("p", "agent-skill", `Skill: ${agent.skill_path}`));
     if (agent.findings) card.append(node("p", "agent-findings", agent.findings));
@@ -731,6 +940,10 @@ function renderDetailPage() {
     submitSection.append(form);
     sideColumn.append(submitSection);
   }
+
+  content.replaceChildren(nextContent);
+  state.detailSignature = detailRenderSignature(challenge);
+  if (savedView) restoreDetailViewState(content, savedView);
 }
 
 function challengeUrl(name = "") {
@@ -798,6 +1011,7 @@ function closeChallengeDetail({ fromHistory = false, replaceHistory = false, ani
   const returnChallenge = state.detailReturnChallenge || state.selectedChallenge || "";
   state.selectedChallenge = null;
   state.detailReturnChallenge = null;
+  state.detailSignature = "";
   document.title = "CTF Agent Command Center";
   if (replaceHistory || (!fromHistory && new URL(window.location.href).searchParams.has("challenge"))) {
     window.history.replaceState({ ctfView: "dashboard" }, "", challengeUrl());
@@ -864,6 +1078,17 @@ async function stopChallenge(name) {
   await runCommand("/api/control/stop", { challenge: name });
 }
 
+function openDeleteChallengeDialog(name) {
+  state.deleteChallengeName = name;
+  byId("delete-challenge-name").textContent = name;
+  const input = byId("delete-challenge-confirmation");
+  input.value = "";
+  input.placeholder = name;
+  byId("delete-challenge-submit").disabled = true;
+  byId("delete-challenge-dialog").showModal();
+  input.focus();
+}
+
 async function refresh({ renderSelected = false } = {}) {
   if (state.refreshing) return;
   state.refreshing = true;
@@ -875,7 +1100,14 @@ async function refresh({ renderSelected = false } = {}) {
     setConnection(true);
     renderOverview();
     renderRows();
-    if (state.selectedChallenge && renderSelected) renderDetailPage();
+    if (state.selectedChallenge && renderSelected) {
+      const challenge = currentChallenge(state.selectedChallenge);
+      const active = document.activeElement;
+      const editing = active && byId("detail-content").contains(active)
+        && active.matches("input, textarea");
+      const changed = detailRenderSignature(challenge) !== state.detailSignature;
+      if (changed && !editing) renderDetailPage({ preserveScroll: true });
+    }
   } catch (error) {
     setConnection(false);
   } finally {
@@ -982,6 +1214,24 @@ async function initialize() {
     if (success) input.value = "";
   });
 
+  const runtimeForm = byId("runtime-settings-form");
+  runtimeForm.addEventListener("input", markRuntimeSettingsDirty);
+  runtimeForm.addEventListener("change", markRuntimeSettingsDirty);
+  runtimeForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!runtimeForm.reportValidity()) return;
+    const submit = runtimeForm.querySelector("button[type=submit]");
+    await submitRuntimeSettings(
+      "/api/settings/runtime",
+      runtimeSettingsFromForm(),
+      submit,
+    );
+  });
+  byId("runtime-settings-reset").addEventListener("click", async (event) => {
+    if (!window.confirm("실행 설정을 프로젝트 기본값으로 복원할까요?")) return;
+    await submitRuntimeSettings("/api/settings/runtime/reset", {}, event.currentTarget);
+  });
+
   byId("ctfd-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const submit = event.currentTarget.querySelector("button[type=submit]");
@@ -1076,6 +1326,34 @@ async function initialize() {
     }
   });
 
+  const deleteDialog = byId("delete-challenge-dialog");
+  const deleteInput = byId("delete-challenge-confirmation");
+  const deleteSubmit = byId("delete-challenge-submit");
+  byId("delete-challenge-cancel").addEventListener("click", () => deleteDialog.close());
+  deleteDialog.addEventListener("click", (event) => {
+    if (event.target === deleteDialog) deleteDialog.close();
+  });
+  deleteInput.addEventListener("input", () => {
+    deleteSubmit.disabled = deleteInput.value !== state.deleteChallengeName;
+  });
+  byId("delete-challenge-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const name = state.deleteChallengeName;
+    if (!name || deleteInput.value !== name) return;
+    const success = await runCommand(
+      "/api/challenges/delete",
+      { challenge: name, confirmation: deleteInput.value },
+      deleteSubmit,
+    );
+    if (success) {
+      state.writeups.delete(name);
+      deleteDialog.close();
+      deleteInput.value = "";
+      deleteSubmit.disabled = true;
+      state.deleteChallengeName = "";
+    }
+  });
+
   byId("local-challenge-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
@@ -1106,6 +1384,7 @@ async function initialize() {
   try {
     const session = await api("/api/session");
     state.csrfToken = session.csrf_token;
+    state.deleteChallengeSupported = session.capabilities?.delete_challenge === true;
     const resetSupported = session.capabilities?.reset_runtime === true
       || await endpointAvailable("/api/control/reset-runtime");
     byId("reset-open").disabled = !resetSupported;

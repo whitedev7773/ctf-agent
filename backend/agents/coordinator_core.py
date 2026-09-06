@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from pathlib import Path
@@ -56,6 +57,7 @@ async def do_fetch_challenges(deps: CoordinatorDeps) -> str:
             "description": (ch.get("description") or "")[:200],
         }
         for ch in challenges
+        if ch.get("name") not in getattr(deps, "dismissed_challenges", set())
     ]
     return json.dumps(result, indent=2)
 
@@ -84,6 +86,9 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
         del deps.swarms[name]
         deps.swarm_tasks.pop(name, None)
 
+    if challenge_name in getattr(deps, "dismissed_challenges", set()):
+        return f"Challenge '{challenge_name}' was deleted by the operator"
+
     if challenge_name in deps.results:
         return f"Already solved: {challenge_name}. Refusing to start another solver swarm."
 
@@ -109,13 +114,20 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
 
     from backend.agents.swarm import ChallengeSwarm
 
+    # A dashboard policy update applies to future work only. Solvers repeatedly
+    # consult their settings while running, so give each swarm an isolated copy.
+    swarm_settings = (
+        deps.settings.model_copy(deep=True)
+        if hasattr(deps.settings, "model_copy")
+        else copy.deepcopy(deps.settings)
+    )
     swarm = ChallengeSwarm(
         challenge_dir=deps.challenge_dirs[challenge_name],
         meta=deps.challenge_metas[challenge_name],
         ctfd=deps.ctfd,
         cost_tracker=deps.cost_tracker,
-        settings=deps.settings,
-        model_specs=deps.model_specs,
+        settings=swarm_settings,
+        model_specs=list(deps.model_specs),
         no_submit=deps.no_submit,
         coordinator_inbox=deps.coordinator_inbox,
     )

@@ -236,6 +236,8 @@ def handoff_quality_issues(path: str | Path) -> list[str]:
             issues.append(f"missing {label} section")
     if not any(marker in folded for marker in ("supported", "refuted", "inconclusive")):
         issues.append("missing supported/refuted/inconclusive verdict")
+    if "/challenge/workspace/" in folded:
+        issues.append("references private delegate workspace; copy reproducible artifacts to shared")
     return issues
 
 

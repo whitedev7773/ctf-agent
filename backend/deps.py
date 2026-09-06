@@ -57,6 +57,9 @@ class CoordinatorDeps:
     swarm_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     results: dict[str, dict] = field(default_factory=dict)
     candidates: dict[str, dict] = field(default_factory=dict)
+    # Challenges explicitly deleted by the operator stay hidden and cannot be
+    # auto-spawned again when a connected CTFd instance is polled or restarted.
+    dismissed_challenges: set[str] = field(default_factory=set)
     challenge_dirs: dict[str, str] = field(default_factory=dict)
     challenge_metas: dict[str, Any] = field(default_factory=dict)
     request_writeup_generation: (

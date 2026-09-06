@@ -51,6 +51,16 @@ def _clean_records(value: Any) -> dict[str, dict]:
     return cleaned
 
 
+def _clean_names(value: Any) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    return {
+        item.strip()[:500]
+        for item in value
+        if isinstance(item, str) and item.strip()
+    }
+
+
 def load_runtime_state(settings: object) -> tuple[dict[str, dict], dict[str, dict]]:
     path = runtime_state_path(settings)
     try:
@@ -66,10 +76,23 @@ def load_runtime_state(settings: object) -> tuple[dict[str, dict], dict[str, dic
     return _clean_records(payload.get("results")), _clean_records(payload.get("candidates"))
 
 
+def load_dismissed_challenges(settings: object) -> set[str]:
+    """Load operator-deleted challenge names without changing the legacy API."""
+    path = runtime_state_path(settings)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:
+        return set()
+    return _clean_names(payload.get("dismissed_challenges"))
+
+
 def save_runtime_state(
     settings: object,
     results: dict[str, dict],
     candidates: dict[str, dict],
+    dismissed_challenges: set[str] | None = None,
 ) -> Path:
     path = runtime_state_path(settings)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,6 +101,7 @@ def save_runtime_state(
         "version": STATE_VERSION,
         "results": _clean_records(results),
         "candidates": _clean_records(candidates),
+        "dismissed_challenges": sorted(_clean_names(list(dismissed_challenges or set()))),
     }
     temp_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -96,6 +120,7 @@ def persist_deps_state(deps: object) -> None:
             settings,
             getattr(deps, "results", {}),
             getattr(deps, "candidates", {}),
+            getattr(deps, "dismissed_challenges", set()),
         )
     except OSError as exc:
         logger.warning("Could not persist runtime state: %s", exc)

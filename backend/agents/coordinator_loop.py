@@ -15,7 +15,7 @@ from backend.deps import CoordinatorDeps
 from backend.models import DEFAULT_MODELS
 from backend.poller import CTFdPoller
 from backend.prompts import ChallengeMeta
-from backend.runtime_state import load_runtime_state
+from backend.runtime_state import load_dismissed_challenges, load_runtime_state
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ def _unsolved_names(deps: CoordinatorDeps, poller: CTFdPoller) -> set[str]:
     """Treat locally persisted confirmations as solved across restarts."""
     known = poller.known_challenges | set(deps.challenge_metas)
     solved = poller.known_solved | set(deps.results)
-    return known - solved
+    return known - solved - getattr(deps, "dismissed_challenges", set())
 
 
 def build_deps(
@@ -68,6 +68,7 @@ def build_deps(
     persisted_results, persisted_candidates = load_runtime_state(settings)
     deps.results.update(persisted_results)
     deps.candidates.update(persisted_candidates)
+    deps.dismissed_challenges.update(load_dismissed_challenges(settings))
 
     # Pre-load already-pulled challenges
     for d in Path(challenges_root).iterdir():
@@ -121,7 +122,10 @@ async def run_event_loop(
         len(poller.known_solved),
     )
 
-    known = poller.known_challenges | set(deps.challenge_metas)
+    dismissed = getattr(deps, "dismissed_challenges", set())
+    known = (
+        poller.known_challenges | set(deps.challenge_metas)
+    ) - dismissed
     solved = poller.known_solved | set(deps.results)
     unsolved = known - solved
     mode = "CTFd connected" if ctfd.is_configured else "standalone local mode"
@@ -158,6 +162,8 @@ async def run_event_loop(
             parts: list[str] = []
             for evt in events:
                 if evt.kind == "new_challenge":
+                    if evt.challenge_name in dismissed:
+                        continue
                     parts.append(f"NEW CHALLENGE: '{evt.challenge_name}' appeared. Spawn a swarm.")
                     # Auto-spawn for new challenges
                     await _auto_spawn_one(deps, evt.challenge_name)
@@ -193,7 +199,9 @@ async def run_event_loop(
                 last_status = now
                 active = [n for n, t in deps.swarm_tasks.items() if not t.done()]
                 solved_set = poller.known_solved | set(deps.results)
-                unsolved_set = (poller.known_challenges | set(deps.challenge_metas)) - solved_set
+                unsolved_set = (
+                    poller.known_challenges | set(deps.challenge_metas)
+                ) - solved_set - dismissed
                 status_line = (
                     f"STATUS: {len(solved_set)} solved, {len(unsolved_set)} unsolved, "
                     f"{len(active)} active swarms. Cost: ${cost_tracker.total_cost_usd:.2f}"
@@ -239,6 +247,8 @@ async def run_event_loop(
 
 async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
     """Auto-spawn a swarm for a single challenge if not already running."""
+    if challenge_name in getattr(deps, "dismissed_challenges", set()):
+        return
     if challenge_name in deps.swarms:
         return
     active = sum(1 for t in deps.swarm_tasks.values() if not t.done())

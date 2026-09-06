@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,9 +12,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import ClientSession, FormData
 
+from backend.artifacts import challenge_workspace_path
 from backend.ctfd import CTFdClient
 from backend.dashboard.server import DashboardServer, _clear_runtime_root
 from backend.prompts import ChallengeMeta, build_prompt
+from backend.runtime_settings import runtime_settings_path
+from backend.runtime_state import load_dismissed_challenges
+from backend.tracing import SolverTracer
 from backend.writeups import finalize_writeup
 
 
@@ -51,6 +56,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             swarm_tasks={},
             results={},
             candidates={},
+            dismissed_challenges=set(),
             model_specs=["codex/gpt-5.6-luna/low"],
             max_concurrent_challenges=3,
             no_submit=True,
@@ -102,12 +108,18 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["stats"]["total"], 1)
             self.assertEqual(payload["challenges"][0]["name"], "web/intro")
             self.assertEqual(payload["challenges"][0]["status"], "idle")
-            self.assertEqual(payload["runtime_revision"], 15)
+            self.assertEqual(payload["runtime_revision"], 19)
             self.assertTrue(callable(self.deps.request_writeup_generation))
             self.assertFalse(payload["restart_required"])
             self.assertTrue(payload["runtime_policy"]["adaptive_delegation"])
             self.assertTrue(payload["runtime_policy"]["in_turn_budget_interrupt"])
             self.assertTrue(payload["runtime_policy"]["runtime_state_persistence"])
+            self.assertEqual(payload["runtime_settings"]["models"], ["codex/gpt-5.6-luna/low"])
+
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            session = await response.json()
+            self.assertTrue(session["capabilities"]["delete_challenge"])
+            self.assertEqual(payload["runtime_policy"]["turn_idle_timeout_seconds"], 300)
             self.assertEqual(payload["runtime_policy"]["max_raw_tokens"], 12_000_000)
             self.assertEqual(payload["runtime_policy"]["delegate_max_attempts"], 4)
             self.assertTrue(
@@ -133,6 +145,18 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("지금까지의 접근 노트", javascript)
             self.assertIn('writeup.status === "generating"', javascript)
             self.assertIn("refresh({ renderSelected: true })", javascript)
+            self.assertIn("captureDetailViewState", javascript)
+            self.assertIn("document.createDocumentFragment()", javascript)
+            self.assertIn("if (changed && !editing)", javascript)
+
+        html_ids = re.findall(r'\bid="([^"]+)"', html)
+        javascript_refs = {
+            item
+            for item in re.findall(r'byId\("([^"]+)"\)', javascript)
+            if item.startswith("runtime-")
+        }
+        self.assertEqual(len(html_ids), len(set(html_ids)))
+        self.assertEqual(javascript_refs - set(html_ids), set())
 
     async def test_detail_notes_are_bounded_and_loaded_from_shared_state(self) -> None:
         from backend.artifacts import challenge_shared_path
@@ -199,6 +223,45 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             payload = await response.json()
 
         self.assertEqual(payload["challenges"][0]["agents"][0]["status"], "finished")
+
+    async def test_active_agent_exposes_idle_watchdog_state(self) -> None:
+        model_spec = "codex/gpt-5.6-sol/xhigh"
+        solver = SimpleNamespace(
+            sandbox=SimpleNamespace(
+                workspace_dir="workspace",
+                resource_snapshot=lambda: {},
+            ),
+            tracer=SimpleNamespace(path="trace.jsonl"),
+            _step_count=9,
+            _budget_stop_reason="",
+            _checkpoint_stop_reason="",
+            _resume_stop_reason="",
+            activity_idle_seconds=lambda: 42.5,
+            tool_call_active=False,
+        )
+        self.deps.swarms["web/intro"] = SimpleNamespace(
+            model_specs=[model_spec],
+            solvers={model_spec: solver},
+            outcomes={},
+            winner=None,
+            findings={},
+            waiting_models=set(),
+            cancel_event=asyncio.Event(),
+        )
+        task = asyncio.create_task(asyncio.Event().wait())
+        self.deps.swarm_tasks["web/intro"] = task
+        try:
+            async with self.client.get(f"{self.base_url}/api/status") as response:
+                payload = await response.json()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        agent = payload["challenges"][0]["agents"][0]
+        self.assertEqual(agent["status"], "running")
+        self.assertEqual(agent["idle_seconds"], 42.5)
+        self.assertEqual(agent["idle_limit_seconds"], 300)
+        self.assertFalse(agent["tool_call_active"])
 
     async def test_writeup_api_serves_text_but_rejects_artifact_traversal(self) -> None:
         from backend.artifacts import challenge_shared_path
@@ -379,6 +442,92 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.deps.no_submit)
         self.poller.reseed.assert_awaited_once()
 
+    async def test_runtime_settings_are_validated_persisted_and_reset(self) -> None:
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+        headers = {"X-CTF-Dashboard-Token": token}
+        endpoint = f"{self.base_url}/api/settings/runtime"
+
+        async with self.client.post(
+            endpoint,
+            json={
+                "models": ["codex/gpt-5.6-sol/high"],
+                "max_concurrent_challenges": 2,
+                "solver_max_estimated_cost_usd": 1.25,
+            },
+            headers=headers,
+        ) as response:
+            payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["settings"]["models"], ["codex/gpt-5.6-sol/high"])
+        self.assertEqual(self.deps.model_specs, ["codex/gpt-5.6-sol/high"])
+        self.assertEqual(self.deps.max_concurrent_challenges, 2)
+        self.assertEqual(self.deps.settings.solver_max_estimated_cost_usd, 1.25)
+        saved = runtime_settings_path(self.deps.challenges_root).read_text(encoding="utf-8")
+        self.assertNotIn("ctfd_token", saved)
+        self.assertNotIn("secret", saved)
+
+        async with self.client.get(endpoint) as response:
+            current = await response.json()
+        self.assertEqual(current["settings"]["max_concurrent_challenges"], 2)
+
+        async with self.client.post(
+            endpoint,
+            json={"solver_turn_timeout_seconds": 60, "solver_turn_idle_timeout_seconds": 61},
+            headers=headers,
+        ) as response:
+            self.assertEqual(response.status, 400)
+        async with self.client.post(
+            endpoint,
+            json={"openai_api_key": "must-not-be-accepted"},
+            headers=headers,
+        ) as response:
+            self.assertEqual(response.status, 400)
+
+        async with self.client.post(
+            f"{endpoint}/reset",
+            json={},
+            headers=headers,
+        ) as response:
+            reset = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(reset["settings"]["models"], ["codex/gpt-5.6-sol/high"])
+        self.assertEqual(self.deps.max_concurrent_challenges, 1)
+
+    async def test_runtime_settings_do_not_mutate_an_active_swarm_snapshot(self) -> None:
+        swarm_settings = SimpleNamespace(solver_max_steps=300)
+        swarm = SimpleNamespace(
+            settings=swarm_settings,
+            model_specs=[],
+            solvers={},
+            outcomes={},
+            winner=None,
+            findings={},
+            waiting_models=set(),
+            cancel_event=asyncio.Event(),
+        )
+        task = asyncio.create_task(asyncio.Event().wait())
+        self.deps.swarms["web/intro"] = swarm
+        self.deps.swarm_tasks["web/intro"] = task
+        try:
+            async with self.client.get(f"{self.base_url}/api/session") as response:
+                token = (await response.json())["csrf_token"]
+            async with self.client.post(
+                f"{self.base_url}/api/settings/runtime",
+                json={"solver_max_steps": 50},
+                headers={"X-CTF-Dashboard-Token": token},
+            ) as response:
+                payload = await response.json()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["active_swarms_unchanged"], 1)
+        self.assertEqual(swarm_settings.solver_max_steps, 300)
+        self.assertEqual(self.deps.settings.solver_max_steps, 50)
+
     async def test_unverified_candidate_is_not_counted_as_solved(self) -> None:
         self.deps.candidates["web/intro"] = {
             "flag": "TEAM{guess}",
@@ -458,6 +607,68 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((Path(challenge_dir) / "distfiles" / "chall").read_bytes(), b"ELF")
         self.assertEqual((Path(challenge_dir) / "distfiles" / "libc.so.6").read_bytes(), b"LIBC")
+
+    async def test_delete_challenge_stops_work_and_removes_only_its_runtime_data(self) -> None:
+        challenge_dir = self.challenges_root / "web-intro"
+        challenge_dir.mkdir()
+        (challenge_dir / "metadata.yml").write_text("name: web/intro\n", encoding="utf-8")
+        self.deps.challenge_dirs["web/intro"] = str(challenge_dir)
+
+        workspace_dir = Path(challenge_workspace_path(self.deps.settings, "web/intro"))
+        (workspace_dir / "solve.py").write_text("print('solve')", encoding="utf-8")
+        tracer = SolverTracer("web/intro", "codex/test", str(self.logs_root))
+        tracer.event("start")
+        tracer.close()
+        experience_file = self.experience_root / "web" / "shared.md"
+        experience_file.parent.mkdir()
+        experience_file.write_text("keep", encoding="utf-8")
+
+        swarm = SimpleNamespace(kill=MagicMock())
+        task = asyncio.create_task(asyncio.Event().wait())
+        self.deps.swarms["web/intro"] = swarm
+        self.deps.swarm_tasks["web/intro"] = task
+        self.deps.results["web/intro"] = {"flag": "TEAM{done}"}
+        self.deps.candidates["web/intro"] = {"flag": "TEAM{maybe}"}
+        self.cost_tracker.by_agent["web/intro/codex/test"] = object()
+
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+        endpoint = f"{self.base_url}/api/challenges/delete"
+        headers = {"X-CTF-Dashboard-Token": token}
+        async with self.client.post(
+            endpoint,
+            json={"challenge": "web/intro", "confirmation": "wrong"},
+            headers=headers,
+        ) as response:
+            self.assertEqual(response.status, 400)
+        self.assertTrue(challenge_dir.exists())
+
+        async with self.client.post(
+            endpoint,
+            json={"challenge": "web/intro", "confirmation": "web/intro"},
+            headers=headers,
+        ) as response:
+            payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["experience_preserved"])
+        swarm.kill.assert_called_once_with()
+        self.assertTrue(task.cancelled())
+        self.assertFalse(challenge_dir.exists())
+        self.assertFalse(workspace_dir.exists())
+        self.assertEqual(list(self.logs_root.iterdir()), [])
+        self.assertEqual(experience_file.read_text(encoding="utf-8"), "keep")
+        self.assertNotIn("web/intro", self.deps.results)
+        self.assertNotIn("web/intro", self.deps.candidates)
+        self.assertNotIn("web/intro/codex/test", self.cost_tracker.by_agent)
+        self.assertIn("web/intro", self.deps.dismissed_challenges)
+        self.assertIn("web/intro", load_dismissed_challenges(self.deps.settings))
+
+        async with self.client.get(f"{self.base_url}/api/status") as response:
+            status = await response.json()
+        self.assertEqual(status["challenges"], [])
+        self.assertEqual(status["stats"]["total"], 0)
+        self.assertEqual(status["stats"]["solved"], 0)
 
     async def test_runtime_reset_requires_exact_korean_confirmation(self) -> None:
         marker = self.workspace_root / "keep-until-confirmed.txt"
@@ -548,6 +759,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.deps.swarm_tasks, {})
         self.assertEqual(self.deps.results, {})
         self.assertEqual(self.deps.candidates, {})
+        self.assertEqual(self.deps.dismissed_challenges, set())
         self.assertEqual(self.deps.challenge_dirs, {})
         self.assertEqual(self.deps.challenge_metas, {})
         self.assertEqual(self.cost_tracker.by_agent, {})

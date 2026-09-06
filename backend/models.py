@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 # SOL owns the solve. It can create bounded Luna delegates while it is running.
 DEFAULT_MODELS: list[str] = [
-    "codex/gpt-5.6-sol/xhigh",
+    "codex/gpt-5.6-sol/high",
 ]
 
 # Context window sizes (tokens)

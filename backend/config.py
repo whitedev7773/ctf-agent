@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     # Per-solver hard budgets. Zero disables token/cost limits only; time, step,
     # and attempt limits stay mandatory so a wedged model cannot run forever.
     solver_turn_timeout_seconds: int = 1800
+    # Interrupt a model turn that produces no protocol/tool activity. This is
+    # shorter than the hard turn timeout and does not stop the whole solver.
+    solver_turn_idle_timeout_seconds: int = 300
     solver_max_runtime_seconds: int = 10800
     solver_max_steps: int = 300
     # Cache-weighted work budget. Cached context is charged at the weight below,
@@ -73,6 +76,7 @@ class Settings(BaseSettings):
     delegate_max_attempts: int = 4
     delegate_max_runtime_seconds: int = 1800
     delegate_turn_timeout_seconds: int = 600
+    delegate_turn_idle_timeout_seconds: int = 180
     delegate_max_steps: int = 96
     delegate_max_tokens: int = 250_000
     delegate_max_raw_tokens: int = 1_200_000
@@ -84,6 +88,7 @@ class Settings(BaseSettings):
     delegate_postprocess_max_attempts: int = 1
     delegate_postprocess_max_runtime_seconds: int = 600
     delegate_postprocess_turn_timeout_seconds: int = 300
+    delegate_postprocess_turn_idle_timeout_seconds: int = 120
     delegate_postprocess_max_steps: int = 40
     delegate_postprocess_max_tokens: int = 80_000
     delegate_postprocess_max_raw_tokens: int = 400_000

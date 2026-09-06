@@ -144,3 +144,15 @@ def solver_turn_timeout_limit(settings: object, model_spec: str) -> int:
             )
         return max(30, int(getattr(settings, "delegate_turn_timeout_seconds", 600)))
     return max(30, int(getattr(settings, "solver_turn_timeout_seconds", 1800)))
+
+
+def solver_turn_idle_timeout_limit(settings: object, model_spec: str) -> int:
+    """Return the no-activity ceiling for a live model turn; zero disables it."""
+    if solver_role(model_spec).key == "delegate":
+        if "postprocess" in model_spec.casefold():
+            value = getattr(settings, "delegate_postprocess_turn_idle_timeout_seconds", 120)
+        else:
+            value = getattr(settings, "delegate_turn_idle_timeout_seconds", 180)
+    else:
+        value = getattr(settings, "solver_turn_idle_timeout_seconds", 300)
+    return max(0, int(value))

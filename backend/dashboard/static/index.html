@@ -124,6 +124,117 @@
       </form>
     </section>
 
+    <section class="runtime-settings-section" aria-labelledby="runtime-settings-title">
+      <div class="section-heading source-heading">
+        <div>
+          <p class="eyebrow">SOLVER POLICY</p>
+          <h2 id="runtime-settings-title">실행 설정</h2>
+          <p>비용과 실행 범위를 조정합니다. 저장한 값은 이후 시작하는 swarm부터 적용됩니다.</p>
+        </div>
+        <span class="source-badge" id="runtime-settings-badge">불러오는 중</span>
+      </div>
+      <article class="setup-card runtime-settings-card">
+        <form id="runtime-settings-form" class="setup-form runtime-settings-form">
+          <label>
+            <span>주 Solver</span>
+            <select id="runtime-primary-model" aria-label="주 solver 모델">
+              <option value="codex/gpt-5.6-sol">GPT-5.6 Sol</option>
+              <option value="codex/gpt-5.6-terra">GPT-5.6 Terra</option>
+              <option value="codex/gpt-5.6-luna">GPT-5.6 Luna</option>
+            </select>
+          </label>
+          <label>
+            <span>Sol reasoning effort</span>
+            <select id="runtime-primary-effort">
+              <option value="low">Low · 최소비용</option>
+              <option value="medium">Medium · 절약</option>
+              <option value="high">High · 기본</option>
+              <option value="xhigh">XHigh · 고비용</option>
+              <option value="max">Max · 최고비용</option>
+            </select>
+          </label>
+          <label>
+            <span>동시 문제 수</span>
+            <input id="runtime-max-concurrent-challenges" type="number" min="1" max="32" step="1" required>
+          </label>
+          <label>
+            <span>Solver 최대 실행 시간 (초)</span>
+            <input id="runtime-solver-max-runtime-seconds" type="number" min="60" max="604800" step="1" required>
+          </label>
+          <label>
+            <span>Solver당 추정 비용 상한 (USD)</span>
+            <input id="runtime-solver-max-estimated-cost-usd" type="number" min="0" max="10000" step="0.01" required>
+            <small>0이면 비활성화됩니다.</small>
+          </label>
+          <label>
+            <span>컨테이너 CPU</span>
+            <input id="runtime-container-cpu-limit" type="number" min="0.1" max="64" step="0.1" required>
+          </label>
+          <label>
+            <span>컨테이너 메모리</span>
+            <input id="runtime-container-memory-limit" maxlength="16" placeholder="4g" required>
+          </label>
+          <label class="toggle-field">
+            <input id="runtime-dynamic-delegation-enabled" type="checkbox">
+            <span>Sol의 Luna 하위 agent 위임 허용</span>
+          </label>
+          <label>
+            <span>Delegate 모델</span>
+            <select id="runtime-delegate-model">
+              <option value="codex/gpt-5.6-luna">GPT-5.6 Luna</option>
+              <option value="codex/gpt-5.6-terra">GPT-5.6 Terra</option>
+              <option value="codex/gpt-5.6-sol">GPT-5.6 Sol</option>
+            </select>
+          </label>
+          <label>
+            <span>Delegate effort</span>
+            <select id="runtime-delegate-effort">
+              <option value="low">Low · 기본</option>
+              <option value="medium">Medium</option>
+              <option value="high">High · 고비용</option>
+            </select>
+          </label>
+          <label class="delegate-concurrency-field">
+            <span>동시 Delegate 수</span>
+            <input id="runtime-delegate-max-concurrent" type="number" min="0" max="16" step="1" required>
+          </label>
+
+          <details class="runtime-advanced wide-field">
+            <summary>고급 예산과 timeout 설정</summary>
+            <div class="runtime-advanced-grid">
+              <label><span>최대 시도 횟수</span><input id="runtime-max-attempts-per-challenge" type="number" min="1" max="100" step="1" required></label>
+              <label><span>Turn timeout (초)</span><input id="runtime-solver-turn-timeout-seconds" type="number" min="30" max="86400" step="1" required></label>
+              <label><span>Idle timeout (초)</span><input id="runtime-solver-turn-idle-timeout-seconds" type="number" min="0" max="86400" step="1" required></label>
+              <label><span>최대 Tool step</span><input id="runtime-solver-max-steps" type="number" min="1" max="10000" step="1" required></label>
+              <label><span>Effective token 상한</span><input id="runtime-solver-max-tokens" type="number" min="0" max="100000000" step="1000" required></label>
+              <label><span>Raw token 상한</span><input id="runtime-solver-max-raw-tokens" type="number" min="0" max="500000000" step="1000" required></label>
+              <label><span>Turn slice token</span><input id="runtime-solver-turn-slice-tokens" type="number" min="0" max="100000000" step="1000" required></label>
+              <label><span>Cached token 가중치</span><input id="runtime-solver-cached-token-weight" type="number" min="0" max="1" step="0.01" required></label>
+              <label><span>Flag 제출 횟수</span><input id="runtime-max-flag-submissions-per-challenge" type="number" min="1" max="100" step="1" required></label>
+              <label><span>Command timeout (초)</span><input id="runtime-max-command-timeout-seconds" type="number" min="1" max="3600" step="1" required></label>
+              <label><span>Delegate 누적 수</span><input id="runtime-delegate-max-agents" type="number" min="0" max="32" step="1" required></label>
+              <label><span>Delegate 최대 시도</span><input id="runtime-delegate-max-attempts" type="number" min="1" max="100" step="1" required></label>
+              <label><span>Delegate 최대 실행 (초)</span><input id="runtime-delegate-max-runtime-seconds" type="number" min="60" max="86400" step="1" required></label>
+              <label><span>Delegate turn timeout</span><input id="runtime-delegate-turn-timeout-seconds" type="number" min="30" max="86400" step="1" required></label>
+              <label><span>Delegate idle timeout</span><input id="runtime-delegate-turn-idle-timeout-seconds" type="number" min="0" max="86400" step="1" required></label>
+              <label><span>Delegate Tool step</span><input id="runtime-delegate-max-steps" type="number" min="1" max="10000" step="1" required></label>
+              <label><span>Delegate effective token</span><input id="runtime-delegate-max-tokens" type="number" min="0" max="100000000" step="1000" required></label>
+              <label><span>Delegate raw token</span><input id="runtime-delegate-max-raw-tokens" type="number" min="0" max="500000000" step="1000" required></label>
+              <label><span>Delegate turn slice</span><input id="runtime-delegate-turn-slice-tokens" type="number" min="0" max="100000000" step="1000" required></label>
+            </div>
+          </details>
+
+          <div class="runtime-settings-actions wide-field">
+            <p id="runtime-settings-copy">현재 설정을 불러오고 있습니다.</p>
+            <div>
+              <button class="secondary-button" id="runtime-settings-reset" type="button">기본값 복원</button>
+              <button class="primary-button setup-submit" type="submit">실행 설정 저장</button>
+            </div>
+          </div>
+        </form>
+      </article>
+    </section>
+
     <section class="source-section" aria-labelledby="source-title">
       <div class="section-heading source-heading">
         <div>
@@ -264,6 +375,22 @@
       <div class="reset-actions">
         <button class="secondary-button" id="experience-reset-cancel" type="button">취소</button>
         <button class="destructive-button" id="experience-reset-submit" type="submit" disabled>경험 초기화</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="reset-dialog" id="delete-challenge-dialog" aria-labelledby="delete-challenge-dialog-title">
+    <form id="delete-challenge-form">
+      <header>
+        <p class="eyebrow">DELETE CHALLENGE</p>
+        <h2 id="delete-challenge-dialog-title">문제를 삭제할까요?</h2>
+      </header>
+      <p><strong id="delete-challenge-name"></strong>의 solver와 Docker를 중단하고 문제 파일, workspace·라이트업, trace, 결과와 비용 기록을 삭제합니다. 공유 풀이 경험은 보존됩니다.</p>
+      <label for="delete-challenge-confirmation">계속하려면 문제명을 정확히 입력하세요.</label>
+      <input id="delete-challenge-confirmation" autocomplete="off" spellcheck="false" required>
+      <div class="reset-actions">
+        <button class="secondary-button" id="delete-challenge-cancel" type="button">취소</button>
+        <button class="destructive-button" id="delete-challenge-submit" type="submit" disabled>문제 영구 삭제</button>
       </div>
     </form>
   </dialog>

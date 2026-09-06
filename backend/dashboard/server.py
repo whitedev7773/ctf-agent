@@ -18,15 +18,27 @@ import yaml
 from aiohttp import web
 
 from backend.artifacts import challenge_approach_notes, challenge_workspace_path
-from backend.budgets import solver_token_limits, token_metrics
+from backend.budgets import (
+    solver_token_limits,
+    solver_turn_idle_timeout_limit,
+    token_metrics,
+)
 from backend.challenge_profiles import external_skill_path, solver_role
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.experience import experience_root, experience_summary
 from backend.model_specs import provider_from_spec
 from backend.prompts import ChallengeMeta
+from backend.runtime_settings import (
+    RuntimeSettings,
+    apply_runtime_settings,
+    reset_runtime_settings,
+    runtime_settings_from,
+    save_runtime_settings,
+)
 from backend.runtime_state import persist_deps_state
 from backend.solver_base import solver_agent_name
+from backend.tracing import challenge_trace_paths
 from backend.writeups import (
     begin_writeup_generation,
     fail_writeup_generation,
@@ -45,7 +57,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 logger = logging.getLogger(__name__)
 RESET_CONFIRMATION = "초기화"
 RESET_EXPERIENCE_CONFIRMATION = "경험 초기화"
-RUNTIME_REVISION = 15
+RUNTIME_REVISION = 19
 
 
 def _runtime_source_fingerprint(project_root: Path | None = None) -> str:
@@ -272,8 +284,12 @@ class DashboardServer:
                 web.get("/api/writeup", self._writeup),
                 web.get("/api/artifact", self._artifact),
                 web.get("/api/trace", self._trace),
+                web.get("/api/settings/runtime", self._runtime_settings),
                 web.post("/api/settings/ctfd", self._configure_ctfd),
+                web.post("/api/settings/runtime", self._configure_runtime),
+                web.post("/api/settings/runtime/reset", self._reset_runtime_settings),
                 web.post("/api/challenges/local", self._create_local_challenge),
+                web.post("/api/challenges/delete", self._delete_challenge),
                 web.post("/api/operator/message", self._operator_message),
                 web.post("/api/control/spawn", self._spawn),
                 web.post("/api/control/stop", self._stop_swarm),
@@ -344,6 +360,8 @@ class DashboardServer:
                     "reset_runtime": True,
                     "reset_experience": True,
                     "request_writeup": True,
+                    "delete_challenge": True,
+                    "runtime_settings": True,
                 },
             }
         )
@@ -364,14 +382,15 @@ class DashboardServer:
 
     def _snapshot(self) -> dict[str, Any]:
         candidates = getattr(self.deps, "candidates", {})
+        dismissed = getattr(self.deps, "dismissed_challenges", set())
         known = (
             self.poller.known_challenges
             | set(self.deps.challenge_metas)
             | set(self.deps.swarms)
             | set(self.deps.results)
             | set(candidates)
-        )
-        solved = self.poller.known_solved | set(self.deps.results)
+        ) - dismissed
+        solved = (self.poller.known_solved | set(self.deps.results)) & known
         active_names = {
             name
             for name, task in self.deps.swarm_tasks.items()
@@ -407,13 +426,19 @@ class DashboardServer:
                     checkpoint_pending = (
                         getattr(solver, "_checkpoint_stop_reason", "") if solver else ""
                     )
+                    resume_pending = (
+                        getattr(solver, "_resume_stop_reason", "") if solver else ""
+                    )
+                    idle_reader = getattr(solver, "activity_idle_seconds", None)
+                    idle_seconds = round(float(idle_reader()), 1) if callable(idle_reader) else 0.0
                     raw_steps = getattr(solver, "_step_count", 0) if solver else 0
                     if isinstance(raw_steps, list):
                         raw_steps = raw_steps[0] if raw_steps else 0
+                    swarm_settings = getattr(swarm, "settings", self.deps.settings)
                     usage = _usage_payload(
                         self.cost_tracker,
                         solver_agent_name(name, spec),
-                        self.deps.settings,
+                        swarm_settings,
                         spec,
                     )
                     sandbox = getattr(solver, "sandbox", None) if solver else None
@@ -429,6 +454,8 @@ class DashboardServer:
                                 running and checkpoint_pending
                             ) else "stopping" if (
                                 running and budget_stop_pending
+                            ) else "redirecting" if (
+                                running and resume_pending
                             ) else "running" if running else (
                                 "won" if outcome is not None and outcome is swarm.winner else (
                                     outcome.status if outcome else "finished"
@@ -439,10 +466,18 @@ class DashboardServer:
                             "trace": Path(getattr(getattr(solver, "tracer", None), "path", "")).name,
                             "stop_reason": (
                                 outcome.stop_reason if outcome else (
-                                    budget_stop_pending or checkpoint_pending
+                                    budget_stop_pending or checkpoint_pending or resume_pending
                                 )
                             ),
                             "attempt": outcome.attempt if outcome else 0,
+                            "idle_seconds": idle_seconds if running else 0.0,
+                            "idle_limit_seconds": solver_turn_idle_timeout_limit(
+                                swarm_settings,
+                                spec,
+                            ),
+                            "tool_call_active": bool(
+                                getattr(solver, "tool_call_active", False)
+                            ),
                             "workspace_path": (
                                 outcome.workspace_path if outcome and outcome.workspace_path
                                 else getattr(getattr(solver, "sandbox", None), "workspace_dir", "")
@@ -546,6 +581,11 @@ class DashboardServer:
 
         current_source_fingerprint = _runtime_source_fingerprint()
         resource_totals = _resource_totals(live_resources)
+        runtime_settings = runtime_settings_from(
+            self.deps.settings,
+            self.deps.model_specs,
+            self.deps.max_concurrent_challenges,
+        )
         return {
             "updated_at": datetime.now(UTC).isoformat(),
             "runtime_revision": RUNTIME_REVISION,
@@ -562,9 +602,15 @@ class DashboardServer:
             },
             "models": self.deps.model_specs,
             "max_concurrent_challenges": self.deps.max_concurrent_challenges,
+            "runtime_settings": runtime_settings.model_dump(),
             "runtime_policy": {
                 "max_attempts": getattr(self.deps.settings, "max_attempts_per_challenge", 8),
                 "turn_timeout_seconds": getattr(self.deps.settings, "solver_turn_timeout_seconds", 1800),
+                "turn_idle_timeout_seconds": getattr(
+                    self.deps.settings,
+                    "solver_turn_idle_timeout_seconds",
+                    300,
+                ),
                 "max_runtime_seconds": getattr(self.deps.settings, "solver_max_runtime_seconds", 10800),
                 "max_steps": getattr(self.deps.settings, "solver_max_steps", 300),
                 "max_tokens": getattr(self.deps.settings, "solver_max_tokens", 1_500_000),
@@ -921,6 +967,83 @@ class DashboardServer:
         trace = await do_read_solver_trace(self.deps, name, model, last_n)
         return web.json_response({"challenge": name, "model": model, "trace": trace})
 
+    def _runtime_settings_payload(self) -> dict[str, Any]:
+        return runtime_settings_from(
+            self.deps.settings,
+            self.deps.model_specs,
+            self.deps.max_concurrent_challenges,
+        ).model_dump()
+
+    async def _runtime_settings(self, _request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "settings": self._runtime_settings_payload(),
+                "applies_to": "future_swarms",
+            }
+        )
+
+    def _apply_runtime_settings(self, runtime: RuntimeSettings) -> None:
+        apply_runtime_settings(self.deps.settings, runtime)
+        self.deps.model_specs[:] = runtime.models
+        self.deps.max_concurrent_challenges = runtime.max_concurrent_challenges
+
+    async def _configure_runtime(self, request: web.Request) -> web.Response:
+        """Validate and persist non-secret policy for future solver swarms."""
+        self._require_csrf(request)
+        data = await self._json_body(request)
+        current = self._runtime_settings_payload()
+        current.update(data)
+        try:
+            runtime = RuntimeSettings.model_validate(current)
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+
+        async with self._command_lock:
+            try:
+                save_runtime_settings(runtime, self.deps.challenges_root)
+            except OSError as exc:
+                raise web.HTTPInternalServerError(
+                    text=f"실행 설정을 저장하지 못했습니다: {exc}"
+                ) from exc
+            self._apply_runtime_settings(runtime)
+
+        active = sum(not task.done() for task in self.deps.swarm_tasks.values())
+        suffix = (
+            f" 실행 중인 swarm {active}개는 기존 설정을 유지합니다."
+            if active
+            else ""
+        )
+        return web.json_response(
+            {
+                "ok": True,
+                "message": f"실행 설정을 저장했습니다. 새 swarm부터 적용됩니다.{suffix}",
+                "settings": runtime.model_dump(),
+                "active_swarms_unchanged": active,
+            }
+        )
+
+    async def _reset_runtime_settings(self, request: web.Request) -> web.Response:
+        """Restore the non-secret dashboard policy to project defaults."""
+        self._require_csrf(request)
+        await self._json_body(request)
+        async with self._command_lock:
+            try:
+                runtime = reset_runtime_settings(self.deps.challenges_root)
+            except OSError as exc:
+                raise web.HTTPInternalServerError(
+                    text=f"기본 실행 설정을 저장하지 못했습니다: {exc}"
+                ) from exc
+            self._apply_runtime_settings(runtime)
+        active = sum(not task.done() for task in self.deps.swarm_tasks.values())
+        return web.json_response(
+            {
+                "ok": True,
+                "message": "실행 설정을 기본값으로 복원했습니다. 새 swarm부터 적용됩니다.",
+                "settings": runtime.model_dump(),
+                "active_swarms_unchanged": active,
+            }
+        )
+
     async def _configure_ctfd(self, request: web.Request) -> web.Response:
         """Validate and apply runtime CTFd settings without exposing secrets back."""
         self._require_csrf(request)
@@ -1045,8 +1168,10 @@ class DashboardServer:
             temp_dir.replace(destination_dir)
 
         meta = ChallengeMeta.from_yaml(destination_dir / "metadata.yml")
+        self.deps.dismissed_challenges.discard(name)
         self.deps.challenge_dirs[name] = str(destination_dir)
         self.deps.challenge_metas[name] = meta
+        persist_deps_state(self.deps)
         attachment_copy = f" 첨부 파일 {file_count}개를 저장했습니다." if file_count else ""
         return web.json_response(
             {
@@ -1054,6 +1179,119 @@ class DashboardServer:
                 "message": f"로컬 문제 '{name}'을 등록했습니다.{attachment_copy}",
                 "challenge": name,
                 "file_count": file_count,
+            }
+        )
+
+    async def _delete_challenge(self, request: web.Request) -> web.Response:
+        """Stop one challenge and permanently remove its local runtime data."""
+        self._require_csrf(request)
+        data = await self._json_body(request)
+        name = str(data.get("challenge", "")).strip()
+        confirmation = str(data.get("confirmation", ""))
+        known = (
+            self.poller.known_challenges
+            | set(self.deps.challenge_metas)
+            | set(self.deps.swarms)
+            | set(self.deps.results)
+            | set(self.deps.candidates)
+        )
+        if not name or name not in known:
+            raise web.HTTPNotFound(text="challenge not found")
+        if confirmation != name:
+            raise web.HTTPBadRequest(text="문제명을 정확히 입력해야 합니다.")
+
+        project_root = Path.cwd().resolve()
+        challenges_root = Path(self.deps.challenges_root).expanduser().resolve()
+        workspace_root = Path(
+            getattr(self.deps.settings, "workspace_root", "workspace")
+        ).expanduser().resolve()
+        logs_root = Path(
+            getattr(self.deps.settings, "logs_root", "logs")
+        ).expanduser().resolve()
+        try:
+            for root in (challenges_root, workspace_root, logs_root):
+                _validate_runtime_root(root, project_root)
+        except ValueError as exc:
+            raise web.HTTPConflict(text=str(exc)) from exc
+
+        challenge_dir_value = self.deps.challenge_dirs.get(name)
+        challenge_dir = (
+            Path(challenge_dir_value).expanduser().resolve()
+            if challenge_dir_value
+            else None
+        )
+        if challenge_dir is not None and (
+            challenge_dir == challenges_root
+            or not challenge_dir.is_relative_to(challenges_root)
+        ):
+            raise web.HTTPConflict(text=f"unsafe challenge path: {challenge_dir}")
+
+        # This helper creates the deterministic directory when absent. That is
+        # harmless here because it is immediately included in the deletion set.
+        workspace_dir = Path(
+            challenge_workspace_path(self.deps.settings, name)
+        ).resolve()
+        if workspace_dir.parent != workspace_root:
+            raise web.HTTPConflict(text=f"unsafe challenge workspace: {workspace_dir}")
+
+        removed_entries = 0
+        retained: list[Path] = []
+        async with self._command_lock:
+            writeup_task = self._writeup_tasks.get(name)
+            if writeup_task is not None and not writeup_task.done():
+                writeup_task.cancel()
+                await asyncio.gather(writeup_task, return_exceptions=True)
+
+            swarm = self.deps.swarms.get(name)
+            if swarm is not None:
+                swarm.kill()
+            swarm_task = self.deps.swarm_tasks.get(name)
+            if swarm_task is not None and not swarm_task.done():
+                swarm_task.cancel()
+                await asyncio.gather(swarm_task, return_exceptions=True)
+
+            targets = [workspace_dir]
+            if challenge_dir is not None:
+                targets.append(challenge_dir)
+            targets.extend(challenge_trace_paths(logs_root, name))
+            for target in targets:
+                if not target.exists():
+                    continue
+                try:
+                    await asyncio.to_thread(_remove_runtime_child, target)
+                except FileNotFoundError:
+                    continue
+                except PermissionError:
+                    retained.append(target)
+                else:
+                    removed_entries += 1
+
+            self._writeup_tasks.pop(name, None)
+            self._writeup_solvers.pop(name, None)
+            self.deps.swarms.pop(name, None)
+            self.deps.swarm_tasks.pop(name, None)
+            self.deps.results.pop(name, None)
+            self.deps.candidates.pop(name, None)
+            self.deps.challenge_dirs.pop(name, None)
+            self.deps.challenge_metas.pop(name, None)
+            self.deps.dismissed_challenges.add(name)
+            agent_prefix = f"{name}/"
+            for agent_name in list(self.cost_tracker.by_agent):
+                if agent_name.startswith(agent_prefix):
+                    self.cost_tracker.by_agent.pop(agent_name, None)
+            persist_deps_state(self.deps)
+
+        message = f"문제 '{name}'과 관련 로컬 데이터 {removed_entries}개를 삭제했습니다."
+        if retained:
+            message += f" 사용 중인 항목 {len(retained)}개는 남아 있습니다."
+        return web.json_response(
+            {
+                "ok": True,
+                "challenge": name,
+                "removed_entries": removed_entries,
+                "retained_locked_entries": len(retained),
+                "experience_preserved": True,
+                "message": message,
             }
         )
 
@@ -1199,6 +1437,7 @@ class DashboardServer:
             self.deps.swarm_tasks.clear()
             self.deps.results.clear()
             self.deps.candidates.clear()
+            self.deps.dismissed_challenges.clear()
             self.deps.challenge_dirs.clear()
             self.deps.challenge_metas.clear()
             self.cost_tracker.by_agent.clear()
