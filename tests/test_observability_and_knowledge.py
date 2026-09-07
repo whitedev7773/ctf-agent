@@ -7,9 +7,11 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from backend.artifacts import challenge_shared_path, challenge_workspace_path
 from backend.experience import experience_summary, promote_challenge_experience
+from backend.prompts import ChallengeMeta, build_writeup_prompt, build_writeup_review_prompt
 from backend.sandbox import DockerSandbox
 from backend.writeups import (
     begin_writeup_generation,
@@ -63,6 +65,28 @@ class DockerResourceTests(unittest.TestCase):
         self.assertEqual(snapshot["block_write_bytes"], 11)
 
 
+class DockerWriteFileTests(unittest.IsolatedAsyncioTestCase):
+    async def test_write_file_uses_posix_container_parent_on_windows_host(self) -> None:
+        container = SimpleNamespace(put_archive=AsyncMock())
+        sandbox = DockerSandbox("ctf-sandbox", "challenge")
+        sandbox._container = container
+
+        await sandbox.write_file("/challenge/shared/writeup/WRITEUP.md", "brief report")
+
+        parent, _archive = container.put_archive.await_args.args
+        self.assertEqual(parent, "/challenge/shared/writeup")
+
+    async def test_terminal_capture_helper_is_installed_in_each_sandbox(self) -> None:
+        container = SimpleNamespace(put_archive=AsyncMock())
+        sandbox = DockerSandbox("ctf-sandbox", "challenge")
+        sandbox._container = container
+
+        await sandbox._install_terminal_capture_helper()
+
+        destination, _archive = container.put_archive.await_args.args
+        self.assertEqual(destination, "/usr/local/bin")
+
+
 class KnowledgeArtifactTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -74,6 +98,32 @@ class KnowledgeArtifactTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def test_writeup_roles_reproduce_only_for_evidence_capture(self) -> None:
+        meta = ChallengeMeta(name="evidence warmup", category="reversing")
+        writer = build_writeup_prompt(meta, "TEAM{verified}")
+        reviewer = build_writeup_review_prompt(meta, "TEAM{verified}")
+
+        self.assertIn("existing verified reproducer", writer)
+        self.assertIn("capture-terminal", writer)
+        self.assertIn("existing verified reproducer", reviewer)
+
+    def test_begin_writeup_stages_solver_reproducer_for_fresh_writer_container(self) -> None:
+        root = Path(challenge_workspace_path(self.settings, "staged reproducer"))
+        solver = root / "codex-gpt-5.6-sol-high" / "solve.py"
+        solver.parent.mkdir(parents=True)
+        solver.write_text("print('reproduced')\n", encoding="utf-8")
+
+        status = begin_writeup_generation(
+            self.settings,
+            "staged reproducer",
+            "codex/gpt-5.6-terra/medium",
+        )
+
+        staged = root / "_shared" / "writeup" / "reproducers" / "codex-gpt-5.6-sol-high" / "solve.py"
+        self.assertTrue(staged.is_file())
+        self.assertEqual(staged.read_text(encoding="utf-8"), "print('reproduced')\n")
+        self.assertIn("_shared/writeup/reproducers/", " ".join(status["reproducers"]))
 
     def test_verified_experience_is_persistent_and_flag_redacted(self) -> None:
         shared = Path(challenge_shared_path(self.settings, "heap warmup"))
@@ -156,7 +206,7 @@ class KnowledgeArtifactTests(unittest.TestCase):
         self.assertEqual(status["status"], "needs_attention")
         self.assertIn("한국어", " ".join(status["issues"]))
 
-    def test_ai_writeup_rejects_omitted_solver_code_and_unexplained_screenshots(self) -> None:
+    def test_ai_writeup_requires_a_compact_reproduction_block(self) -> None:
         root = Path(challenge_workspace_path(self.settings, "thin report"))
         lead = root / "_shared" / "lead"
         output = root / "_shared" / "writeup"
@@ -169,12 +219,11 @@ class KnowledgeArtifactTests(unittest.TestCase):
         begin_writeup_generation(self.settings, "thin report", "codex/gpt-5.6-sol/high")
         (output / "WRITEUP.md").write_text(
             "# 풀이 인증\n\n"
-            "## 요약\n인증 검사가 누락된 요청을 이용해 관리자 기능에 접근한 문제입니다.\n\n"
-            "## 취약점 또는 핵심 원리\n서버가 사용자의 권한을 확인하지 않고 관리자 요청을 처리합니다.\n\n"
-            "## 풀이 과정\n핵심 exploit 코드는 solve.py에 구현했으므로 생략합니다.\n\n"
-            "## 재현 방법\n보존된 스크립트를 실행합니다.\n\n"
+            "## 핵심 원리\n서버가 사용자의 권한을 확인하지 않고 관리자 요청을 처리합니다.\n\n"
+            "## 풀이 순서\n1. 요청을 보냅니다.\n2. 응답을 확인합니다.\n3. Flag를 기록합니다.\n\n"
+            "## 재현\n보존된 스크립트를 실행합니다.\n\n"
             "## 검증\n반환된 결과에서 정답 문자열을 확인했습니다.\n\n"
-            "## 주요 스크린샷\n참고용 이미지 두 장입니다.\n\n"
+            "## 증거 화면\n참고용 이미지 두 장입니다.\n\n"
             "![one](evidence/one.png)\n\n![two](evidence/two.png)\n",
             encoding="utf-8",
         )
@@ -190,9 +239,9 @@ class KnowledgeArtifactTests(unittest.TestCase):
 
         combined = " ".join(status["issues"])
         self.assertFalse(status["documented"])
-        self.assertIn("핵심 exploit/solver 로직 전체", combined)
-        self.assertIn("생략할 수 없습니다", combined)
-        self.assertIn("핵심 원리 또는 취약점 증거", combined)
+        self.assertIn("재현 절에 핵심 payload", combined)
+        self.assertIn("핵심 원리 또는 취약점", combined)
+        self.assertIn("해결 성공 또는 Flag", combined)
 
     def test_ai_writeup_manifest_keeps_only_two_explained_decisive_screenshots(self) -> None:
         root = Path(challenge_workspace_path(self.settings, "reviewable report"))
@@ -207,9 +256,9 @@ class KnowledgeArtifactTests(unittest.TestCase):
         begin_writeup_generation(self.settings, "reviewable report", "codex/gpt-5.6-sol/high")
         (output / "WRITEUP.md").write_text(
             "# 풀이 인증\n\n"
-            "## 요약\n인증 누락을 재현하고 관리자 결과와 최종 Flag를 확인한 풀이입니다.\n\n"
-            "## 취약점 또는 핵심 원리\n요청 헤더를 신뢰해 권한 검사가 우회되는 것이 핵심 원인입니다.\n\n"
-            "## 풀이 과정\n아래 코드는 요청 구성부터 응답 검증까지 사용한 전체 핵심 로직입니다.\n\n"
+            "## 핵심 원리\n요청 헤더를 신뢰해 권한 검사가 우회됩니다.\n\n"
+            "![핵심 메커니즘](evidence/root-cause.png)\n\n"
+            "## 풀이 순서\n1. 헤더를 조작합니다.\n2. 관리자 응답을 확인합니다.\n3. Flag를 기록합니다.\n\n"
             "```python\nimport requests\n\ndef exploit(base):\n"
             "    session = requests.Session()\n"
             "    response = session.get(base + '/admin', headers={'X-Role': 'admin'})\n"
@@ -217,13 +266,9 @@ class KnowledgeArtifactTests(unittest.TestCase):
             "    body = response.text\n"
             "    assert 'TEAM{' in body\n"
             "    return body\n\nprint(exploit('http://challenge'))\n```\n\n"
-            "## 재현 방법\n```sh\npython3 solve.py\n```\n\n"
+            "## 재현\n```sh\npython3 solve.py\n```\n\n"
             "## 검증\n동일한 요청을 다시 보내 같은 Flag 결과가 반환되는지 확인했습니다.\n\n"
-            "## 주요 스크린샷\n\n"
-            "### 핵심 취약점 분석 근거\n권한 검사 없이 관리자 응답이 반환되는 화면입니다.\n\n"
-            "![핵심 취약점](evidence/root-cause.png)\n\n"
-            "### 해결 성공 및 Flag 결과\n실제 공격 요청으로 최종 정답을 얻은 화면입니다.\n\n"
-            "![Flag 성공](evidence/success.png)\n",
+            "![Flag 성공 결과](evidence/success.png)\n",
             encoding="utf-8",
         )
 

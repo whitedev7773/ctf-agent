@@ -892,14 +892,16 @@ class CodexSolver:
             self._resume_after_checkpoint = False
         elif self.task_mode == "writeup":
             prompt_text = (
-                "Generate the final Korean writeup now. Read the preserved solver evidence, write "
-                "/challenge/shared/writeup/WRITEUP.md, and include real decisive screenshots when "
-                "available or reproducible. Do not re-solve or submit the challenge."
+                "Generate the final Korean writeup now. Start from the preserved solver evidence, then run only the "
+                "existing verified reproducer or minimal documented command needed to capture the two real evidence "
+                "screens. Write /challenge/shared/writeup/WRITEUP.md. Do not re-triage, develop a new solve route, "
+                "or submit the challenge."
             )
         elif self.task_mode == "writeup_review":
             prompt_text = (
-                "Review the generated Korean writeup now. Correct unsupported or incomplete content, verify the "
-                "two decisive screenshot roles and embedded solver code, then write REVIEW.md with the final verdict."
+                "Review the generated Korean writeup now. Correct unsupported or incomplete content and verify the "
+                "two decisive screenshot roles. If one is missing, rerun only the existing verified reproducer or "
+                "minimal documented capture command. Then write REVIEW.md with the final verdict."
             )
         elif self._step_count == 0:
             prompt_text = "Solve this CTF challenge."

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import posixpath
 import shlex
 import tarfile
 import tempfile
@@ -245,6 +246,24 @@ class DockerSandbox:
         snapshot["history"] = list(self._resource_history)
         return snapshot
 
+    async def _install_terminal_capture_helper(self) -> None:
+        """Make terminal evidence capture available even before the image is rebuilt."""
+        if not self._container:
+            raise RuntimeError("Sandbox not started")
+        source = Path(__file__).resolve().parents[1] / "sandbox" / "capture_terminal.py"
+        content = source.read_bytes()
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as tar:
+            info = tarfile.TarInfo(name="capture-terminal")
+            info.mode = 0o755
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+        archive.seek(0)
+        await asyncio.wait_for(
+            self._container.put_archive("/usr/local/bin", archive.getvalue()),
+            timeout=30,
+        )
+
     async def start(self) -> None:
         sem = _start_semaphore or asyncio.Semaphore(50)
         async with sem:
@@ -296,6 +315,7 @@ class DockerSandbox:
 
             self._container = await self._docker.containers.create(config)
             await self._container.start()
+            await self._install_terminal_capture_helper()
             await _track_start()
             self._started_monotonic = time.monotonic()
 
@@ -421,15 +441,23 @@ class DockerSandbox:
             content = content.encode("utf-8")
 
         buf = io.BytesIO()
+        # This is a Linux container path even when the host is Windows.
+        # pathlib.Path would turn it into ``\\challenge\\shared`` and Docker
+        # would reject the archive destination with a 404.
+        container_path = path.replace("\\", "/")
+        parent = posixpath.dirname(container_path) or "/"
+        filename = posixpath.basename(container_path)
+        if not filename:
+            raise ValueError("write_file requires a file path")
         with tarfile.open(fileobj=buf, mode="w") as tar:
-            info = tarfile.TarInfo(name=Path(path).name)
+            info = tarfile.TarInfo(name=filename)
             info.size = len(content)
             tar.addfile(info, io.BytesIO(content))
         buf.seek(0)
 
         try:
             await asyncio.wait_for(
-                self._container.put_archive(str(Path(path).parent), buf.getvalue()),
+                self._container.put_archive(parent, buf.getvalue()),
                 timeout=30,
             )
         except TimeoutError as e:

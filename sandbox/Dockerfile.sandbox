@@ -172,5 +172,7 @@ RUN mkdir -p /challenge/skills \
 
 # ── Tools reference ──────────────────────────────────────────────────────────
 COPY sandbox/sandbox-tools.txt /tools.txt
+COPY sandbox/capture_terminal.py /usr/local/bin/capture-terminal
+RUN chmod 755 /usr/local/bin/capture-terminal
 
 WORKDIR /challenge

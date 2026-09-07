@@ -41,6 +41,8 @@ pngcheck           PNG structure checker. pngcheck -v file.png
 identify           ImageMagick: identify file properties. identify image.png
 convert            ImageMagick: transform images. convert in.png -enhance out.png
 montage            ImageMagick: tile images. montage *.png out.png
+capture-terminal   Run a command in a pseudo-terminal and save its real terminal screen as PNG.
+                   capture-terminal --output /challenge/shared/lead/evidence/success.png -- bash -lc './solve.py'
 tesseract          OCR. tesseract image.png stdout, or --psm 6 for block text.
 ffmpeg             Audio/video processing. ffmpeg -i in.wav out.mp3
 sox                Audio analysis. sox in.wav -n spectrogram -o spec.png
