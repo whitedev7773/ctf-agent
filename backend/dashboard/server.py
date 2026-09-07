@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import logging
 import re
 import secrets
 import shutil
 import time
+import zipfile
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,6 +48,7 @@ from backend.writeups import (
     finalize_writeup,
     interrupted_writeup_status,
     read_writeup,
+    seed_writeup_from_solver_evidence,
     writeup_status,
 )
 
@@ -269,6 +272,7 @@ class DashboardServer:
         self._writeup_lock = asyncio.Lock()
         self._writeup_tasks: dict[str, asyncio.Task[None]] = {}
         self._writeup_solvers: dict[str, Any] = {}
+        self._writeup_phases: dict[str, str] = {}
         self.codex_usage_monitor = CodexUsageMonitor(
             getattr(self.deps.settings, "codex_cli_path", ""),
         )
@@ -287,6 +291,7 @@ class DashboardServer:
                 web.get("/api/codex/usage", self._codex_usage),
                 web.get("/api/resources", self._resources),
                 web.get("/api/writeup", self._writeup),
+                web.get("/api/writeup/archive", self._writeup_archive),
                 web.get("/api/artifact", self._artifact),
                 web.get("/api/trace", self._trace),
                 web.get("/api/settings/runtime", self._runtime_settings),
@@ -503,18 +508,24 @@ class DashboardServer:
             writeup_solver = self._writeup_solvers.get(name)
             writeup_task = self._writeup_tasks.get(name)
             if writeup_solver is not None and writeup_task is not None and not writeup_task.done():
-                spec = f"{writeup_solver.model_spec}/writeup"
+                phase = self._writeup_phases.get(name, "writing")
+                role = "writeup_review" if phase == "reviewing" else "writeup"
+                spec = f"{writeup_solver.model_spec}/{role.replace('_', '-')}"
                 resource_reader = getattr(writeup_solver.sandbox, "resource_snapshot", None)
                 resource = resource_reader() if callable(resource_reader) else {}
                 agents.append(
                     {
                         "model_spec": spec,
-                        "role": "writeup",
-                        "role_title": "Korean writeup generator",
+                        "role": role,
+                        "role_title": "Luna writeup reviewer" if phase == "reviewing" else "Terra writeup writer",
                         "skill_path": "",
                         "status": "generating",
                         "steps": getattr(writeup_solver, "_step_count", 0),
-                        "findings": "한국어 최종본과 주요 스크린샷을 구성하고 있습니다.",
+                        "findings": getattr(
+                            writeup_solver,
+                            "activity_summary",
+                            "생성된 라이트업을 검수하는 중" if phase == "reviewing" else "풀이 내역으로 라이트업을 작성하는 중",
+                        ),
                         "trace": Path(
                             getattr(getattr(writeup_solver, "tracer", None), "path", "")
                         ).name,
@@ -741,13 +752,14 @@ class DashboardServer:
                         live.append(resource)
             writeup_solver = self._writeup_solvers.get(name)
             if writeup_solver is not None:
+                phase = self._writeup_phases.get(name, "writing")
                 reader = getattr(writeup_solver.sandbox, "resource_snapshot", None)
                 resource = reader() if callable(reader) else {}
                 if resource:
                     agents.append(
                         {
-                            "model_spec": f"{writeup_solver.model_spec}/writeup",
-                            "role": "writeup",
+                            "model_spec": f"{writeup_solver.model_spec}/{'writeup-review' if phase == 'reviewing' else 'writeup'}",
+                            "role": "writeup_review" if phase == "reviewing" else "writeup",
                             "resource": resource,
                         }
                     )
@@ -782,6 +794,61 @@ class DashboardServer:
         status = self._current_writeup_status(name, solved=True)
         return web.json_response({"challenge": name, "content": content, "writeup": status})
 
+    async def _writeup_archive(self, request: web.Request) -> web.Response:
+        """Download a self-contained Markdown and selected-evidence bundle."""
+        name = request.query.get("challenge", "").strip()
+        if name not in self.deps.challenge_metas and name not in self.deps.results:
+            raise web.HTTPNotFound(text="challenge not found")
+        try:
+            content, status, root = read_writeup(self.deps.settings, name)
+        except FileNotFoundError as exc:
+            raise web.HTTPNotFound(text=str(exc)) from exc
+
+        writeup_path = (root / str(status.get("writeup_path", ""))).resolve()
+        selected: list[tuple[Path, str]] = []
+        used_names: set[str] = set()
+        rewritten = content
+        for index, item in enumerate(status.get("screenshots") or [], 1):
+            relative = str(item.get("path", "")).strip()
+            source = (root / relative).resolve()
+            if (
+                not relative
+                or not source.is_relative_to(root)
+                or source.suffix.casefold() not in {".png", ".jpg", ".jpeg", ".webp"}
+                or not source.is_file()
+            ):
+                continue
+            archive_name = source.name
+            if archive_name.casefold() in used_names:
+                archive_name = f"{source.stem}-{index}{source.suffix.lower()}"
+            used_names.add(archive_name.casefold())
+            archive_path = f"evidence/{archive_name}"
+            selected.append((source, archive_path))
+            try:
+                markdown_path = source.relative_to(writeup_path.parent).as_posix()
+            except ValueError:
+                parent_depth = len(writeup_path.parent.relative_to(root).parts)
+                markdown_path = Path(
+                    *([".."] * parent_depth),
+                    *source.relative_to(root).parts,
+                ).as_posix()
+            rewritten = rewritten.replace(f"]({markdown_path})", f"]({archive_path})")
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("WRITEUP.md", rewritten.encode("utf-8"))
+            review_path = root / "_shared" / "writeup" / "REVIEW.md"
+            if review_path.is_file():
+                archive.write(review_path, "REVIEW.md")
+            for source, archive_path in selected:
+                archive.write(source, archive_path)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or "challenge"
+        return web.Response(
+            body=buffer.getvalue(),
+            content_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{safe_name}-writeup.zip"'},
+        )
+
     def _current_writeup_status(self, name: str, *, solved: bool) -> dict[str, Any]:
         status = writeup_status(self.deps.settings, name, solved=solved)
         task = self._writeup_tasks.get(name)
@@ -791,17 +858,45 @@ class DashboardServer:
             status["documented"] = False
             status["active"] = True
             solver = self._writeup_solvers.get(name)
+            phase = self._writeup_phases.get(name, "writing")
+            status["phase"] = phase
+            status["phase_label"] = "Luna-Medium 검수" if phase == "reviewing" else "Terra-Medium 작성"
+            status["activity"] = getattr(
+                solver,
+                "activity_summary",
+                "생성된 라이트업을 검수하는 중" if phase == "reviewing" else "풀이 내역으로 라이트업을 작성하는 중",
+            )
+            idle_reader = getattr(solver, "activity_idle_seconds", None)
+            status["steps"] = getattr(solver, "_step_count", 0)
+            if callable(idle_reader):
+                idle = max(0.0, float(idle_reader()))
+                status["idle_seconds"] = round(idle, 1)
+                status["last_activity_at"] = datetime.fromtimestamp(
+                    time.time() - idle, UTC,
+                ).isoformat()
+            status["idle_timeout_seconds"] = max(
+                1, int(getattr(self.deps.settings, "writeup_idle_timeout_seconds", 300)),
+            )
             resource_reader = getattr(getattr(solver, "sandbox", None), "resource_snapshot", None)
             if callable(resource_reader):
                 status["resource"] = resource_reader()
             return status
         return interrupted_writeup_status(status)
 
-    def _writeup_model_spec(self) -> str:
-        return next(
-            (spec for spec in self.deps.model_specs if provider_from_spec(spec) == "codex"),
-            "",
-        )
+    def _writeup_model_specs(self) -> tuple[str, str]:
+        writer = str(
+            getattr(self.deps.settings, "writeup_model_spec", "codex/gpt-5.6-terra/medium")
+        ).strip()
+        reviewer = str(
+            getattr(
+                self.deps.settings,
+                "writeup_review_model_spec",
+                "codex/gpt-5.6-luna/medium",
+            )
+        ).strip()
+        if provider_from_spec(writer) != "codex" or provider_from_spec(reviewer) != "codex":
+            return "", ""
+        return writer, reviewer
 
     def _create_writeup_solver(
         self,
@@ -810,6 +905,7 @@ class DashboardServer:
         challenge_dir: str,
         model_spec: str,
         flag: str,
+        task_mode: str = "writeup",
     ):
         from backend.agents.codex_solver import CodexSolver
 
@@ -821,32 +917,78 @@ class DashboardServer:
             cost_tracker=self.cost_tracker,
             settings=self.deps.settings,
             no_submit=True,
-            task_mode="writeup",
+            task_mode=task_mode,
             verified_flag=flag,
         )
+
+    async def _wait_for_writeup(self, solver: Any) -> Any:
+        """Watch documentation jobs independently of the solve swarm's watchdog."""
+        idle_limit = max(
+            1, int(getattr(self.deps.settings, "writeup_idle_timeout_seconds", 300)),
+        )
+        job = asyncio.create_task(solver.run_until_done_or_gave_up())
+        try:
+            while True:
+                done, _ = await asyncio.wait({job}, timeout=1)
+                if done:
+                    return job.result()
+                reader = getattr(solver, "_reader_task", None)
+                if reader is not None and reader.done():
+                    if not reader.cancelled() and reader.exception() is not None:
+                        raise RuntimeError("라이트업 응답 수신기가 오류로 종료되었습니다") from reader.exception()
+                    raise RuntimeError("라이트업 응답 연결이 종료되었습니다")
+                idle_reader = getattr(solver, "activity_idle_seconds", None)
+                tool_active = bool(getattr(solver, "tool_call_active", False))
+                if callable(idle_reader) and not tool_active and idle_reader() >= idle_limit:
+                    raise RuntimeError(
+                        f"라이트업 생성기에서 {idle_limit}초 동안 새 활동이 없어 중단했습니다. "
+                        "보존된 자료로 다시 요청할 수 있습니다"
+                    )
+        finally:
+            if not job.done():
+                job.cancel()
+            await asyncio.gather(job, return_exceptions=True)
 
     async def _run_writeup_generation(
         self,
         name: str,
         meta: ChallengeMeta,
         model_spec: str,
+        review_model_spec: str,
         flag: str,
     ) -> None:
         challenge_dir = self.deps.challenge_dirs.get(name, self.deps.challenges_root)
-        solver = self._create_writeup_solver(
-            name,
-            meta,
-            challenge_dir,
-            model_spec,
-            flag,
-        )
-        self._writeup_solvers[name] = solver
         try:
             timeout = max(
                 60,
                 int(getattr(self.deps.settings, "writeup_generation_timeout_seconds", 1800)),
             )
-            result = await asyncio.wait_for(solver.run_until_done_or_gave_up(), timeout=timeout)
+            results = []
+            for phase, spec, task_mode in (
+                ("writing", model_spec, "writeup"),
+                ("reviewing", review_model_spec, "writeup_review"),
+            ):
+                self._writeup_phases[name] = phase
+                solver = self._create_writeup_solver(
+                    name,
+                    meta,
+                    challenge_dir,
+                    spec,
+                    flag,
+                    task_mode=task_mode,
+                )
+                self._writeup_solvers[name] = solver
+                try:
+                    results.append(
+                        await asyncio.wait_for(self._wait_for_writeup(solver), timeout=timeout)
+                    )
+                finally:
+                    try:
+                        await asyncio.wait_for(solver.stop(), timeout=15)
+                    except Exception as exc:
+                        logger.warning("Could not stop %s stage for %s: %s", phase, name, exc)
+                    if self._writeup_solvers.get(name) is solver:
+                        self._writeup_solvers.pop(name, None)
             status = finalize_writeup(
                 self.deps.settings,
                 name,
@@ -854,8 +996,11 @@ class DashboardServer:
                 flag,
                 prefer_canonical=True,
                 require_screenshots=True,
+                require_review=True,
             )
-            if not status.get("documented") and result.status in {"error", "quota_error"}:
+            if not status.get("documented") and any(
+                result.status in {"error", "quota_error"} for result in results
+            ):
                 status = fail_writeup_generation(
                     self.deps.settings,
                     name,
@@ -882,11 +1027,8 @@ class DashboardServer:
                 f"라이트업 생성 실패: {type(exc).__name__}: {exc}",
             )
         finally:
-            try:
-                await solver.stop()
-            except Exception as exc:
-                logger.warning("Could not stop writeup generator for %s: %s", name, exc)
             self._writeup_solvers.pop(name, None)
+            self._writeup_phases.pop(name, None)
             self._writeup_tasks.pop(name, None)
 
         if name in self.deps.results:
@@ -900,21 +1042,34 @@ class DashboardServer:
             if existing is not None and not existing.done():
                 return self._current_writeup_status(name, solved=True)
 
-            model_spec = self._writeup_model_spec()
-            if not model_spec:
-                raise RuntimeError("writeup generation requires a configured Codex model")
+            model_spec, review_model_spec = self._writeup_model_specs()
+            if not model_spec or not review_model_spec:
+                raise RuntimeError("writeup generation and review require configured Codex models")
 
             meta = self.deps.challenge_metas.get(name)
             if meta is None:
                 meta = ChallengeMeta(name=name, category="Unknown")
             result = self.deps.results.get(name, {})
-            status = begin_writeup_generation(self.deps.settings, name, model_spec)
+            flag = str(result.get("flag", ""))
+            seed_writeup_from_solver_evidence(
+                self.deps.settings,
+                name,
+                getattr(meta, "category", "Unknown"),
+                flag,
+            )
+            status = begin_writeup_generation(
+                self.deps.settings,
+                name,
+                model_spec,
+                review_model_spec,
+            )
             task = asyncio.create_task(
                 self._run_writeup_generation(
                     name,
                     meta,
                     model_spec,
-                    str(result.get("flag", "")),
+                    review_model_spec,
+                    flag,
                 ),
                 name=f"writeup-{name}",
             )

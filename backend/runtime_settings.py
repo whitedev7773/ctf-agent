@@ -34,6 +34,8 @@ class RuntimeSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     models: list[str] = Field(default_factory=lambda: list(DEFAULT_MODELS), min_length=1, max_length=4)
+    writeup_model_spec: str = "codex/gpt-5.6-terra/medium"
+    writeup_review_model_spec: str = "codex/gpt-5.6-luna/medium"
     max_concurrent_challenges: int = Field(default=1, ge=1, le=32)
     container_memory_limit: str = "4g"
     container_cpu_limit: float = Field(default=2.0, ge=0.1, le=64.0)
@@ -75,6 +77,16 @@ class RuntimeSettings(BaseModel):
     @field_validator("delegate_model_spec")
     @classmethod
     def _validate_delegate_model(cls, value: str) -> str:
+        return _validate_model_spec(value, delegate=True)
+
+    @field_validator("writeup_model_spec")
+    @classmethod
+    def _validate_writeup_model(cls, value: str) -> str:
+        return _validate_model_spec(value, delegate=True)
+
+    @field_validator("writeup_review_model_spec")
+    @classmethod
+    def _validate_writeup_review_model(cls, value: str) -> str:
         return _validate_model_spec(value, delegate=True)
 
     @field_validator("container_memory_limit")

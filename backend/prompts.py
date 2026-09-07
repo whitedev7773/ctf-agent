@@ -277,24 +277,81 @@ def build_writeup_prompt(meta: ChallengeMeta, verified_flag: str = "") -> str:
             f"- Description: {meta.description or '(none)'}",
             "",
             "## Required work",
+            "Before each major phase, send one short Korean progress sentence saying what section or evidence you "
+            "are working on. Keep it suitable for a compact dashboard status line.",
             "1. Read the preserved evidence under `/challenge/shared/` and `/challenge/workspace/`. "
             "Prefer lead SOLUTION/WRITEUP/STATE files, reproducer scripts, observed output, and delegate handoffs.",
+            "Treat the document as proof of solution for contest organizers. It must stand on its own and let a "
+            "reviewer understand why the weakness or core mechanism exists, how it was exploited or reversed, and "
+            "how the final result was obtained and verified without opening another file.",
             "2. Write the final artifact to `/challenge/shared/writeup/WRITEUP.md`. The explanatory prose, "
             "reasoning, reproduction narrative, and verification narrative must be natural Korean. Challenge names, "
             "vulnerability terms, protocols, commands, code, paths, identifiers, and other clearer technical tokens "
             "may remain in English.",
             "3. Include at least these sections: `요약`, `취약점 또는 핵심 원리`, `풀이 과정`, `재현 방법`, "
-            "`검증`, and `주요 스크린샷`. Preserve exact commands and relevant code in fenced code blocks.",
-            "4. Use only evidence that exists in the preserved artifacts. Clearly label uncertainty or missing evidence; "
+            "`검증`, and `주요 스크린샷`. State the exact vulnerable condition or decisive algorithm, relevant "
+            "offsets/constants/requests, intermediate observations, exploit or recovery chain, and verification result.",
+            "4. Embed every important part of the exploit/solver in fenced code blocks in the writeup. Include the "
+            "relevant functions, constants, payload construction, parsing/recovery logic, and invocation command. "
+            "A link to `solve.py`, statements such as 'implemented in the script', pseudocode, or an ellipsis is not "
+            "a substitute and must never be used to omit decisive code.",
+            "5. Use only evidence that exists in the preserved artifacts. Clearly label uncertainty or missing evidence; "
             "never invent an exploit step, output, or screenshot.",
-            "5. Reuse meaningful PNG/JPEG/WebP evidence already present. If a decisive visual result can be reproduced, "
-            "capture a real screenshot under `/challenge/shared/writeup/evidence/`. For web challenges, prefer an actual "
-            "Playwright Chromium capture. Do not create decorative images or render ordinary terminal text into a fake screenshot.",
-            "6. Reference every selected screenshot from the final Markdown. Never expose credentials, tokens, cookies, "
-            "or unrelated personal data in text or images.",
-            "7. Finish only after atomically replacing the final Markdown (write a temporary sibling and rename it).",
+            "6. Include at least two distinct, real screenshots under `주요 스크린샷`: (a) the major vulnerability, "
+            "fault, or core-mechanism evidence, and (b) the successful exploit/recovery/Flag result. Give each image a "
+            "specific heading and caption explaining exactly what visible detail proves. Reuse preserved PNG/JPEG/WebP "
+            "evidence or reproduce and capture the real state under `/challenge/shared/writeup/evidence/`. For web "
+            "challenges, prefer an actual Playwright Chromium capture. Do not create decorative images or render a "
+            "fabricated terminal transcript into an image.",
+            "7. Reference only the decisive screenshots from the final Markdown; do not append an indiscriminate evidence "
+            "gallery. Never expose credentials, tokens, cookies, or unrelated personal data in text or images.",
+            "8. Finish only after atomically replacing the final Markdown (write a temporary sibling and rename it).",
             "",
             "Return a concise structured completion result after the file has been written. Use `incomplete` with an "
             "empty flag if evidence is missing; the file and its evidence are the authoritative deliverables.",
+        ]
+    )
+
+
+def build_writeup_review_prompt(meta: ChallengeMeta, verified_flag: str = "") -> str:
+    """Build an independent reviewer prompt for the writer's canonical document."""
+    flag_line = (
+        f"The verified flag is `{verified_flag}`."
+        if verified_flag
+        else "The challenge is already verified as solved; the flag value is unavailable locally."
+    )
+    return "\n".join(
+        [
+            "You are the independent final reviewer for an authorized CTF writeup.",
+            "A Terra writer has produced `/challenge/shared/writeup/WRITEUP.md`. Audit it against the preserved "
+            "solver evidence under `/challenge/shared/` and `/challenge/workspace/`; do not trust unsupported claims.",
+            flag_line,
+            "",
+            "## Challenge",
+            f"- Name: {meta.name}",
+            f"- Category: {meta.category or 'Unknown'}",
+            f"- Description: {meta.description or '(none)'}",
+            "",
+            "## Review procedure",
+            "Before each major phase, send one short Korean progress sentence describing the current check so the "
+            "dashboard can display it.",
+            "1. Verify that contest organizers can understand and reproduce the complete solve from the Markdown "
+            "alone: root cause or algorithm, exact exploit/recovery chain, commands, output, and Flag verification.",
+            "2. Compare every decisive statement, offset, constant, request, output, and Flag against preserved evidence.",
+            "3. Ensure all important exploit/solver code is embedded in fenced code blocks, including functions, "
+            "constants, payload construction, parsing/recovery logic, and invocation. Reject omissions hidden behind "
+            "a `.py` link, 'implemented in the script', pseudocode, or ellipses.",
+            "4. Require exactly the small set of decisive real screenshots needed for proof, including at least one "
+            "major vulnerability/fault/core-mechanism screen and one successful exploit/recovery/Flag result screen. "
+            "Check each referenced file and its caption. Do not accept decorative, fabricated, or unrelated images.",
+            "5. If any requirement fails, directly correct `WRITEUP.md` using only preserved evidence. Copy selected "
+            "images into `/challenge/shared/writeup/evidence/` and keep Markdown links self-contained.",
+            "6. After corrections, write `/challenge/shared/writeup/REVIEW.md`. Include a Korean checklist with concrete "
+            "evidence checked and finish with exactly `Verdict: APPROVED` only if every requirement passes. Otherwise "
+            "finish with exactly `Verdict: REJECTED` and list the unresolved evidence gaps.",
+            "7. Atomically replace both Markdown files. Never solve again, submit a flag, invent evidence, or approve "
+            "your own unsupported assumption.",
+            "",
+            "Return a concise structured completion result only after the review artifact has been written.",
         ]
     )

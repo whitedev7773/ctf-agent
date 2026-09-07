@@ -36,7 +36,13 @@ from backend.loop_detect import LoopDetector
 from backend.model_specs import effort_from_spec
 from backend.models import model_id_from_spec, supports_vision
 from backend.output_types import assess_solver_output, solver_output_json_schema
-from backend.prompts import ChallengeMeta, build_prompt, build_writeup_prompt, list_distfiles
+from backend.prompts import (
+    ChallengeMeta,
+    build_prompt,
+    build_writeup_prompt,
+    build_writeup_review_prompt,
+    list_distfiles,
+)
 from backend.sandbox import DockerSandbox
 from backend.solver_base import (
     BUDGET_EXHAUSTED,
@@ -201,7 +207,7 @@ class CodexSolver:
         self.delegate_task_fn = delegate_task_fn
         self.delegate_status_fn = delegate_status_fn
         self.task_directive = task_directive.strip()[:6000]
-        if task_mode not in {"solve", "writeup"}:
+        if task_mode not in {"solve", "writeup", "writeup_review"}:
             raise ValueError(f"unsupported Codex task mode: {task_mode}")
         self.task_mode = task_mode
         self.verified_flag = verified_flag.strip()[:2000]
@@ -221,7 +227,9 @@ class CodexSolver:
             workspace_dir=solver_workspace_path(
                 settings,
                 meta.name,
-                f"{model_spec}/writeup" if task_mode == "writeup" else model_spec,
+                f"{model_spec}/{task_mode.replace('_', '-')}"
+                if task_mode != "solve"
+                else model_spec,
             ),
             shared_workspace_dir=challenge_shared_path(settings, meta.name),
             experience_dir=str(experience_root(settings)),
@@ -240,7 +248,9 @@ class CodexSolver:
             log_dir=getattr(settings, "logs_root", "logs"),
         )
         accounting_spec = (
-            f"{self.model_spec}/writeup" if task_mode == "writeup" else self.model_spec
+            f"{self.model_spec}/{task_mode.replace('_', '-')}"
+            if task_mode != "solve"
+            else self.model_spec
         )
         self.agent_name = solver_agent_name(meta.name, accounting_spec)
 
@@ -264,6 +274,13 @@ class CodexSolver:
         self._turn_active = False
         self._active_tool_calls = 0
         self._last_activity_at = time.monotonic()
+        self._activity_summary = (
+            "풀이 내역을 바탕으로 라이트업 구성을 준비하는 중"
+            if task_mode == "writeup"
+            else "생성된 라이트업의 검수 기준을 준비하는 중"
+            if task_mode == "writeup_review"
+            else ""
+        )
         self._latest_raw_tokens = 0
         self._turn_start_raw_tokens = 0
         self._pending_responses: dict[int, asyncio.Future] = {}
@@ -284,6 +301,8 @@ class CodexSolver:
         distfile_names = list_distfiles(self.challenge_dir)
         if self.task_mode == "writeup":
             system_prompt = build_writeup_prompt(self.meta, self.verified_flag)
+        elif self.task_mode == "writeup_review":
+            system_prompt = build_writeup_review_prompt(self.meta, self.verified_flag)
         else:
             system_prompt = build_prompt(
                 self.meta, distfile_names, container_arch=container_arch,
@@ -330,7 +349,7 @@ class CodexSolver:
 
         # thread/start — system prompt is supplied through baseInstructions
         # Prepend sandbox path reminder to prevent models from using host paths
-        if self.task_mode == "writeup":
+        if self.task_mode in {"writeup", "writeup_review"}:
             allowed = {"bash", "read_file", "write_file", "list_files", "view_image", "web_fetch"}
             dynamic_tools = [tool for tool in SANDBOX_TOOLS if tool["name"] in allowed]
         else:
@@ -439,6 +458,10 @@ class CodexSolver:
     def activity_idle_seconds(self) -> float:
         """Return elapsed wall time since the last app-server or tool activity."""
         return max(0.0, time.monotonic() - self._last_activity_at)
+
+    @property
+    def activity_summary(self) -> str:
+        return self._activity_summary
 
     @property
     def tool_call_active(self) -> bool:
@@ -558,6 +581,17 @@ class CodexSolver:
                     phase = item.get("phase")  # "commentary" | "final_answer" | null
                     if text:
                         self._findings = text[:2000]
+                        if phase == "commentary" and self.task_mode != "solve":
+                            summary = text
+                            if text.lstrip().startswith("{"):
+                                try:
+                                    progress = json.loads(text)
+                                    summary = str(progress.get("method", ""))
+                                except (json.JSONDecodeError, AttributeError, ValueError):
+                                    summary = ""
+                            summary = " ".join(summary.split())[:180]
+                            if summary:
+                                self._activity_summary = summary
                         if phase != "commentary" and text.lstrip()[:1] == "{":
                             try:
                                 parsed = json.loads(text)
@@ -684,6 +718,8 @@ class CodexSolver:
             args = {}
 
         self._step_count += 1
+        if getattr(self, "task_mode", "solve") != "solve":
+            self._activity_summary = self._documentation_tool_activity(tool_name, args)
         self.tracer.tool_call(tool_name, args, self._step_count)
 
         max_steps = solver_step_limit(self.settings, self.model_spec)
@@ -749,6 +785,28 @@ class CodexSolver:
                 f"step budget exhausted during turn ({self._step_count}/{max_steps})",
                 params.get("turnId"),
             )
+
+    def _documentation_tool_activity(self, tool_name: str, args: dict) -> str:
+        """Map low-level tool calls to a compact operator-facing status."""
+        reviewing = self.task_mode == "writeup_review"
+        prefix = "검수: " if reviewing else "작성: "
+        raw_path = str(args.get("path", args.get("filename", ""))).casefold()
+        command = str(args.get("command", "")).casefold()
+        if tool_name == "view_image":
+            detail = "취약점·해결 스크린샷을 확인하는 중"
+        elif tool_name == "write_file" and "review.md" in raw_path:
+            detail = "검수 결과와 승인 여부를 기록하는 중"
+        elif tool_name == "write_file" and "writeup.md" in raw_path:
+            detail = "최종 Markdown을 보강해 저장하는 중"
+        elif tool_name in {"read_file", "list_files"}:
+            detail = "풀이 기록과 증거 파일을 대조하는 중" if reviewing else "풀이 기록과 증거를 읽는 중"
+        elif tool_name == "bash" and ("writeup.md" in command or "review.md" in command):
+            detail = "문서 구조와 증거 링크를 검증하는 중" if reviewing else "Markdown과 증거 링크를 작성하는 중"
+        elif tool_name == "bash":
+            detail = "재현 명령과 핵심 로직을 확인하는 중"
+        else:
+            detail = "문서 근거를 검토하는 중"
+        return prefix + detail
 
     async def _exec_tool(self, name: str, args: dict) -> str | tuple[bytes, str]:
         if name == "bash":
@@ -837,6 +895,11 @@ class CodexSolver:
                 "Generate the final Korean writeup now. Read the preserved solver evidence, write "
                 "/challenge/shared/writeup/WRITEUP.md, and include real decisive screenshots when "
                 "available or reproducible. Do not re-solve or submit the challenge."
+            )
+        elif self.task_mode == "writeup_review":
+            prompt_text = (
+                "Review the generated Korean writeup now. Correct unsupported or incomplete content, verify the "
+                "two decisive screenshot roles and embedded solver code, then write REVIEW.md with the final verdict."
             )
         elif self._step_count == 0:
             prompt_text = "Solve this CTF challenge."

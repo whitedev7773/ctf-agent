@@ -214,6 +214,42 @@
               <option value="high">High · 고비용</option>
             </select>
           </label>
+          <label>
+            <span>라이트업 작성 모델</span>
+            <select id="runtime-writeup-model">
+              <option value="codex/gpt-5.6-terra">GPT-5.6 Terra</option>
+              <option value="codex/gpt-5.6-sol">GPT-5.6 Sol</option>
+              <option value="codex/gpt-5.6-luna">GPT-5.6 Luna</option>
+            </select>
+          </label>
+          <label>
+            <span>작성 effort</span>
+            <select id="runtime-writeup-effort">
+              <option value="low">Low · 비용 절감</option>
+              <option value="medium">Medium</option>
+              <option value="high">High · 기본</option>
+              <option value="xhigh">XHigh</option>
+              <option value="max">Max</option>
+            </select>
+          </label>
+          <label>
+            <span>라이트업 검수 모델</span>
+            <select id="runtime-writeup-review-model">
+              <option value="codex/gpt-5.6-luna">GPT-5.6 Luna</option>
+              <option value="codex/gpt-5.6-terra">GPT-5.6 Terra</option>
+              <option value="codex/gpt-5.6-sol">GPT-5.6 Sol</option>
+            </select>
+          </label>
+          <label>
+            <span>검수 effort</span>
+            <select id="runtime-writeup-review-effort">
+              <option value="low">Low · 비용 절감</option>
+              <option value="medium">Medium · 기본</option>
+              <option value="high">High</option>
+              <option value="xhigh">XHigh</option>
+              <option value="max">Max</option>
+            </select>
+          </label>
           <label class="delegate-concurrency-field">
             <span>동시 Delegate 수</span>
             <input id="runtime-delegate-max-concurrent" type="number" min="0" max="16" step="1" required>

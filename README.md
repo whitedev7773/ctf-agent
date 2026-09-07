@@ -136,7 +136,7 @@ Each solver gets an isolated Docker container pre-loaded with CTF tools:
 - **Approach notes** — challenge details summarize persistent state, blockers, experiments, and audited handoffs without another model call
 
 - **Persistent solve experience** — verified, flag-redacted lessons are promoted into a cross-challenge read-only knowledge store that survives runtime resets
-- **Evidence-backed Korean writeups** — confirmed solves produce a Korean-first canonical writeup, reproducible artifact list, and a gallery of valid screenshots while preserving clear English technical terms
+- **Two-agent, organizer-reviewable Korean writeups** — one Terra-Medium agent drafts a self-contained explanation, then one Luna-Medium agent audits and corrects it before approval. The dashboard shows the live writing/review activity, and the final Markdown, review record, and selected evidence images can be downloaded as one self-contained ZIP
 - **Live Docker telemetry** — CPU, memory, PID, network, block I/O, uptime, limits, peaks, and short history are tracked per solver container
 
 ## Configuration

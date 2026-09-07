@@ -427,11 +427,25 @@ function renderRuntimeSettings(settings) {
     "codex/gpt-5.6-luna",
     "low",
   );
+  const writeup = splitModelSpec(
+    settings.writeup_model_spec,
+    "codex/gpt-5.6-terra",
+    "medium",
+  );
+  const writeupReview = splitModelSpec(
+    settings.writeup_review_model_spec,
+    "codex/gpt-5.6-luna",
+    "medium",
+  );
   state.runtimeModels = models;
   selectValue(byId("runtime-primary-model"), primary.base);
   selectValue(byId("runtime-primary-effort"), primary.effort);
   selectValue(byId("runtime-delegate-model"), delegate.base);
   selectValue(byId("runtime-delegate-effort"), delegate.effort);
+  selectValue(byId("runtime-writeup-model"), writeup.base);
+  selectValue(byId("runtime-writeup-effort"), writeup.effort);
+  selectValue(byId("runtime-writeup-review-model"), writeupReview.base);
+  selectValue(byId("runtime-writeup-review-effort"), writeupReview.effort);
   byId("runtime-container-memory-limit").value = settings.container_memory_limit ?? "4g";
   byId("runtime-dynamic-delegation-enabled").checked = Boolean(
     settings.dynamic_delegation_enabled,
@@ -462,6 +476,8 @@ function runtimeSettingsFromForm() {
     container_memory_limit: byId("runtime-container-memory-limit").value.trim(),
     dynamic_delegation_enabled: byId("runtime-dynamic-delegation-enabled").checked,
     delegate_model_spec: `${byId("runtime-delegate-model").value}/${byId("runtime-delegate-effort").value}`,
+    writeup_model_spec: `${byId("runtime-writeup-model").value}/${byId("runtime-writeup-effort").value}`,
+    writeup_review_model_spec: `${byId("runtime-writeup-review-model").value}/${byId("runtime-writeup-review-effort").value}`,
   };
   for (const field of runtimeNumericFields) {
     result[runtimeFieldKey(field)] = Number(byId(`runtime-${field}`).value);
@@ -742,7 +758,7 @@ function buildWriteupSection(challenge) {
       "strong",
       "",
       isGenerating
-        ? "라이트업 생성 중"
+        ? `${writeup.phase_label || "라이트업 생성"} 중`
         : challenge.documented
           ? "DOCUMENTED"
           : challenge.solved
@@ -753,13 +769,14 @@ function buildWriteupSection(challenge) {
       "span",
       "",
       isGenerating
-        ? `${writeup.model_spec || "AI"}가 한국어 최종본과 스크린샷을 구성하고 있습니다.`
+        ? `${writeup.activity || "작업 내용을 준비하는 중"} · ${writeup.phase === "reviewing" ? writeup.review_model_spec : writeup.model_spec || "AI"} · 도구 실행 ${writeup.steps || 0}회 · ${writeup.idle_seconds == null ? "에이전트 시작 중" : `마지막 활동 ${Math.floor(writeup.idle_seconds)}초 전 (무응답 ${writeup.idle_timeout_seconds}초 후 중단)`}`
         : `${(writeup.reproducers || []).length} reproducers · ${(writeup.screenshots || []).length} screenshots`,
     ),
   );
   const actions = node("div", "writeup-actions");
   if (writeup.writeup_path) {
     actions.append(button("Writeup 보기", "secondary-button", () => loadWriteup(challenge.name)));
+    actions.append(button("Markdown + 사진 ZIP", "secondary-button", () => downloadWriteupArchive(challenge.name)));
   }
   if (challenge.solved) {
     const requestLabel = isGenerating
@@ -812,6 +829,11 @@ async function loadWriteup(challengeName) {
   } catch (error) {
     toast(error.message, "error");
   }
+}
+
+function downloadWriteupArchive(challengeName) {
+  const params = new URLSearchParams({ challenge: challengeName });
+  window.location.assign(`/api/writeup/archive?${params}`);
 }
 
 async function requestWriteup(challengeName, control) {

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import re
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -372,10 +374,10 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         (lead / "solve.py").write_text("print('reproduced')\n", encoding="utf-8")
         generation_started = asyncio.Event()
         finish_generation = asyncio.Event()
+        review_started = asyncio.Event()
+        finish_review = asyncio.Event()
 
         class FakeWriteupSolver:
-            model_spec = "codex/gpt-5.6-luna/low"
-            agent_name = "web/intro/codex/gpt-5.6-luna/low/writeup"
             _step_count = 1
             tracer = SimpleNamespace(path="writeup-trace.jsonl")
             sandbox = SimpleNamespace(
@@ -383,10 +385,32 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
                 resource_snapshot=lambda: {"status": "running"},
             )
 
+            def __init__(self, task_mode: str):
+                self.task_mode = task_mode
+                self.model_spec = (
+                    "codex/gpt-5.6-luna/medium"
+                    if task_mode == "writeup_review"
+                    else "codex/gpt-5.6-terra/medium"
+                )
+                self.agent_name = f"web/intro/{self.model_spec}/{task_mode}"
+                self.activity_summary = (
+                    "검수: 핵심 코드와 증거 화면을 대조하는 중"
+                    if task_mode == "writeup_review"
+                    else "작성: 풀이 과정과 핵심 코드를 작성하는 중"
+                )
+
             async def run_until_done_or_gave_up(self):
+                output = shared / "writeup"
+                if self.task_mode == "writeup_review":
+                    review_started.set()
+                    await finish_review.wait()
+                    (output / "REVIEW.md").write_text(
+                        "# 독립 검수\n\n모든 근거와 이미지를 대조했습니다.\n\nVerdict: APPROVED\n",
+                        encoding="utf-8",
+                    )
+                    return SimpleNamespace(status="gave_up")
                 generation_started.set()
                 await finish_generation.wait()
-                output = shared / "writeup"
                 evidence = output / "evidence"
                 evidence.mkdir(parents=True, exist_ok=True)
                 (output / "WRITEUP.md").write_text(
@@ -394,20 +418,40 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
                     "## 요약\n인증 검사가 누락된 요청 경로를 이용해 관리자 전용 응답을 확인한 문제입니다.\n\n"
                     "## 취약점 또는 핵심 원리\n서버가 요청의 권한 정보를 검증하지 않아 일반 사용자 입력이 관리자 처리 경로에 도달했습니다.\n\n"
                     "## 풀이 과정\n보존된 요청과 응답을 비교해 권한 검사 누락 지점을 찾고 조작한 요청을 두 번 전송해 같은 결과를 확인했습니다.\n\n"
+                    "```python\n"
+                    "import requests\n\n"
+                    "def exploit(base_url):\n"
+                    "    session = requests.Session()\n"
+                    "    session.post(f'{base_url}/login', data={'user': 'guest'})\n"
+                    "    response = session.get(f'{base_url}/admin', headers={'X-Role': 'admin'})\n"
+                    "    response.raise_for_status()\n"
+                    "    assert 'administrator' in response.text\n"
+                    "    return response.text\n\n"
+                    "print(exploit('http://challenge'))\n"
+                    "```\n\n"
                     "## 재현 방법\n```sh\npython solve.py\n```\n\n"
-                    "## 검증\n재현 스크립트 실행 결과 관리자 응답과 검증된 결과가 일치했습니다.\n",
+                    "## 검증\n재현 스크립트 실행 결과 관리자 응답과 검증된 결과가 일치했습니다.\n\n"
+                    "## 주요 스크린샷\n\n"
+                    "### 핵심 취약점 증거\n권한 검사 없이 관리자 응답이 반환되는 화면입니다.\n\n"
+                    "![핵심 취약점](evidence/missing-auth-check.png)\n\n"
+                    "### 해결 성공 및 Flag 결과\n동일 요청으로 최종 성공 결과를 확인한 화면입니다.\n\n"
+                    "![해결 성공 결과](evidence/admin-response.png)\n",
                     encoding="utf-8",
                 )
                 (evidence / "admin-response.png").write_bytes(
                     b"\x89PNG\r\n\x1a\n" + b"0" * 24
+                )
+                (evidence / "missing-auth-check.png").write_bytes(
+                    b"\x89PNG\r\n\x1a\n" + b"1" * 24
                 )
                 return SimpleNamespace(status="gave_up")
 
             async def stop(self):
                 return None
 
-        fake_solver = FakeWriteupSolver()
-        self.server._create_writeup_solver = MagicMock(return_value=fake_solver)
+        self.server._create_writeup_solver = MagicMock(
+            side_effect=lambda *args, task_mode="writeup", **kwargs: FakeWriteupSolver(task_mode)
+        )
         async with self.client.get(f"{self.base_url}/api/session") as response:
             token = (await response.json())["csrf_token"]
 
@@ -431,6 +475,10 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 202)
         self.assertEqual(payload["writeup"]["status"], "generating")
+        self.assertTrue(payload["writeup"]["writeup_path"])
+        seeded = shared / "writeup" / "WRITEUP.md"
+        self.assertTrue(seeded.is_file())
+        self.assertIn("복구된 풀이", seeded.read_text(encoding="utf-8"))
         await generation_started.wait()
         task = self.server._writeup_tasks["web/intro"]
 
@@ -438,6 +486,8 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             generating = await response.json()
         self.assertEqual(generating["challenges"][0]["writeup"]["status"], "generating")
         self.assertTrue(generating["challenges"][0]["writeup"]["active"])
+        self.assertEqual(generating["challenges"][0]["writeup"]["phase"], "writing")
+        self.assertIn("풀이 과정", generating["challenges"][0]["writeup"]["activity"])
 
         async with self.client.post(
             endpoint,
@@ -447,6 +497,12 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 409)
 
         finish_generation.set()
+        await review_started.wait()
+        async with self.client.get(f"{self.base_url}/api/status") as response:
+            reviewing = await response.json()
+        self.assertEqual(reviewing["challenges"][0]["writeup"]["phase"], "reviewing")
+        self.assertIn("핵심 코드", reviewing["challenges"][0]["writeup"]["activity"])
+        finish_review.set()
         await task
 
         async with self.client.get(
@@ -457,8 +513,117 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertTrue(recovered["writeup"]["documented"])
         self.assertEqual(recovered["writeup"]["status"], "complete")
-        self.assertEqual(len(recovered["writeup"]["screenshots"]), 1)
+        self.assertEqual(len(recovered["writeup"]["screenshots"]), 2)
         self.assertIn("## 주요 스크린샷", recovered["content"])
+        self.assertTrue(recovered["writeup"]["reviewed"])
+
+        async with self.client.get(
+            f"{self.base_url}/api/writeup/archive",
+            params={"challenge": "web/intro"},
+        ) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.content_type, "application/zip")
+            archive_bytes = await response.read()
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            self.assertEqual(
+                set(archive.namelist()),
+                {
+                    "WRITEUP.md",
+                    "REVIEW.md",
+                    "evidence/admin-response.png",
+                    "evidence/missing-auth-check.png",
+                },
+            )
+            archived_writeup = archive.read("WRITEUP.md").decode("utf-8")
+            self.assertIn("](evidence/admin-response.png)", archived_writeup)
+
+    async def test_writeup_initialization_failure_is_persisted_and_retryable(self) -> None:
+        self.server._create_writeup_solver = MagicMock(side_effect=OSError("disk unavailable"))
+        await self.server.start_writeup_generation("web/intro")
+        task = self.server._writeup_tasks["web/intro"]
+        await task
+        status = self.server._current_writeup_status("web/intro", solved=True)
+        self.assertEqual(status["status"], "needs_attention")
+        self.assertIn("disk unavailable", " ".join(status["issues"]))
+        self.assertNotIn("web/intro", self.server._writeup_tasks)
+        self.assertNotIn("web/intro", self.server._writeup_solvers)
+
+    async def test_writeup_idle_job_is_cancelled_and_preserves_existing_document(self) -> None:
+        root = Path(challenge_workspace_path(self.deps.settings, "web/intro"))
+        document = root / "_shared" / "writeup" / "WRITEUP.md"
+        document.parent.mkdir(parents=True)
+        document.write_text("기존 문서", encoding="utf-8")
+        cancelled = asyncio.Event()
+
+        async def hang():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        solver = SimpleNamespace(
+            run_until_done_or_gave_up=hang,
+            activity_idle_seconds=lambda: 301,
+            stop=AsyncMock(),
+            _step_count=3,
+        )
+        self.server._create_writeup_solver = MagicMock(return_value=solver)
+        await self.server.start_writeup_generation("web/intro")
+        task = self.server._writeup_tasks["web/intro"]
+        await asyncio.sleep(0)
+        active = self.server._current_writeup_status("web/intro", solved=True)
+        self.assertEqual(active["steps"], 3)
+        self.assertEqual(active["idle_seconds"], 301)
+        self.assertTrue(active["last_activity_at"])
+        await asyncio.wait_for(task, timeout=5)
+        self.assertTrue(cancelled.is_set())
+        solver.stop.assert_awaited_once()
+        status = self.server._current_writeup_status("web/intro", solved=True)
+        self.assertEqual(status["status"], "needs_attention")
+        self.assertFalse(status["active"])
+        self.assertIn("300초", " ".join(status["issues"]))
+        self.assertEqual(document.read_text(encoding="utf-8"), "기존 문서")
+
+    async def test_writeup_reader_failure_does_not_wait_for_hard_timeout(self) -> None:
+        reader = asyncio.get_running_loop().create_future()
+        reader.set_exception(ValueError("invalid response"))
+        solver = SimpleNamespace(
+            run_until_done_or_gave_up=asyncio.Event().wait,
+            activity_idle_seconds=lambda: 0,
+            _reader_task=reader,
+        )
+        with self.assertRaisesRegex(RuntimeError, "수신기"):
+            await asyncio.wait_for(self.server._wait_for_writeup(solver), timeout=5)
+
+    async def test_writeup_active_job_completes_under_watchdog(self) -> None:
+        result = SimpleNamespace(status="incomplete")
+        solver = SimpleNamespace(
+            run_until_done_or_gave_up=AsyncMock(return_value=result),
+            activity_idle_seconds=lambda: 0,
+        )
+        self.assertIs(await self.server._wait_for_writeup(solver), result)
+
+    async def test_writeup_watchdog_cancellation_drains_child_job(self) -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def hang():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        solver = SimpleNamespace(
+            run_until_done_or_gave_up=hang,
+            activity_idle_seconds=lambda: 0,
+        )
+        task = asyncio.create_task(self.server._wait_for_writeup(solver))
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(cancelled.is_set())
 
     async def test_dashboard_mutation_requires_session_token(self) -> None:
         endpoint = f"{self.base_url}/api/operator/message"
@@ -525,6 +690,13 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 200)
         self.assertEqual(payload["settings"]["models"], ["codex/gpt-5.6-sol/high"])
+        self.assertEqual(
+            payload["settings"]["writeup_model_spec"], "codex/gpt-5.6-terra/medium"
+        )
+        self.assertEqual(
+            payload["settings"]["writeup_review_model_spec"],
+            "codex/gpt-5.6-luna/medium",
+        )
         self.assertEqual(self.deps.model_specs, ["codex/gpt-5.6-sol/high"])
         self.assertEqual(self.deps.max_concurrent_challenges, 2)
         self.assertEqual(self.deps.settings.solver_max_estimated_cost_usd, 1.25)

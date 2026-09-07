@@ -17,6 +17,33 @@ _MAX_IMAGE_BYTES = 5 * 1024 * 1024
 _MAX_IMAGES = 8
 _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`]+`")
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((?:<)?([^)>\s]+)(?:>)?(?:\s+[^)]*)?\)")
+_REQUIRED_REVIEW_SECTIONS = (
+    "요약",
+    "취약점 또는 핵심 원리",
+    "풀이 과정",
+    "재현 방법",
+    "검증",
+    "주요 스크린샷",
+)
+_CORE_EVIDENCE_WORDS = (
+    "취약점",
+    "핵심 원리",
+    "원인",
+    "공격 지점",
+    "분석 근거",
+    "고장",
+    "결함",
+    "손상",
+    "우회",
+)
+_SUCCESS_EVIDENCE_WORDS = ("해결", "성공", "플래그", "flag", "정답", "결과", "복구")
+_CODE_OMISSION_RE = re.compile(
+    r"(?:코드|로직|구현|exploit|payload).{0,40}(?:생략|파일을? 참고|스크립트를? 참고)|"
+    r"(?:\.py|\.sage|\.sh|\.js).{0,30}(?:에 작성|에 구현).{0,30}(?:생략|참고)",
+    re.IGNORECASE | re.DOTALL,
+)
+_APPROVED_REVIEW_RE = re.compile(r"(?im)^Verdict:\s*APPROVED\s*$")
 
 
 def _has_korean_narrative(text: str, minimum_characters: int = 20) -> bool:
@@ -24,6 +51,74 @@ def _has_korean_narrative(text: str, minimum_characters: int = 20) -> bool:
     prose = _CODE_BLOCK_RE.sub(" ", text)
     prose = _INLINE_CODE_RE.sub(" ", prose)
     return len(re.findall(r"[가-힣]", prose)) >= minimum_characters
+
+
+def _section_body(text: str, title: str) -> str:
+    match = re.search(
+        rf"(?ms)^##\s+{re.escape(title)}\s*$\n(.*?)(?=^##\s+|\Z)",
+        text,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _substantive_code_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
+    for raw in _CODE_BLOCK_RE.findall(text):
+        body = raw[3:-3].strip()
+        lines = body.splitlines()
+        if lines and re.fullmatch(r"[A-Za-z0-9_+.-]+", lines[0].strip()):
+            lines = lines[1:]
+        code = "\n".join(lines).strip()
+        if len(code) >= 240 and len(lines) >= 8:
+            blocks.append(code)
+    return blocks
+
+
+def _referenced_screenshot_paths(report: str, writeup_path: Path, root: Path) -> list[Path]:
+    section = _section_body(report, "주요 스크린샷")
+    selected: list[Path] = []
+    seen: set[Path] = set()
+    for _label, raw_path in _MARKDOWN_IMAGE_RE.findall(section):
+        if re.match(r"^[a-z][a-z0-9+.-]*://", raw_path, re.IGNORECASE):
+            continue
+        try:
+            path = (writeup_path.parent / raw_path).resolve()
+        except OSError:
+            continue
+        if path in seen or not path.is_relative_to(root) or not _valid_image(path):
+            continue
+        seen.add(path)
+        selected.append(path)
+    return selected
+
+
+def _review_quality_issues(
+    report: str,
+    writeup_path: Path,
+    root: Path,
+    reproducers: list[Path],
+) -> tuple[list[str], list[Path]]:
+    """Apply the organizer-facing proof standard to an AI-authored document."""
+    issues: list[str] = []
+    missing_sections = [title for title in _REQUIRED_REVIEW_SECTIONS if not _section_body(report, title)]
+    if missing_sections:
+        issues.append("대회 관계자 검토에 필요한 절이 빠졌습니다: " + ", ".join(missing_sections))
+
+    if reproducers and not _substantive_code_blocks(report):
+        issues.append("핵심 exploit/solver 로직 전체를 본문 code block에 포함해야 합니다")
+    if _CODE_OMISSION_RE.search(_CODE_BLOCK_RE.sub(" ", report)):
+        issues.append("외부 .py 또는 스크립트를 이유로 중요한 코드나 로직을 생략할 수 없습니다")
+
+    screenshot_section = _section_body(report, "주요 스크린샷")
+    selected_images = _referenced_screenshot_paths(report, writeup_path, root)
+    if len(selected_images) < 2:
+        issues.append("서로 다른 실제 화면으로 핵심 원리/취약점과 해결 성공 결과를 각각 증명해야 합니다")
+    lowered = screenshot_section.casefold()
+    if not any(word.casefold() in lowered for word in _CORE_EVIDENCE_WORDS):
+        issues.append("주요 스크린샷에 핵심 원리 또는 취약점 증거 화면과 설명이 없습니다")
+    if not any(word.casefold() in lowered for word in _SUCCESS_EVIDENCE_WORDS):
+        issues.append("주요 스크린샷에 해결 성공 또는 Flag 결과 화면과 설명이 없습니다")
+    return issues, selected_images
 
 
 def _valid_image(path: Path) -> bool:
@@ -49,11 +144,17 @@ def _relative(path: Path, root: Path) -> str:
 
 def _discover_images(root: Path) -> list[Path]:
     candidates: list[tuple[int, int, Path]] = []
+    seen_hashes: set[str] = set()
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.casefold() not in _IMAGE_SUFFIXES:
             continue
         if not _valid_image(path):
             continue
+        digest = _file_sha256(path)
+        if digest and digest in seen_hashes:
+            continue
+        if digest:
+            seen_hashes.add(digest)
         try:
             stat = path.stat()
         except OSError:
@@ -66,6 +167,16 @@ def _discover_images(root: Path) -> list[Path]:
             score += 30
         candidates.append((score, stat.st_mtime_ns, path))
     return [item[2] for item in sorted(candidates, reverse=True)[:_MAX_IMAGES]]
+
+
+def _image_manifest_entry(path: Path, root: Path) -> dict[str, Any]:
+    """Return bounded, auditable metadata without trusting image contents."""
+    return {
+        "path": _relative(path, root),
+        "caption": path.stem.replace("-", " ").replace("_", " ")[:160],
+        "size_bytes": path.stat().st_size,
+        "sha256": _file_sha256(path),
+    }
 
 
 def _discover_reproducers(root: Path) -> list[Path]:
@@ -129,12 +240,14 @@ def begin_writeup_generation(
     settings: object,
     challenge_name: str,
     model_spec: str,
+    review_model_spec: str = "",
 ) -> dict[str, Any]:
     """Persist a restart-visible generating state before starting the model."""
     root = Path(challenge_workspace_path(settings, challenge_name))
     output_dir = root / "_shared" / "writeup"
     output_dir.mkdir(parents=True, exist_ok=True)
     writeup_path = output_dir / "WRITEUP.md"
+    review_path = output_dir / "REVIEW.md"
     images = _discover_images(root)
     reproducers = _discover_reproducers(root)
     now = datetime.now(UTC).isoformat()
@@ -145,22 +258,41 @@ def begin_writeup_generation(
         "started_at": now,
         "updated_at": now,
         "model_spec": model_spec,
+        "review_model_spec": review_model_spec,
+        "phase": "writing",
         "writeup_path": _relative(writeup_path, root) if writeup_path.is_file() else "",
+        "review_path": _relative(review_path, root) if review_path.is_file() else "",
         "source_path": "",
         "previous_writeup_sha256": _file_sha256(writeup_path),
+        "previous_review_sha256": _file_sha256(review_path),
         "issues": [],
-        "screenshots": [
-            {
-                "path": _relative(path, root),
-                "caption": path.stem.replace("-", " ").replace("_", " ")[:160],
-                "size_bytes": path.stat().st_size,
-            }
-            for path in images
-        ],
+        "screenshots": [_image_manifest_entry(path, root) for path in images],
         "reproducers": [_relative(path, root) for path in reproducers],
     }
     _atomic_json(output_dir / "manifest.json", payload)
     return payload
+
+
+def seed_writeup_from_solver_evidence(
+    settings: object,
+    challenge_name: str,
+    category: str,
+    flag: str = "",
+) -> dict[str, Any] | None:
+    """Create a readable fallback before starting the asynchronous AI editor.
+
+    A writeup model can be interrupted, time out, or leave its turn open. Keep
+    the solver's evidence usable in all of those cases, while never replacing a
+    canonical document produced by an earlier successful generation.
+    """
+    root = Path(challenge_workspace_path(settings, challenge_name))
+    writeup_path = root / "_shared" / "writeup" / "WRITEUP.md"
+    if writeup_path.is_file():
+        return None
+    source, _ = _source_report(root)
+    if source is None:
+        return None
+    return finalize_writeup(settings, challenge_name, category, flag)
 
 
 def fail_writeup_generation(
@@ -209,29 +341,6 @@ def interrupted_writeup_status(payload: dict[str, Any]) -> dict[str, Any]:
     return recovered
 
 
-def _append_screenshot_gallery(writeup_path: Path, root: Path, images: list[Path]) -> str:
-    report = writeup_path.read_text(encoding="utf-8", errors="replace")[:500_000]
-    missing = [path for path in images if path.name not in report]
-    if not missing:
-        return report
-    lines = [report.rstrip(), ""]
-    if "## 주요 스크린샷" not in report:
-        lines.extend(["## 주요 스크린샷", ""])
-    for index, path in enumerate(missing, 1):
-        relative = _relative(path, root)
-        lines.extend(
-            [
-                f"### 증거 {index}: {path.stem}",
-                "",
-                f"![{path.stem}](../../{relative})",
-                "",
-            ]
-        )
-    report = "\n".join(lines).rstrip() + "\n"
-    _atomic_text(writeup_path, report)
-    return report
-
-
 def finalize_writeup(
     settings: object,
     challenge_name: str,
@@ -240,6 +349,7 @@ def finalize_writeup(
     *,
     prefer_canonical: bool = False,
     require_screenshots: bool = False,
+    require_review: bool = False,
 ) -> dict[str, Any]:
     """Assemble a canonical writeup without inventing evidence."""
     root = Path(challenge_workspace_path(settings, challenge_name))
@@ -247,9 +357,11 @@ def finalize_writeup(
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "manifest.json"
     writeup_path = output_dir / "WRITEUP.md"
+    review_path = output_dir / "REVIEW.md"
     source, report = _source_report(root, prefer_canonical=prefer_canonical)
     images = _discover_images(root)
     reproducers = _discover_reproducers(root)
+    manifest_images = images
     try:
         generation_state = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -278,8 +390,31 @@ def finalize_writeup(
     ):
         issues.append("AI가 최종 라이트업 파일을 갱신하지 못했습니다")
 
-    if source == writeup_path and images:
-        report = _append_screenshot_gallery(writeup_path, root, images)
+    if prefer_canonical and source == writeup_path:
+        quality_issues, selected_images = _review_quality_issues(
+            report,
+            writeup_path,
+            root,
+            reproducers,
+        )
+        issues.extend(issue for issue in quality_issues if issue not in issues)
+        manifest_images = selected_images
+
+    review_approved = False
+    if require_review:
+        try:
+            review = review_path.read_text(encoding="utf-8", errors="replace")[:100_000]
+        except OSError:
+            review = ""
+        review_approved = bool(_APPROVED_REVIEW_RE.search(review))
+        if not review_approved:
+            issues.append("Luna 검수 결과가 없거나 APPROVED가 아닙니다")
+        elif (
+            generation_state.get("previous_review_sha256")
+            and generation_state.get("previous_review_sha256") == _file_sha256(review_path)
+        ):
+            review_approved = False
+            issues.append("Luna 검수 에이전트가 REVIEW.md를 갱신하지 못했습니다")
 
     if source != writeup_path and not prefer_canonical:
         source_label = _relative(source, root) if source else "none"
@@ -335,17 +470,14 @@ def finalize_writeup(
         "started_at": generation_state.get("started_at", ""),
         "updated_at": datetime.now(UTC).isoformat(),
         "model_spec": generation_state.get("model_spec", ""),
+        "review_model_spec": generation_state.get("review_model_spec", ""),
+        "phase": "complete" if status == "complete" else "needs_attention",
+        "reviewed": review_approved,
         "writeup_path": _relative(writeup_path, root) if writeup_path.is_file() else "",
+        "review_path": _relative(review_path, root) if review_path.is_file() else "",
         "source_path": _relative(source, root) if source else "",
         "issues": issues,
-        "screenshots": [
-            {
-                "path": _relative(path, root),
-                "caption": path.stem.replace("-", " ").replace("_", " ")[:160],
-                "size_bytes": path.stat().st_size,
-            }
-            for path in images
-        ],
+        "screenshots": [_image_manifest_entry(path, root) for path in manifest_images],
         "reproducers": [_relative(path, root) for path in reproducers],
     }
     _atomic_json(manifest_path, payload)
