@@ -46,6 +46,43 @@ async def list_files(ctx: RunContext[SolverDeps], path: str = "/challenge/distfi
     return await do_list_files(ctx.deps.sandbox, path)
 
 
+async def session_open(ctx: RunContext[SolverDeps], command: str) -> str:
+    """Open a persistent interactive PTY and return its session ID."""
+    return await ctx.deps.sandbox.session_open(command)
+
+
+async def session_send(ctx: RunContext[SolverDeps], session_id: str, data: str) -> str:
+    """Send text or control bytes to a persistent PTY."""
+    await ctx.deps.sandbox.session_send(session_id, data)
+    return "SESSION INPUT SENT"
+
+
+async def session_read(
+    ctx: RunContext[SolverDeps],
+    session_id: str,
+    wait_seconds: float = 0.25,
+    max_output_chars: int = 12_000,
+) -> str:
+    """Read currently available PTY output without closing the process."""
+    return await ctx.deps.sandbox.session_read(
+        session_id,
+        wait_seconds=wait_seconds,
+        max_output_chars=max_output_chars,
+    )
+
+
+async def session_interrupt(ctx: RunContext[SolverDeps], session_id: str) -> str:
+    """Send Ctrl-C to an interactive PTY."""
+    await ctx.deps.sandbox.session_interrupt(session_id)
+    return "SESSION INTERRUPTED"
+
+
+async def session_close(ctx: RunContext[SolverDeps], session_id: str) -> str:
+    """Close a persistent PTY."""
+    await ctx.deps.sandbox.session_close(session_id)
+    return "SESSION CLOSED"
+
+
 async def check_findings(ctx: RunContext[SolverDeps]) -> str:
     """Check for new findings from other agents working on the same challenge.
 

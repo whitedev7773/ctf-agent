@@ -6,6 +6,7 @@ import asyncio
 import io
 import logging
 import posixpath
+import secrets
 import shlex
 import tarfile
 import tempfile
@@ -80,6 +81,20 @@ class ExecResult:
 
 
 @dataclass
+class InteractiveSession:
+    id: str
+    command: str
+    exec_instance: Any
+    stream: Any
+    reader_task: asyncio.Task[None] | None = None
+    pending: bytearray = field(default_factory=bytearray)
+    output_event: asyncio.Event = field(default_factory=asyncio.Event)
+    created_at: float = field(default_factory=time.monotonic)
+    last_activity_at: float = field(default_factory=time.monotonic)
+    closed: bool = False
+
+
+@dataclass
 class DockerSandbox:
     """Isolated Docker container for a single solver agent."""
 
@@ -93,6 +108,9 @@ class DockerSandbox:
     experience_dir: str = ""
     keep_workspace: bool = False
     resource_sample_interval_s: float = 2.0
+    max_sessions: int = 4
+    session_ttl_seconds: int = 900
+    session_buffer_bytes: int = 200_000
     _container: Any = field(default=None, repr=False)
     _docker: Any = field(default=None, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -103,6 +121,8 @@ class DockerSandbox:
     )
     _resource_snapshot: dict[str, Any] = field(default_factory=dict, repr=False)
     _started_monotonic: float = field(default=0.0, repr=False)
+    _sessions: dict[str, InteractiveSession] = field(default_factory=dict, repr=False)
+    _session_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     @property
     def container_id(self) -> str:
@@ -351,6 +371,128 @@ class DockerSandbox:
                 # Container was deleted (e.g., sibling solver found the flag)
                 return ExecResult(exit_code=-1, stdout="", stderr=f"Container gone: {e}")
 
+    async def _session_reader(self, session: InteractiveSession) -> None:
+        try:
+            while not session.closed:
+                message = await session.stream.read_out()
+                if message is None:
+                    break
+                session.pending.extend(message.data)
+                overflow = len(session.pending) - max(1024, self.session_buffer_bytes)
+                if overflow > 0:
+                    del session.pending[:overflow]
+                session.last_activity_at = time.monotonic()
+                session.output_event.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            session.pending.extend(f"\n[session reader error: {exc}]\n".encode())
+            session.output_event.set()
+        finally:
+            session.closed = True
+            session.output_event.set()
+
+    async def _prune_sessions(self) -> None:
+        now = time.monotonic()
+        expired = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if session.closed or now - session.last_activity_at > self.session_ttl_seconds
+        ]
+        for session_id in expired:
+            await self.session_close(session_id)
+
+    async def session_open(self, command: str) -> str:
+        """Open a bounded interactive TTY inside the existing container."""
+        if not self._container:
+            raise RuntimeError("Sandbox not started")
+        command = command.strip()[:8000]
+        if not command:
+            raise ValueError("session command is required")
+        await self._prune_sessions()
+        async with self._session_lock:
+            if len(self._sessions) >= max(1, self.max_sessions):
+                raise RuntimeError(f"interactive session limit reached ({self.max_sessions})")
+            exec_instance = await self._container.exec(
+                cmd=["bash", "-lc", command],
+                stdout=True,
+                stderr=True,
+                stdin=True,
+                tty=True,
+                workdir="/challenge",
+            )
+            stream = exec_instance.start(detach=False)
+            initializer = getattr(stream, "_init", None)
+            if callable(initializer):
+                await asyncio.wait_for(initializer(), timeout=15)
+            session_id = f"S-{secrets.token_hex(6)}"
+            session = InteractiveSession(
+                id=session_id,
+                command=command,
+                exec_instance=exec_instance,
+                stream=stream,
+            )
+            self._sessions[session_id] = session
+            session.reader_task = asyncio.create_task(
+                self._session_reader(session),
+                name=f"sandbox-session-{session_id}",
+            )
+            return session_id
+
+    def _get_session(self, session_id: str) -> InteractiveSession:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"unknown session: {session_id}")
+        return session
+
+    async def session_send(self, session_id: str, data: str) -> None:
+        session = self._get_session(session_id)
+        if session.closed:
+            raise RuntimeError(f"session is closed: {session_id}")
+        await session.stream.write_in(data.encode("utf-8", errors="replace"))
+        session.last_activity_at = time.monotonic()
+
+    async def session_read(
+        self,
+        session_id: str,
+        *,
+        wait_seconds: float = 0.25,
+        max_output_chars: int = 12_000,
+    ) -> str:
+        session = self._get_session(session_id)
+        if not session.pending and not session.closed and wait_seconds > 0:
+            try:
+                await asyncio.wait_for(session.output_event.wait(), timeout=min(wait_seconds, 5.0))
+            except TimeoutError:
+                pass
+        raw = bytes(session.pending)
+        session.pending.clear()
+        session.output_event.clear()
+        session.last_activity_at = time.monotonic()
+        text = raw.decode("utf-8", errors="replace")
+        limit = max(100, min(int(max_output_chars), 100_000))
+        if len(text) > limit:
+            text = f"[...truncated {len(text) - limit} chars...]\n" + text[-limit:]
+        status = "closed" if session.closed else "running"
+        return f"[session {session_id} {status}]\n{text or '(no new output)'}"
+
+    async def session_interrupt(self, session_id: str) -> None:
+        await self.session_send(session_id, "\x03")
+
+    async def session_close(self, session_id: str) -> None:
+        async with self._session_lock:
+            session = self._sessions.pop(session_id, None)
+        if session is None:
+            return
+        session.closed = True
+        try:
+            await session.stream.close()
+        except Exception:
+            pass
+        if session.reader_task and session.reader_task is not asyncio.current_task():
+            session.reader_task.cancel()
+            await asyncio.gather(session.reader_task, return_exceptions=True)
+
     async def _exec_inner(self, command: str, timeout_s: int) -> ExecResult:
         # Wrap command with `timeout` so the container kills the process on expiry.
         # --signal=KILL ensures hard kill; --kill-after=5 is a safety net.
@@ -470,6 +612,8 @@ class DockerSandbox:
         Path(host_path).write_bytes(data)
 
     async def stop(self) -> None:
+        for session_id in list(self._sessions):
+            await self.session_close(session_id)
         if self._resource_task:
             self._resource_task.cancel()
             await asyncio.gather(self._resource_task, return_exceptions=True)

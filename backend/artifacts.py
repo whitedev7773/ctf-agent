@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 _STATE_FILES = {".ctf-agent-state.json", ".ctf-agent-state.tmp"}
 _HIGH_VALUE_PREFIXES = (
@@ -239,6 +242,68 @@ def handoff_quality_issues(path: str | Path) -> list[str]:
     if "/challenge/workspace/" in folded:
         issues.append("references private delegate workspace; copy reproducible artifacts to shared")
     return issues
+
+
+@dataclass(frozen=True)
+class ReproducerSpec:
+    command: str
+    exit_code: int = 0
+    stdout_contains: str = ""
+    timeout_seconds: int = 120
+
+
+def handoff_reproducer(path: str | Path) -> ReproducerSpec | None:
+    """Extract a bounded machine-readable reproducer from a delegate handoff."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")[:100_000]
+    except OSError:
+        return None
+    blocks = re.findall(r"```(?:ya?ml)?\s*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    for block in blocks:
+        try:
+            payload = yaml.safe_load(block)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw = payload.get("reproducer", payload)
+        if not isinstance(raw, dict) or not isinstance(raw.get("command"), str):
+            continue
+        expect = raw.get("expect") if isinstance(raw.get("expect"), dict) else {}
+        command = raw["command"].strip()[:8000]
+        if not command:
+            continue
+        try:
+            exit_code = int(expect.get("exit_code", 0))
+            timeout_seconds = max(1, min(int(raw.get("timeout_seconds", 120)), 600))
+        except (TypeError, ValueError):
+            continue
+        stdout_contains = str(expect.get("stdout_contains", ""))[:2000].strip()
+        if not stdout_contains:
+            continue
+        return ReproducerSpec(
+            command=command,
+            exit_code=exit_code,
+            stdout_contains=stdout_contains,
+            timeout_seconds=timeout_seconds,
+        )
+    return None
+
+
+async def verify_handoff_reproducer(sandbox, path: str | Path) -> tuple[bool, str]:
+    spec = handoff_reproducer(path)
+    if spec is None:
+        return False, "missing machine-readable YAML reproducer"
+    try:
+        result = await sandbox.exec(spec.command, timeout_s=spec.timeout_seconds)
+    except Exception as exc:
+        return False, f"reproducer execution error: {exc}"
+    if result.exit_code != spec.exit_code:
+        return False, f"exit code {result.exit_code}, expected {spec.exit_code}"
+    combined = f"{result.stdout}\n{result.stderr}"
+    if spec.stdout_contains and spec.stdout_contains not in combined:
+        return False, f"expected output marker not observed: {spec.stdout_contains!r}"
+    return True, f"exit={result.exit_code}; marker={spec.stdout_contains or '(none)'}"
 
 
 _NOTE_SECTIONS = (

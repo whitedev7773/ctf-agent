@@ -248,7 +248,9 @@ def build_prompt(
         "Prioritize accurate evidence over presentation language; a separate documentation task converts "
         "these artifacts into the Korean canonical writeup. "
         "The LEAD must also write `/challenge/shared/lead/EXPERIENCE.md` containing only reusable "
-        "techniques, failure modes, and decision rules suitable for future challenges.",
+        "techniques, failure modes, and decision rules suitable for future challenges. Organize it "
+        "under `Symptom`, `Mechanism`, `Successful pivot`, `Failed routes`, and `Decision rule` so "
+        "retrieval can match the current blocker rather than category alone.",
         "16. Before declaring a solve, save exactly two decisive PNG screenshots beneath your shared role directory "
         "(prefer `evidence/`): one showing the core mechanism and one showing the successful exploit/recovery/Flag. "
         "Use a real browser/UI/debugger capture when applicable. For CLI work, execute the real command through "

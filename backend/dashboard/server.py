@@ -835,7 +835,16 @@ class DashboardServer:
             rewritten = rewritten.replace(f"]({markdown_path})", f"]({archive_path})")
 
         buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        # Solver containers can preserve Unix-epoch mtimes on generated artifacts.
+        # The ZIP format cannot represent dates before 1980; without relaxed
+        # timestamp handling, ZipFile.write() raises ValueError and the dashboard
+        # returns HTTP 500 for an otherwise valid writeup bundle.
+        with zipfile.ZipFile(
+            buffer,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            strict_timestamps=False,
+        ) as archive:
             archive.writestr("WRITEUP.md", rewritten.encode("utf-8"))
             review_path = root / "_shared" / "writeup" / "REVIEW.md"
             if review_path.is_file():

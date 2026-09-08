@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -183,3 +185,74 @@ def experience_summary(settings: object) -> dict[str, Any]:
         "total_bytes": total_bytes,
         "updated_at": datetime.fromtimestamp(latest, UTC).isoformat() if latest else "",
     }
+
+
+def _search_tokens(text: str) -> list[str]:
+    return [
+        token.casefold()
+        for token in re.findall(r"[A-Za-z0-9_+.-]{2,}|[가-힣]{2,}", text)
+        if token.casefold() not in {"the", "and", "for", "with", "from", "that"}
+    ]
+
+
+def retrieve_experience(
+    settings: object,
+    query: str,
+    *,
+    category: str = "",
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """BM25-style retrieval by symptom, blocker, mechanism, and primitive."""
+    root = experience_root(settings)
+    documents: list[tuple[Path, str, list[str]]] = []
+    for path in root.glob("*/*.md"):
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")[:80_000]
+        except OSError:
+            continue
+        documents.append((path, text, _search_tokens(text)))
+    query_tokens = _search_tokens(f"{category} {query}")
+    if not documents or not query_tokens:
+        return []
+    document_frequency = Counter(
+        token for _, _, tokens in documents for token in set(tokens)
+    )
+    average_length = sum(len(tokens) for _, _, tokens in documents) / len(documents)
+    scored: list[tuple[float, Path, str]] = []
+    for path, text, tokens in documents:
+        frequencies = Counter(tokens)
+        score = 0.0
+        for token in set(query_tokens):
+            frequency = frequencies[token]
+            if not frequency:
+                continue
+            inverse = math.log(
+                1 + (len(documents) - document_frequency[token] + 0.5)
+                / (document_frequency[token] + 0.5)
+            )
+            denominator = frequency + 1.2 * (
+                0.25 + 0.75 * len(tokens) / max(1.0, average_length)
+            )
+            score += inverse * frequency * 2.2 / denominator
+        if category and category.casefold() in path.parent.name.casefold():
+            score += 0.75
+        if score > 0:
+            scored.append((score, path, text))
+    results: list[dict[str, Any]] = []
+    for score, path, text in sorted(scored, key=lambda item: item[0], reverse=True)[
+        : max(1, min(limit, 10))
+    ]:
+        folded = text.casefold()
+        offsets = [folded.find(token) for token in query_tokens if folded.find(token) >= 0]
+        start = max(0, (min(offsets) if offsets else 0) - 300)
+        snippet = " ".join(text[start : start + 1800].split())
+        results.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "score": round(score, 4),
+                "snippet": snippet,
+            }
+        )
+    return results

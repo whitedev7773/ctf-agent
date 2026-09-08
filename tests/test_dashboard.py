@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import re
 import tempfile
 import unittest
@@ -516,6 +517,11 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(recovered["writeup"]["screenshots"]), 2)
         self.assertIn("## 주요 스크린샷", recovered["content"])
         self.assertTrue(recovered["writeup"]["reviewed"])
+
+        # Files copied out of a solver container may carry the Unix epoch. ZIP
+        # archives must clamp those mtimes instead of failing the request.
+        os.utime(shared / "writeup" / "REVIEW.md", (0, 0))
+        os.utime(shared / "writeup" / "evidence" / "admin-response.png", (0, 0))
 
         async with self.client.get(
             f"{self.base_url}/api/writeup/archive",

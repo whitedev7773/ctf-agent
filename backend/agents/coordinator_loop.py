@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,62 @@ def _unsolved_names(deps: CoordinatorDeps, poller: CTFdPoller) -> set[str]:
     known = poller.known_challenges | set(deps.challenge_metas)
     solved = poller.known_solved | set(deps.results)
     return known - solved - getattr(deps, "dismissed_challenges", set())
+
+
+def _challenge_priority(deps: CoordinatorDeps, challenge_name: str) -> float:
+    """Estimate expected points per minute from locally available metadata."""
+    meta = getattr(deps, "challenge_metas", {}).get(challenge_name)
+    if meta is None:
+        return 0.0
+    category = str(getattr(meta, "category", "") or "misc").casefold()
+    category_key = next(
+        (
+            key
+            for key in ("web", "misc", "forensics", "crypto", "reversing", "pwn")
+            if key in category
+        ),
+        "misc",
+    )
+    base_probability = {
+        "web": 0.58,
+        "misc": 0.52,
+        "forensics": 0.50,
+        "crypto": 0.43,
+        "reversing": 0.40,
+        "pwn": 0.36,
+    }[category_key]
+    expected_minutes = {
+        "web": 22.0,
+        "misc": 18.0,
+        "forensics": 28.0,
+        "crypto": 34.0,
+        "reversing": 38.0,
+        "pwn": 42.0,
+    }[category_key]
+    solves = max(0, int(getattr(meta, "solves", 0) or 0))
+    solve_probability = min(0.95, base_probability + math.log1p(solves) / 14.0)
+    points = max(1, int(getattr(meta, "value", 0) or 0))
+
+    challenge_dir = getattr(deps, "challenge_dirs", {}).get(challenge_name, "")
+    distfiles = Path(challenge_dir) / "distfiles" if challenge_dir else None
+    try:
+        file_count = sum(1 for item in distfiles.iterdir() if item.is_file()) if distfiles else 0
+    except OSError:
+        file_count = 0
+    connection_info = str(getattr(meta, "connection_info", "") or "")
+    if file_count:
+        expected_minutes *= min(1.25, 0.90 + 0.04 * file_count)
+    elif connection_info:
+        expected_minutes *= 1.15
+    return points * solve_probability / expected_minutes
+
+
+def _rank_unsolved(deps: CoordinatorDeps, poller: CTFdPoller) -> list[str]:
+    """Return a deterministic value/cost ordering for auto-spawn."""
+    return sorted(
+        _unsolved_names(deps, poller),
+        key=lambda name: (-_challenge_priority(deps, name), name.casefold()),
+    )
 
 
 def build_deps(
@@ -123,9 +180,7 @@ async def run_event_loop(
     )
 
     dismissed = getattr(deps, "dismissed_challenges", set())
-    known = (
-        poller.known_challenges | set(deps.challenge_metas)
-    ) - dismissed
+    known = (poller.known_challenges | set(deps.challenge_metas)) - dismissed
     solved = poller.known_solved | set(deps.results)
     unsolved = known - solved
     mode = "CTFd connected" if ctfd.is_configured else "standalone local mode"
@@ -173,7 +228,9 @@ async def run_event_loop(
             # Detect finished swarms
             for name, task in list(deps.swarm_tasks.items()):
                 if task.done():
-                    parts.append(f"SOLVER FINISHED: Swarm for '{name}' completed. Check results or retry.")
+                    parts.append(
+                        f"SOLVER FINISHED: Swarm for '{name}' completed. Check results or retry."
+                    )
                     deps.swarm_tasks.pop(name, None)
 
             # Drain solver-to-coordinator messages
@@ -200,8 +257,8 @@ async def run_event_loop(
                 active = [n for n, t in deps.swarm_tasks.items() if not t.done()]
                 solved_set = poller.known_solved | set(deps.results)
                 unsolved_set = (
-                    poller.known_challenges | set(deps.challenge_metas)
-                ) - solved_set - dismissed
+                    (poller.known_challenges | set(deps.challenge_metas)) - solved_set - dismissed
+                )
                 status_line = (
                     f"STATUS: {len(solved_set)} solved, {len(unsolved_set)} unsolved, "
                     f"{len(active)} active swarms. Cost: ${cost_tracker.total_cost_usd:.2f}"
@@ -217,7 +274,7 @@ async def run_event_loop(
                 logger.info("Event -> coordinator: %s", msg[:200])
                 await turn_fn(msg)
 
-    except (KeyboardInterrupt, asyncio.CancelledError):
+    except KeyboardInterrupt, asyncio.CancelledError:
         logger.info("Coordinator shutting down...")
     except Exception as e:
         logger.error("Coordinator fatal: %s", e, exc_info=True)
@@ -256,6 +313,7 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
         return
     try:
         from backend.agents.coordinator_core import do_spawn_swarm
+
         result = await do_spawn_swarm(deps, challenge_name)
         logger.info(f"Auto-spawn {challenge_name}: {result[:100]}")
     except Exception as e:
@@ -264,6 +322,6 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
 
 async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
     """Auto-spawn swarms for all unsolved challenges that don't have active swarms."""
-    for name in sorted(_unsolved_names(deps, poller)):
+    for name in _rank_unsolved(deps, poller):
         await _auto_spawn_one(deps, name)
     return

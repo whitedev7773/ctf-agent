@@ -15,6 +15,7 @@ from backend.agents.solver import Solver
 from backend.artifacts import (
     challenge_shared_path,
     handoff_quality_issues,
+    verify_handoff_reproducer,
     workspace_progress_signature,
     write_checkpoint,
 )
@@ -83,7 +84,9 @@ class ChallengeSwarm:
     _flag_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _submit_count: dict[str, int] = field(default_factory=dict)  # per-model wrong submission count
     _submitted_flags: set[str] = field(default_factory=set)  # dedup exact flags
-    _last_submit_time: dict[str, float] = field(default_factory=dict)  # per-model last submit timestamp
+    _last_submit_time: dict[str, float] = field(
+        default_factory=dict
+    )  # per-model last submit timestamp
     _total_submit_count: int = 0
     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
     waiting_models: set[str] = field(default_factory=set)
@@ -110,11 +113,14 @@ class ChallengeSwarm:
         """
         provider = provider_from_spec(model_spec)
 
-        def _submit_fn(flag): return self.try_submit_flag(flag, model_spec)
+        def _submit_fn(flag):
+            return self.try_submit_flag(flag, model_spec)
+
         _notify = self._make_notify_fn(model_spec)
 
         if provider == "claude-sdk":
             from backend.agents.claude_solver import ClaudeSolver
+
             return ClaudeSolver(
                 model_spec=model_spec,
                 challenge_dir=self.challenge_dir,
@@ -131,9 +137,9 @@ class ChallengeSwarm:
 
         if provider == "codex":
             from backend.agents.codex_solver import CodexSolver
-            can_delegate = (
-                solver_role(model_spec).key == "lead"
-                and bool(getattr(self.settings, "dynamic_delegation_enabled", True))
+
+            can_delegate = solver_role(model_spec).key == "lead" and bool(
+                getattr(self.settings, "dynamic_delegation_enabled", True)
             )
             return CodexSolver(
                 model_spec=model_spec,
@@ -156,6 +162,7 @@ class ChallengeSwarm:
 
     def _make_notify_fn(self, model_spec: str):
         """Publish a milestone to the coordinator and sibling solvers."""
+
         async def _notify(message: str) -> None:
             await self.message_bus.post(model_spec, message)
             role_key = solver_role(model_spec).key
@@ -164,12 +171,13 @@ class ChallengeSwarm:
             elif role_key == "analyst":
                 self._solution_ready.set()
             if self.coordinator_inbox:
-                self.coordinator_inbox.put_nowait(
-                    f"[{self.meta.name}/{model_spec}] {message}"
-                )
+                self.coordinator_inbox.put_nowait(f"[{self.meta.name}/{model_spec}] {message}")
+
         return _notify
 
-    def _create_pydantic_solver(self, model_spec: str, sandbox=None, owns_sandbox: bool | None = None) -> Solver:
+    def _create_pydantic_solver(
+        self, model_spec: str, sandbox=None, owns_sandbox: bool | None = None
+    ) -> Solver:
         """Create a Pydantic AI solver. Pass sandbox to reuse an existing container (quota fallback)."""
         solver = Solver(
             model_spec=model_spec,
@@ -199,6 +207,7 @@ class ChallengeSwarm:
     @staticmethod
     def _delegate_tasks_overlap(first: str, second: str) -> bool:
         """Catch cheap paraphrases so scarce worker slots are not duplicated."""
+
         def normalize(value: str) -> str:
             return " ".join(re.findall(r"[a-z0-9_]+", value.casefold()))
 
@@ -211,20 +220,65 @@ class ChallengeSwarm:
         union = left_words | right_words
         return bool(union) and len(left_words & right_words) / len(union) >= 0.72
 
-    async def _spawn_delegate(self, task: str, deliverable: str) -> str:
+    def _delegate_model_for(self, task_type: str, difficulty: str) -> str:
+        task_type = task_type.casefold()
+        if task_type in {"verification", "reproduction", "independent_verification"}:
+            setting = "delegate_verifier_model_spec"
+            fallback = "codex/gpt-5.6-terra/medium"
+        elif difficulty.casefold() == "hard" or task_type in {
+            "crypto_analysis",
+            "vm_analysis",
+            "heap_exploitation",
+            "protocol_inference",
+        }:
+            setting = "delegate_hard_model_spec"
+            fallback = "codex/gpt-5.6-sol/high"
+        else:
+            setting = "delegate_model_spec"
+            fallback = "codex/gpt-5.6-luna/low"
+        return str(getattr(self.settings, setting, fallback)).strip()
+
+    async def _spawn_delegate(
+        self,
+        task: str,
+        deliverable: str,
+        *,
+        hypothesis_id: str = "",
+        dependency_key: str = "",
+        task_type: str = "extraction",
+        difficulty: str = "easy",
+        expected_seconds: int = 300,
+        independent: bool = True,
+    ) -> str:
         """Launch one bounded Luna worker without blocking the SOL lead."""
         task = " ".join(task.split())[:3000]
         deliverable = " ".join(deliverable.split())[:1500]
+        hypothesis_id = hypothesis_id.strip()[:200]
+        dependency_key = dependency_key.strip()[:300]
+        task_type = task_type.strip().casefold()[:100] or "extraction"
+        difficulty = difficulty.strip().casefold()[:20] or "easy"
+        expected_seconds = max(1, min(int(expected_seconds), 3600))
         if len(task) < 8 or len(deliverable) < 4:
             return "DELEGATION REJECTED: provide one precise task and an explicit deliverable."
         if not bool(getattr(self.settings, "dynamic_delegation_enabled", True)):
             return "DELEGATION DISABLED by runtime policy."
 
         async with self._delegate_lock:
-            if any(
-                self._delegate_tasks_overlap(request["task"], task)
-                for request in self.delegate_requests.values()
-            ):
+            def overlaps(request: dict) -> bool:
+                same_dependency = bool(
+                    dependency_key and request.get("dependency_key") == dependency_key
+                )
+                same_hypothesis = bool(
+                    hypothesis_id
+                    and request.get("hypothesis_id") == hypothesis_id
+                    and request.get("task_type") == task_type
+                )
+                lexical_fallback = not (dependency_key or hypothesis_id) and self._delegate_tasks_overlap(
+                    request["task"], task
+                )
+                return same_dependency or same_hypothesis or lexical_fallback
+
+            if any(overlaps(request) for request in self.delegate_requests.values()):
                 return "DELEGATION REJECTED: this task overlaps an existing worker assignment."
             active = sum(1 for worker in self.delegate_tasks.values() if not worker.done())
             max_concurrent = max(
@@ -242,9 +296,7 @@ class ChallengeSwarm:
             if self._delegate_count >= max_agents:
                 return f"DELEGATION LIMIT: all {max_agents} worker slots were already used."
 
-            configured = str(
-                getattr(self.settings, "delegate_model_spec", "codex/gpt-5.6-luna/low")
-            ).strip()
+            configured = self._delegate_model_for(task_type, difficulty)
             parts = configured.split("/")
             if len(parts) < 2 or parts[0] != "codex":
                 return "DELEGATION CONFIG ERROR: delegate_model_spec must use the codex provider."
@@ -262,6 +314,10 @@ class ChallengeSwarm:
                 f"Delegate ID: {delegate_id}\n"
                 f"Assigned task: {task}\n"
                 f"Required deliverable: {deliverable}\n"
+                f"Hypothesis: {hypothesis_id or 'unassigned'}\n"
+                f"Dependency: {dependency_key or 'independent'}\n"
+                f"Task type/difficulty: {task_type}/{difficulty}\n"
+                f"Expected duration: {expected_seconds}s\n"
                 f"Your private `/challenge/workspace/` is not visible to SOL. Put every script, "
                 f"capture, or machine-readable artifact needed for reproduction under "
                 f"`/challenge/shared/delegates/{delegate_id}/`, and reference only those shared "
@@ -269,7 +325,10 @@ class ChallengeSwarm:
                 f"Write the result to `{handoff}` using exactly these sections: "
                 "`## Conclusion` (SUPPORTED/REFUTED/INCONCLUSIVE), `## Evidence`, "
                 "`## Reproduction`, and `## Assumptions and conflicts`. Include commands or scripts "
-                "and observed output. Recompute critical arithmetic and name contradictory shared "
+                "and observed output. Under `## Reproduction`, include a fenced YAML block with "
+                "`reproducer.command`, `reproducer.expect.exit_code`, and "
+                "`reproducer.expect.stdout_contains`; the runtime executes it in a clean tool call. "
+                "Recompute critical arithmetic and name contradictory shared "
                 "claims rather than silently choosing one. Call `notify_coordinator` "
                 "with a one-paragraph summary and the handoff path, then stop."
             )
@@ -278,6 +337,12 @@ class ChallengeSwarm:
                 "deliverable": deliverable,
                 "handoff": handoff,
                 "host_handoff": host_handoff,
+                "hypothesis_id": hypothesis_id,
+                "dependency_key": dependency_key,
+                "task_type": task_type,
+                "difficulty": difficulty,
+                "expected_seconds": expected_seconds,
+                "independent": independent,
             }
             self.model_specs.append(model_spec)
             worker = asyncio.create_task(
@@ -391,9 +456,7 @@ class ChallengeSwarm:
         )
         host_handoff = Path(request.get("host_handoff", ""))
         issues = (
-            handoff_quality_issues(host_handoff)
-            if host_handoff.is_file()
-            else ["handoff missing"]
+            handoff_quality_issues(host_handoff) if host_handoff.is_file() else ["handoff missing"]
         )
         audit = "passed" if not issues else "UNSAFE: " + ", ".join(issues)
         recovery_dir = Path(challenge_shared_path(self.settings, self.meta.name)) / "recovery"
@@ -450,7 +513,13 @@ class ChallengeSwarm:
         for spec, request in self.delegate_requests.items():
             worker = self.delegate_tasks.get(spec)
             outcome = self.outcomes.get(spec)
-            status = outcome.status if outcome else "running" if worker and not worker.done() else "starting"
+            status = (
+                outcome.status
+                if outcome
+                else "running"
+                if worker and not worker.done()
+                else "starting"
+            )
             finding = self.findings.get(spec, "").strip().replace("\n", " ")[:700]
             host_handoff = Path(request.get("host_handoff", ""))
             if host_handoff.is_file():
@@ -530,6 +599,7 @@ class ChallengeSwarm:
             self._total_submit_count += 1
 
             from backend.tools.core import do_submit_flag
+
             display, is_confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag)
             if is_confirmed:
                 self.confirmed_flag = normalized
@@ -605,7 +675,9 @@ class ChallengeSwarm:
             if solver is not None:
                 await solver.stop()
 
-    async def _run_solver_loop(self, solver, model_spec: str) -> tuple[SolverResult, SolverProtocol]:
+    async def _run_solver_loop(
+        self, solver, model_spec: str
+    ) -> tuple[SolverResult, SolverProtocol]:
         """Inner loop: start → run → bump → run → ..."""
         bump_count = 0
         consecutive_errors = 0
@@ -616,8 +688,12 @@ class ChallengeSwarm:
         idle_timeout = solver_turn_idle_timeout_limit(self.settings, model_spec)
         max_runtime = max(turn_timeout, solver_runtime_limit(self.settings, model_spec))
         result = SolverResult(
-            flag=None, status=CANCELLED, findings_summary="",
-            step_count=0, cost_usd=0.0, log_path="",
+            flag=None,
+            status=CANCELLED,
+            findings_summary="",
+            step_count=0,
+            cost_usd=0.0,
+            log_path="",
         )
         await solver.start()
 
@@ -625,13 +701,19 @@ class ChallengeSwarm:
             elapsed = time.monotonic() - started_at
             if attempt >= max_attempts:
                 result = self._budget_result(
-                    solver, model_spec, result, attempt,
+                    solver,
+                    model_spec,
+                    result,
+                    attempt,
                     f"attempt budget exhausted ({attempt}/{max_attempts})",
                 )
                 break
             if elapsed >= max_runtime:
                 result = self._budget_result(
-                    solver, model_spec, result, attempt,
+                    solver,
+                    model_spec,
+                    result,
+                    attempt,
                     f"runtime budget exhausted ({int(elapsed)}s/{max_runtime}s)",
                 )
                 break
@@ -707,7 +789,10 @@ class ChallengeSwarm:
                     else f"turn timeout exceeded ({int(allowed)}s)"
                 )
                 result = self._budget_result(
-                    solver, model_spec, result, attempt,
+                    solver,
+                    model_spec,
+                    result,
+                    attempt,
                     reason,
                 )
                 self._checkpoint(solver, model_spec, result, attempt)
@@ -722,19 +807,19 @@ class ChallengeSwarm:
             self._checkpoint(solver, model_spec, result, attempt)
 
             # Only broadcast useful findings — skip errors and broken solvers
-            if (result.status not in (ERROR, QUOTA_ERROR)
-                    and not (result.step_count == 0 and result.cost_usd == 0)
-                    and result.findings_summary
-                    and not result.findings_summary.startswith(("Error:", "Turn failed:"))):
+            if (
+                result.status not in (ERROR, QUOTA_ERROR)
+                and not (result.step_count == 0 and result.cost_usd == 0)
+                and result.findings_summary
+                and not result.findings_summary.startswith(("Error:", "Turn failed:"))
+            ):
                 self.findings[model_spec] = result.findings_summary
                 await self.message_bus.post(model_spec, result.findings_summary[:500])
 
             if result.status == FLAG_FOUND:
                 self.cancel_event.set()
                 self.winner = result
-                logger.info(
-                    f"[{self.meta.name}] Flag found by {model_spec}: {result.flag}"
-                )
+                logger.info(f"[{self.meta.name}] Flag found by {model_spec}: {result.flag}")
                 return result, solver
 
             if result.status == CANDIDATE_FOUND:
@@ -756,10 +841,29 @@ class ChallengeSwarm:
             if result.status in (GAVE_UP, PROGRESS_CHECKPOINT, BUDGET_EXHAUSTED):
                 handoff = self._audited_delegate_handoff(model_spec)
                 if handoff:
+                    request = self.delegate_requests.get(model_spec, {})
+                    verified, verification = await verify_handoff_reproducer(
+                        solver.sandbox,
+                        request.get("host_handoff", ""),
+                    )
+                    if not verified:
+                        solver.bump(
+                            "Delegate handoff format passed but clean reproduction failed: "
+                            f"{verification}. Repair the shared reproducer and its observed marker."
+                        )
+                        logger.warning(
+                            "[%s/%s] Delegate reproducer rejected: %s",
+                            self.meta.name,
+                            model_spec,
+                            verification,
+                        )
+                        continue
                     result = replace(
                         result,
                         status=HANDOFF_COMPLETE,
-                        stop_reason=f"audited delegate handoff completed: {handoff}",
+                        stop_reason=(
+                            f"verified delegate handoff completed: {handoff}; {verification}"
+                        ),
                     )
                     logger.info(
                         "[%s/%s] Delegate handoff passed audit; stopping without bump",
@@ -768,7 +872,8 @@ class ChallengeSwarm:
                     )
                     message = (
                         f"DELEGATE HANDOFF READY: {model_spec.rsplit('/', 1)[-1]}; "
-                        f"audit=passed; handoff={handoff}. Integrate this evidence "
+                        f"audit=SUPPORTED_VERIFIED; {verification}; handoff={handoff}. "
+                        "Integrate this evidence "
                         "before repeating the delegated experiment."
                     )
                     lead_spec = self._lead_model_spec()
@@ -776,6 +881,15 @@ class ChallengeSwarm:
                         "runtime-delegate",
                         message,
                         target=lead_spec,
+                        kind="reproduction",
+                        claim=message,
+                        confidence=1.0,
+                        evidence_ids=[
+                            f"runtime:{model_spec.rsplit('/', 1)[-1]}:reproducer"
+                        ],
+                        hypothesis_id=request.get("hypothesis_id") or None,
+                        tags=[request.get("task_type", "delegate")],
+                        urgency="urgent",
                     )
                     lead_solver = self.solvers.get(lead_spec) if lead_spec else None
                     if lead_solver is not None:
@@ -845,7 +959,9 @@ class ChallengeSwarm:
                     # Detach sandbox from old solver so stop() doesn't destroy it
                     solver.sandbox = None  # type: ignore[assignment]
                     await solver.stop()
-                    solver = self._create_pydantic_solver(fallback_spec, sandbox=existing_sandbox, owns_sandbox=True)
+                    solver = self._create_pydantic_solver(
+                        fallback_spec, sandbox=existing_sandbox, owns_sandbox=True
+                    )
                     self.solvers[model_spec] = solver
                     await solver.start()
                     continue
@@ -876,20 +992,27 @@ class ChallengeSwarm:
                     consecutive_errors = 0
 
                 bump_count += 1
-                # Cooldown between bumps — check cancellation during wait
-                try:
-                    await asyncio.wait_for(
-                        self.cancel_event.wait(),
-                        timeout=min(bump_count * 30, 300),
-                    )
-                    break  # cancelled during cooldown
-                except TimeoutError:
-                    pass  # cooldown elapsed, proceed with bump
+                # Re-plan immediately; wall-clock backoff is reserved for submissions/APIs.
                 insights = self._gather_sibling_insights(model_spec)
+                state_store = getattr(solver, "reasoning_state_store", None)
+                if state_store is not None:
+                    state = state_store.load()
+                    refuted = [
+                        f"{item.id}: {item.statement}"
+                        for item in state.hypotheses
+                        if item.status == "refuted"
+                    ][-5:]
+                    insights = (
+                        f"Confirmed facts: {state.confirmed_facts[-8:]}\n"
+                        f"Refuted hypotheses: {refuted}\n"
+                        f"Current blocker: {state.current_blocker or 'not recorded'}\n"
+                        f"Recent failed experiments: {state.failed_experiments[-3:]}\n"
+                        f"Available sibling evidence: {insights}\n"
+                        "Generate three materially different hypotheses, each with one cheap "
+                        "discriminating experiment, then activate the best one."
+                    )
                 solver.bump(insights)
-                logger.info(
-                    f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}), resuming"
-                )
+                logger.info(f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}), resuming")
                 continue
 
         return result, solver
@@ -901,7 +1024,7 @@ class ChallengeSwarm:
             raw = raw[0] if raw else 0
         try:
             return max(0, int(raw))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 0
 
     def _agent_usage(self, model_spec: str):
@@ -909,6 +1032,9 @@ class ChallengeSwarm:
 
     @staticmethod
     def _progress_signature(solver) -> str:
+        state_store = getattr(solver, "reasoning_state_store", None)
+        if state_store is not None:
+            return state_store.semantic_signature()
         sandbox = getattr(solver, "sandbox", None)
         return workspace_progress_signature(
             getattr(sandbox, "workspace_dir", ""),
@@ -996,6 +1122,28 @@ class ChallengeSwarm:
 
     async def run(self) -> SolverResult | None:
         """Return a verified winner, or a standalone candidate awaiting human review."""
+        benchmark_started = time.monotonic()
+        benchmark_started_wall = time.time()
+
+        def record_benchmark(result: SolverResult | None) -> None:
+            destination = str(getattr(self.settings, "benchmark_results_path", "") or "")
+            if not destination:
+                return
+            try:
+                from backend.benchmark import append_trial, trial_from_swarm
+
+                append_trial(
+                    destination,
+                    trial_from_swarm(
+                        self,
+                        result,
+                        time.monotonic() - benchmark_started,
+                        benchmark_started_wall,
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("Could not record benchmark trial: %s", exc)
+
         tasks: set[asyncio.Task] = {
             asyncio.create_task(self._run_solver(spec), name=f"solver-{spec}")
             for spec in list(self.model_specs)
@@ -1032,6 +1180,7 @@ class ChallengeSwarm:
                     if result and result.status == FLAG_FOUND:
                         self.cancel_event.set()
                         await cancel_workers(tasks)
+                        record_benchmark(result)
                         return result
                     if (
                         result
@@ -1041,9 +1190,11 @@ class ChallengeSwarm:
                     ):
                         self.cancel_event.set()
                         await cancel_workers(tasks)
+                        record_benchmark(result)
                         return result
 
             self.cancel_event.set()
+            record_benchmark(self.winner)
             return self.winner
         except asyncio.CancelledError:
             self.cancel_event.set()
@@ -1053,6 +1204,7 @@ class ChallengeSwarm:
             logger.error(f"[{self.meta.name}] Swarm error: {e}", exc_info=True)
             self.cancel_event.set()
             await cancel_workers(tasks)
+            record_benchmark(None)
             return None
 
     def kill(self) -> None:
@@ -1074,15 +1226,39 @@ class ChallengeSwarm:
 
     def get_status(self) -> dict:
         """Get per-agent progress and findings."""
+        reasoning = {}
+        for solver in self.solvers.values():
+            store = getattr(solver, "reasoning_state_store", None)
+            if store is None:
+                continue
+            state = store.load()
+            reasoning = {
+                "phase": state.phase,
+                "semantic_revision": state.semantic_revision,
+                "active_hypothesis": state.active_hypothesis,
+                "current_blocker": state.current_blocker,
+                "next_experiment": state.next_experiment,
+                "evidence_count": len(state.evidence),
+                "contradictions": state.contradictions[-5:],
+                "hypotheses": [
+                    {
+                        "id": item.id,
+                        "statement": item.statement,
+                        "status": item.status,
+                        "confidence": item.confidence,
+                    }
+                    for item in state.hypotheses
+                ],
+            }
+            break
         return {
             "challenge": self.meta.name,
             "cancelled": self.cancel_event.is_set(),
             "winner": self.winner.flag if self.winner else None,
             "candidates": {
-                spec: result.flag
-                for spec, result in self.candidates.items()
-                if result.flag
+                spec: result.flag for spec, result in self.candidates.items() if result.flag
             },
+            "reasoning": reasoning,
             "agents": {
                 spec: {
                     "role": solver_role(spec).key,
@@ -1093,7 +1269,9 @@ class ChallengeSwarm:
                     "stop_reason": (
                         self.outcomes[spec].stop_reason if spec in self.outcomes else ""
                     ),
-                    "workspace_path": getattr(getattr(self.solvers.get(spec), "sandbox", None), "workspace_dir", ""),
+                    "workspace_path": getattr(
+                        getattr(self.solvers.get(spec), "sandbox", None), "workspace_dir", ""
+                    ),
                 }
                 for spec in self.model_specs
             },

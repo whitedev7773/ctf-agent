@@ -88,6 +88,8 @@ class ClaudeSolver:
             memory_limit=getattr(settings, "container_memory_limit", "4g"),
             cpu_limit=getattr(settings, "container_cpu_limit", 2.0),
             max_exec_timeout_s=getattr(settings, "max_command_timeout_seconds", 600),
+            max_sessions=getattr(settings, "max_interactive_sessions", 4),
+            session_ttl_seconds=getattr(settings, "interactive_session_ttl_seconds", 900),
             workspace_dir=solver_workspace_path(settings, meta.name, model_spec),
             shared_workspace_dir=challenge_shared_path(settings, meta.name),
             experience_dir=str(experience_root(settings)),
@@ -278,16 +280,6 @@ class ClaudeSolver:
             response_str = str(input_data.get("tool_response", ""))[:2000]
             self.tracer.tool_result(input_data.get("tool_name", "?"), response_str[:500], self._step_count)
 
-            if self._step_count % 5 == 0 and self.message_bus:
-                from backend.tools.core import do_check_findings
-                findings = await do_check_findings(self.message_bus, self.model_spec)
-                if findings and "No new findings" not in findings:
-                    return {
-                        "hookSpecificOutput": {
-                            "hookEventName": "PostToolUse",
-                            "additionalContext": findings,
-                        }
-                    }
             return {}
 
         effort = effort_from_spec(self.model_spec)
@@ -413,7 +405,7 @@ class ClaudeSolver:
 
     def bump(self, insights: str) -> None:
         self._bump_insights = insights
-        self.loop_detector.reset()
+        self.loop_detector.reset_transient()
         self.tracer.event("bump", insights=insights[:500])
         logger.info(f"[{self.agent_name}] Bumped with insights (session {self._session_id})")
 

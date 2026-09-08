@@ -52,9 +52,13 @@ class RuntimeSettings(BaseModel):
     solver_max_estimated_cost_usd: float = Field(default=0.0, ge=0.0, le=10_000.0)
     max_flag_submissions_per_challenge: int = Field(default=8, ge=1, le=100)
     max_command_timeout_seconds: int = Field(default=600, ge=1, le=3600)
+    max_interactive_sessions: int = Field(default=4, ge=1, le=16)
+    interactive_session_ttl_seconds: int = Field(default=900, ge=30, le=86_400)
 
     dynamic_delegation_enabled: bool = True
     delegate_model_spec: str = "codex/gpt-5.6-luna/low"
+    delegate_hard_model_spec: str = "codex/gpt-5.6-sol/high"
+    delegate_verifier_model_spec: str = "codex/gpt-5.6-terra/medium"
     delegate_max_agents: int = Field(default=4, ge=0, le=32)
     delegate_max_concurrent: int = Field(default=2, ge=0, le=16)
     delegate_max_attempts: int = Field(default=4, ge=1, le=100)
@@ -74,7 +78,9 @@ class RuntimeSettings(BaseModel):
             raise ValueError("models cannot contain duplicates")
         return normalized
 
-    @field_validator("delegate_model_spec")
+    @field_validator(
+        "delegate_model_spec", "delegate_hard_model_spec", "delegate_verifier_model_spec"
+    )
     @classmethod
     def _validate_delegate_model(cls, value: str) -> str:
         return _validate_model_spec(value, delegate=True)

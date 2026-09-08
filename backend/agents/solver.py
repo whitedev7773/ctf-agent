@@ -53,6 +53,11 @@ from backend.tools.sandbox import (
     list_files,
     notify_coordinator,
     read_file,
+    session_close,
+    session_interrupt,
+    session_open,
+    session_read,
+    session_send,
     web_fetch,
     webhook_create,
     webhook_get_requests,
@@ -107,20 +112,16 @@ class TracingToolset(WrapperToolset[SolverDeps]):
         if name == "submit_flag" and any(m in result_str for m in CORRECT_MARKERS):
             self.tracer.event("flag_confirmed", tool=name, step=step)
 
-        if step % 5 == 0 and ctx.deps.message_bus and isinstance(result, str):
-            from backend.tools.core import do_check_findings
-            findings_text = await do_check_findings(ctx.deps.message_bus, ctx.deps.model_spec)
-            if findings_text and "No new findings" not in findings_text:
-                result = f"{result}\n\n---\n{findings_text}"
-                self.tracer.event("findings_injected", step=step)
-
         return result
 
 
 def _build_toolset(deps: SolverDeps) -> FunctionToolset[SolverDeps]:
     """Build the raw toolset for a solver agent."""
-    tools = [bash, read_file, write_file, list_files, submit_flag, web_fetch,
-             webhook_create, webhook_get_requests, check_findings, notify_coordinator]
+    tools = [
+        bash, read_file, write_file, list_files, submit_flag, web_fetch,
+        webhook_create, webhook_get_requests, check_findings, notify_coordinator,
+        session_open, session_send, session_read, session_interrupt, session_close,
+    ]
     if deps.use_vision:
         tools.append(view_image)
     return FunctionToolset(tools=tools, max_retries=4)
@@ -158,6 +159,8 @@ class Solver:
             memory_limit=getattr(settings, "container_memory_limit", "4g"),
             cpu_limit=getattr(settings, "container_cpu_limit", 2.0),
             max_exec_timeout_s=getattr(settings, "max_command_timeout_seconds", 600),
+            max_sessions=getattr(settings, "max_interactive_sessions", 4),
+            session_ttl_seconds=getattr(settings, "interactive_session_ttl_seconds", 900),
             workspace_dir=workspace_dir,
             shared_workspace_dir=challenge_shared_path(settings, meta.name),
             experience_dir=str(experience_root(settings)),
@@ -368,7 +371,7 @@ class Solver:
             ]
         )
         self._messages.append(bump_msg)
-        self.loop_detector.reset()
+        self.loop_detector.reset_transient()
         self.tracer.event("bump", insights=insights[:500])
         logger.info(f"[{self.agent_name}] Bumped with sibling insights")
 

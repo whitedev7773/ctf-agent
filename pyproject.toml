@@ -22,6 +22,7 @@ dependencies = [
 [project.scripts]
 ctf-solve = "backend.cli:main"
 ctf-msg = "backend.cli:msg"
+ctf-benchmark = "backend.benchmark:main"
 
 [build-system]
 requires = ["hatchling"]

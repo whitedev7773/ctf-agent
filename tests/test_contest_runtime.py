@@ -399,11 +399,19 @@ class _Tracer:
         )
 
 
+class _FakeWorkspaceSandbox:
+    def __init__(self, workspace: str) -> None:
+        self.workspace_dir = workspace
+
+    async def exec(self, _command: str, timeout_s: int = 120):
+        return SimpleNamespace(exit_code=0, stdout="REPRO_OK", stderr="")
+
+
 class _GaveUpSolver:
     def __init__(self, workspace: str) -> None:
         self.model_spec = "codex/test"
         self.agent_name = "budget/codex/test"
-        self.sandbox = SimpleNamespace(workspace_dir=workspace)
+        self.sandbox = _FakeWorkspaceSandbox(workspace)
         self.tracer = _Tracer()
         self._step_count = 0
         self.bump_count = 0
@@ -1030,7 +1038,8 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
             handoff = Path(root) / "delegate-01.md"
             handoff.write_text(
                 "## Conclusion\nREFUTED\n## Evidence\nObserved rejection.\n"
-                "## Reproduction\n`python3 repro.py`\n"
+                "## Reproduction\n```yaml\nreproducer:\n  command: python3 repro.py\n"
+                "  expect:\n    exit_code: 0\n    stdout_contains: REPRO_OK\n```\n"
                 "## Assumptions and conflicts\nNone.\n",
                 encoding="utf-8",
             )
@@ -1051,9 +1060,10 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(solver.bump_count, 0)
             self.assertEqual(lead_solver.bump_count, 1)
             self.assertIn("delegate-01.md", result.stop_reason)
+            self.assertIn("REPRO_OK", result.stop_reason)
             unread = await swarm.message_bus.check(lead)
             self.assertTrue(
-                any("DELEGATE HANDOFF READY" in finding.content for finding in unread)
+                any("SUPPORTED_VERIFIED" in finding.content for finding in unread)
             )
 
     async def test_cancelling_solver_loop_reaps_active_turn(self) -> None:
