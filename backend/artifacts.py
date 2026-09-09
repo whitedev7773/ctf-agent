@@ -115,6 +115,11 @@ def _artifact_score(path: Path, root: Path) -> int | None:
         relative = path.relative_to(root)
     except ValueError:
         return None
+    if relative.as_posix().casefold() in {
+        "reasoning/state.json",
+        "reasoning/state.json.tmp",
+    }:
+        return None
     lowered = path.name.casefold()
     named = any(lowered.startswith(prefix) for prefix in _HIGH_VALUE_PREFIXES)
     if path.name in _STATE_FILES:

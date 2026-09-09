@@ -118,19 +118,20 @@ async def test_codex_state_tools_use_runtime_observation_receipt(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_context_and_file_mtime_are_not_semantic_progress(tmp_path: Path) -> None:
+async def test_progress_combines_semantic_state_and_workspace_artifacts(tmp_path: Path) -> None:
     store = ReasoningStateStore(tmp_path)
-    before = store.semantic_signature()
-    await store.update_context(blocker="Need a leak", next_experiment="Inspect GOT")
-    assert store.semantic_signature() == before
-
-    artifact = tmp_path / "STATE.md"
-    artifact.write_text("still investigating", encoding="utf-8")
 
     class Solver:
         reasoning_state_store = store
+        sandbox = SimpleNamespace(workspace_dir=str(tmp_path), shared_workspace_dir="")
 
+    before = ChallengeSwarm._progress_signature(Solver())
+    await store.update_context(blocker="Need a leak", next_experiment="Inspect GOT")
     assert ChallengeSwarm._progress_signature(Solver()) == before
+
+    artifact = tmp_path / "STATE.md"
+    artifact.write_text("still investigating", encoding="utf-8")
+    assert ChallengeSwarm._progress_signature(Solver()) != before
 
 
 @pytest.mark.asyncio

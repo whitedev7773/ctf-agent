@@ -537,7 +537,7 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
     async def test_idle_turn_is_interrupted_and_resumed_without_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             settings = SimpleNamespace(
-                max_attempts_per_challenge=2,
+                max_attempts_per_challenge=1,
                 solver_turn_timeout_seconds=30,
                 solver_turn_idle_timeout_seconds=1,
                 solver_max_runtime_seconds=120,
@@ -954,7 +954,7 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
     async def test_compaction_recovery_resumes_even_without_new_progress_file(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             settings = SimpleNamespace(
-                max_attempts_per_challenge=2,
+                max_attempts_per_challenge=1,
                 solver_turn_timeout_seconds=30,
                 solver_max_runtime_seconds=120,
                 solver_max_steps=100,

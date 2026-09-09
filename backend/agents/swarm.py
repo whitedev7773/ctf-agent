@@ -906,6 +906,9 @@ class ChallengeSwarm:
 
             if result.status == PROGRESS_CHECKPOINT:
                 if result.stop_reason.startswith("resume interrupt:"):
+                    # Guidance and idle-watchdog interrupts only split a live turn;
+                    # they are not independent solve attempts.
+                    attempt = max(0, attempt - 1)
                     if "idle watchdog" in result.stop_reason:
                         insights = self._gather_sibling_insights(model_spec)
                         solver.bump(
@@ -921,6 +924,9 @@ class ChallengeSwarm:
                     )
                     continue
                 if result.stop_reason.startswith("compaction recovery:"):
+                    # A fresh-thread recovery is infrastructure bookkeeping, so it
+                    # must not consume the challenge's attempt budget either.
+                    attempt = max(0, attempt - 1)
                     logger.warning(
                         "[%s/%s] Compaction recovery created a fresh thread; resuming immediately",
                         self.meta.name,
@@ -1040,13 +1046,13 @@ class ChallengeSwarm:
     @staticmethod
     def _progress_signature(solver) -> str:
         state_store = getattr(solver, "reasoning_state_store", None)
-        if state_store is not None:
-            return state_store.semantic_signature()
+        semantic_signature = state_store.semantic_signature() if state_store is not None else ""
         sandbox = getattr(solver, "sandbox", None)
-        return workspace_progress_signature(
+        artifact_signature = workspace_progress_signature(
             getattr(sandbox, "workspace_dir", ""),
             getattr(sandbox, "shared_workspace_dir", ""),
         )
+        return f"{semantic_signature}:{artifact_signature}"
 
     def _budget_reason(self, solver, model_spec: str, attempt: int, started_at: float) -> str:
         limits = solver_token_limits(self.settings, model_spec)
