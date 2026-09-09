@@ -180,6 +180,8 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("@media (forced-colors: active)", stylesheet)
             self.assertIn("body { user-select: text; }", stylesheet)
             self.assertIn(".row-duration-copy", stylesheet)
+            self.assertIn(".trace-output", stylesheet)
+            self.assertIn("overflow-wrap: anywhere", stylesheet)
 
         async with self.client.get(f"{self.base_url}/") as response:
             html = await response.text()
@@ -342,6 +344,32 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent["idle_seconds"], 42.5)
         self.assertEqual(agent["idle_limit_seconds"], 300)
         self.assertFalse(agent["tool_call_active"])
+
+    async def test_trace_api_prefixes_every_event_with_local_time(self) -> None:
+        model_spec = "codex/gpt-5.6-sol/xhigh"
+        trace_path = self.logs_root / "trace.jsonl"
+        trace_path.write_text(
+            '{"ts":1700000000.125,"type":"tool_call","step":7,'
+            '"tool":"bash","args":{"command":"file chall"}}\n'
+            '{"ts":1700000001.5,"type":"finish","status":"gave_up"}\n',
+            encoding="utf-8",
+        )
+        self.deps.swarms["web/intro"] = SimpleNamespace(
+            solvers={model_spec: SimpleNamespace(tracer=SimpleNamespace(path=str(trace_path)))},
+        )
+
+        async with self.client.get(
+            f"{self.base_url}/api/trace",
+            params={"challenge": "web/intro", "model": model_spec, "last_n": 2},
+        ) as response:
+            payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        lines = payload["trace"].splitlines()
+        self.assertEqual(len(lines), 2)
+        timestamp = r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}\]"
+        self.assertRegex(lines[0], rf"^{timestamp} step 7 CALL bash:")
+        self.assertRegex(lines[1], rf"^{timestamp} \*\* finish:")
 
     async def test_writeup_api_serves_text_but_rejects_artifact_traversal(self) -> None:
         from backend.artifacts import challenge_shared_path

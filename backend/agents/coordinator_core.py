@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 
 from backend.artifacts import challenge_shared_path
@@ -17,6 +18,15 @@ from backend.solver_base import FLAG_FOUND
 from backend.writeups import finalize_writeup
 
 logger = logging.getLogger(__name__)
+
+
+def _trace_timestamp(value: object) -> str:
+    """Format an epoch trace timestamp in the server's local timezone."""
+    try:
+        timestamp = datetime.fromtimestamp(float(value)).astimezone()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "[time unknown]"
+    return f"[{timestamp.isoformat(sep=' ', timespec='milliseconds')}]"
 
 
 async def _generate_or_finalize_writeup(
@@ -382,21 +392,33 @@ async def do_read_solver_trace(deps: CoordinatorDeps, challenge_name: str, model
         for line in recent:
             try:
                 d = json.loads(line)
+                timestamp = _trace_timestamp(d.get("ts"))
                 t = d.get("type", "?")
                 if t == "tool_call":
                     args_str = str(d.get("args", ""))[:100]
-                    summary.append(f"step {d.get('step','?')} CALL {d.get('tool','?')}: {args_str}")
+                    summary.append(
+                        f"{timestamp} step {d.get('step','?')} "
+                        f"CALL {d.get('tool','?')}: {args_str}"
+                    )
                 elif t == "tool_result":
                     result_str = str(d.get("result", ""))[:100]
-                    summary.append(f"step {d.get('step','?')} RESULT {d.get('tool','?')}: {result_str}")
+                    summary.append(
+                        f"{timestamp} step {d.get('step','?')} "
+                        f"RESULT {d.get('tool','?')}: {result_str}"
+                    )
                 elif t in ("finish", "error", "bump", "turn_failed"):
-                    summary.append(f"** {t}: {json.dumps({k:v for k,v in d.items() if k != 'ts'})}")
+                    details = json.dumps({key: value for key, value in d.items() if key != "ts"})
+                    summary.append(f"{timestamp} ** {t}: {details}")
                 elif t == "usage":
-                    summary.append(f"usage: in={d.get('input_tokens',0)} out={d.get('output_tokens',0)} cost=${d.get('cost_usd',0):.4f}")
+                    summary.append(
+                        f"{timestamp} usage: in={d.get('input_tokens',0)} "
+                        f"out={d.get('output_tokens',0)} "
+                        f"cost=${d.get('cost_usd',0):.4f}"
+                    )
                 else:
-                    summary.append(f"{t}: {str(d)[:80]}")
+                    summary.append(f"{timestamp} {t}: {str(d)[:80]}")
             except Exception:
-                summary.append(line[:100])
+                summary.append(f"[time unknown] {line[:100]}")
         return "\n".join(summary)
     except FileNotFoundError:
         return f"Trace file not found: {path}"
