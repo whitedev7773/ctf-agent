@@ -25,6 +25,10 @@ const state = {
   runtimeSettingsDirty: false,
   runtimeModels: [],
   codexUsage: null,
+  snapshotReceivedAt: 0,
+  uptimeBaseSeconds: 0,
+  challengeClocks: new Map(),
+  clockTimer: null,
 };
 
 const runtimeNumericFields = [
@@ -39,6 +43,8 @@ const runtimeNumericFields = [
   "solver-max-raw-tokens",
   "solver-cached-token-weight",
   "solver-turn-slice-tokens",
+  "solver-compaction-timeout-seconds",
+  "solver-compaction-max-waits",
   "solver-max-estimated-cost-usd",
   "max-flag-submissions-per-challenge",
   "max-command-timeout-seconds",
@@ -113,6 +119,63 @@ function formatDuration(seconds) {
   if (value >= 3600) return `${Math.floor(value / 3600)}h ${Math.floor(value % 3600 / 60)}m`;
   if (value >= 60) return `${Math.floor(value / 60)}m ${Math.floor(value % 60)}s`;
   return `${Math.floor(value)}s`;
+}
+
+function hasActiveTextSelection() {
+  const selection = window.getSelection?.();
+  return Boolean(selection && !selection.isCollapsed && selection.toString().trim());
+}
+
+function sampledElapsedSeconds(baseSeconds) {
+  const delta = state.snapshotReceivedAt
+    ? Math.max(0, (performance.now() - state.snapshotReceivedAt) / 1000)
+    : 0;
+  return Math.max(0, Number(baseSeconds || 0) + delta);
+}
+
+function observedChallengeDuration(challenge) {
+  return Math.max(0, ...challenge.agents.map((agent) => Number(agent.duration_seconds || 0)));
+}
+
+function challengeElapsedSeconds(challenge) {
+  const clock = state.challengeClocks.get(challenge.name);
+  if (!clock) return observedChallengeDuration(challenge);
+  const delta = clock.active ? Math.max(0, (performance.now() - clock.sampledAt) / 1000) : 0;
+  return clock.baseSeconds + delta;
+}
+
+function syncFrontendClocks(snapshot) {
+  const now = performance.now();
+  const previousUptime = sampledElapsedSeconds(state.uptimeBaseSeconds);
+  state.snapshotReceivedAt = now;
+  state.uptimeBaseSeconds = Math.max(previousUptime, Number(snapshot.uptime_seconds || 0));
+
+  const currentNames = new Set();
+  for (const challenge of snapshot.challenges || []) {
+    currentNames.add(challenge.name);
+    const previous = state.challengeClocks.get(challenge.name);
+    const previousElapsed = previous
+      ? previous.baseSeconds + (previous.active ? Math.max(0, (now - previous.sampledAt) / 1000) : 0)
+      : 0;
+    state.challengeClocks.set(challenge.name, {
+      active: Boolean(challenge.active),
+      baseSeconds: Math.max(previousElapsed, observedChallengeDuration(challenge)),
+      sampledAt: now,
+    });
+  }
+  for (const name of state.challengeClocks.keys()) {
+    if (!currentNames.has(name)) state.challengeClocks.delete(name);
+  }
+}
+
+function renderLiveClocks() {
+  if (!state.snapshot || hasActiveTextSelection()) return;
+  const uptime = byId("uptime-value");
+  if (uptime) uptime.textContent = `UPTIME ${formatDuration(sampledElapsedSeconds(state.uptimeBaseSeconds))}`;
+  for (const element of document.querySelectorAll("[data-challenge-elapsed]")) {
+    const challenge = currentChallenge(element.dataset.challengeElapsed);
+    if (challenge) element.textContent = `풀이 ${formatDuration(challengeElapsedSeconds(challenge))}`;
+  }
 }
 
 function formatResetTime(unixSeconds) {
@@ -547,16 +610,20 @@ function currentChallenge(name) {
 function createChallengeRow(challengeName) {
   const row = node("tr");
   row.dataset.challengeName = challengeName;
-  row.tabIndex = 0;
-  row.addEventListener("click", () => openChallengeDetail(row.dataset.challengeName));
-  row.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      openChallengeDetail(row.dataset.challengeName);
-    }
+  row.addEventListener("click", () => {
+    if (hasActiveTextSelection()) return;
+    openChallengeDetail(row.dataset.challengeName);
   });
 
   const nameCell = node("td", "challenge-name-cell");
+  const detailLink = node("button", "challenge-name");
+  detailLink.type = "button";
+  detailLink.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openChallengeDetail(row.dataset.challengeName);
+  });
+  const meta = node("span", "challenge-meta");
+  nameCell.append(detailLink, meta);
   const statusCell = node("td", "challenge-status-cell");
   const agentsCell = node("td", "challenge-agents-cell");
   const progressCell = node("td", "progress-copy challenge-progress-cell");
@@ -579,17 +646,17 @@ function createChallengeRow(challengeName) {
 
 function updateChallengeRow(row, challenge) {
   row.dataset.challengeName = challenge.name;
-  row.setAttribute("aria-label", `${challenge.name} 상세 보기`);
 
   const nameCell = row.querySelector(".challenge-name-cell");
-  nameCell.replaceChildren(node("span", "challenge-name", challenge.name));
-  const meta = node("span", "challenge-meta");
+  const detailLink = nameCell.querySelector(".challenge-name");
+  detailLink.textContent = challenge.name;
+  detailLink.setAttribute("aria-label", `${challenge.name} 상세 보기`);
+  const meta = nameCell.querySelector(".challenge-meta");
+  meta.replaceChildren();
   meta.append(node("span", "", challenge.category));
   meta.append(node("span", "", `${formatNumber(challenge.value)} pts`));
   if (challenge.solves) meta.append(node("span", "", `${formatNumber(challenge.solves)} solves`));
   if (challenge.documented) meta.append(node("span", "documented-badge", "DOCUMENTED"));
-  nameCell.append(meta);
-
   const statusCell = row.querySelector(".challenge-status-cell");
   statusCell.replaceChildren(node("span", `status-badge ${challenge.status}`, statusLabel(challenge.status)));
 
@@ -616,6 +683,13 @@ function updateChallengeRow(row, challenge) {
         : "",
     ),
   );
+  const elapsed = node(
+    "span",
+    "challenge-elapsed row-duration-copy",
+    `풀이 ${formatDuration(challengeElapsedSeconds(challenge))}`,
+  );
+  elapsed.dataset.challengeElapsed = challenge.name;
+  progressCell.append(elapsed);
 
   row.querySelector(".challenge-cost-cell").textContent = formatMoney(challenge.cost_usd);
   const action = row.querySelector(".row-action");
@@ -919,9 +993,11 @@ function renderDetailPage({ preserveScroll = false } = {}) {
   summary.append(
     metric("STATUS", statusLabel(challenge.status)),
     metric("AGENTS", String(challenge.agents.length)),
+    metric("SOLVE TIME", formatDuration(challengeElapsedSeconds(challenge))),
     metric("COST", formatMoney(challenge.cost_usd)),
     metric("WRITEUP", challenge.documented ? "DONE" : challenge.solved ? "PENDING" : "WAITING"),
   );
+  summary.children[2].querySelector("strong").dataset.challengeElapsed = challenge.name;
   const controls = node("div", "control-row detail-actions");
   if (challenge.active) {
     controls.append(button("풀이 중단", "danger-button", () => stopChallenge(challenge.name)));
@@ -1020,6 +1096,7 @@ function renderDetailPage({ preserveScroll = false } = {}) {
     if (agent.role_title) header.title = agent.role_title;
     const stats = node("div", "agent-stats");
     stats.append(
+      node("span", "", `elapsed ${formatDuration(agent.duration_seconds || 0)}`),
       node("span", "", `${formatNumber(agent.steps)} steps`),
       node("span", "", `${formatTokens(agent.input_tokens)} in`),
       node("span", "", `${formatTokens(agent.output_tokens)} out`),
@@ -1259,19 +1336,25 @@ async function refresh({ renderSelected = false } = {}) {
   byId("refresh-button").disabled = true;
   byId("refresh-button").setAttribute("aria-busy", "true");
   try {
-    state.snapshot = await api("/api/status");
+    const snapshot = await api("/api/status");
+    syncFrontendClocks(snapshot);
+    state.snapshot = snapshot;
     notifyCandidateReviews(state.snapshot);
     setConnection(true);
-    renderOverview();
-    renderRows();
+    const selecting = hasActiveTextSelection();
+    if (!selecting) {
+      renderOverview();
+      renderRows();
+    }
     if (state.selectedChallenge && renderSelected) {
       const challenge = currentChallenge(state.selectedChallenge);
       const active = document.activeElement;
       const editing = active && byId("detail-content").contains(active)
         && active.matches("input, textarea");
       const changed = detailRenderSignature(challenge) !== state.detailSignature;
-      if (changed && !editing) renderDetailPage({ preserveScroll: true });
+      if (changed && !editing && !selecting) renderDetailPage({ preserveScroll: true });
     }
+    renderLiveClocks();
   } catch (error) {
     setConnection(false);
   } finally {
@@ -1297,6 +1380,7 @@ async function refreshResources() {
         if (byAgent.has(agent.model_spec)) agent.resource = byAgent.get(agent.model_spec);
       }
     }
+    if (hasActiveTextSelection()) return;
     renderGlobalResources(state.snapshot.resources);
     for (const row of byId("challenge-rows").querySelectorAll("tr")) {
       const challenge = state.snapshot.challenges.find(
@@ -1566,6 +1650,7 @@ async function initialize() {
     syncViewFromLocation({ animate: false });
     state.refreshTimer = window.setInterval(() => refresh({ renderSelected: true }), 2500);
     state.resourceTimer = window.setInterval(refreshResources, 1000);
+    state.clockTimer = window.setInterval(renderLiveClocks, 1000);
     state.codexUsageTimer = window.setInterval(refreshCodexUsage, 30_000);
   } catch (error) {
     setConnection(false);

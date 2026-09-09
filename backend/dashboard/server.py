@@ -49,6 +49,7 @@ from backend.writeups import (
     interrupted_writeup_status,
     read_writeup,
     seed_writeup_from_solver_evidence,
+    writeup_review_verdict,
     writeup_status,
 )
 
@@ -509,7 +510,13 @@ class DashboardServer:
             writeup_task = self._writeup_tasks.get(name)
             if writeup_solver is not None and writeup_task is not None and not writeup_task.done():
                 phase = self._writeup_phases.get(name, "writing")
-                role = "writeup_review" if phase == "reviewing" else "writeup"
+                role = (
+                    "writeup_review"
+                    if phase == "reviewing"
+                    else "writeup_revision"
+                    if phase == "revising"
+                    else "writeup"
+                )
                 spec = f"{writeup_solver.model_spec}/{role.replace('_', '-')}"
                 resource_reader = getattr(writeup_solver.sandbox, "resource_snapshot", None)
                 resource = resource_reader() if callable(resource_reader) else {}
@@ -517,14 +524,24 @@ class DashboardServer:
                     {
                         "model_spec": spec,
                         "role": role,
-                        "role_title": "Luna writeup reviewer" if phase == "reviewing" else "Terra writeup writer",
+                        "role_title": (
+                            "Luna writeup reviewer"
+                            if phase == "reviewing"
+                            else "Terra writeup reviser"
+                            if phase == "revising"
+                            else "Terra writeup writer"
+                        ),
                         "skill_path": "",
                         "status": "generating",
                         "steps": getattr(writeup_solver, "_step_count", 0),
                         "findings": getattr(
                             writeup_solver,
                             "activity_summary",
-                            "생성된 라이트업을 검수하는 중" if phase == "reviewing" else "풀이 내역으로 라이트업을 작성하는 중",
+                            "생성된 라이트업을 검수하는 중"
+                            if phase == "reviewing"
+                            else "검수 반려 항목을 수정하는 중"
+                            if phase == "revising"
+                            else "풀이 내역으로 라이트업을 작성하는 중",
                         ),
                         "trace": Path(
                             getattr(getattr(writeup_solver, "tracer", None), "path", "")
@@ -758,8 +775,8 @@ class DashboardServer:
                 if resource:
                     agents.append(
                         {
-                            "model_spec": f"{writeup_solver.model_spec}/{'writeup-review' if phase == 'reviewing' else 'writeup'}",
-                            "role": "writeup_review" if phase == "reviewing" else "writeup",
+                            "model_spec": f"{writeup_solver.model_spec}/{'writeup-review' if phase == 'reviewing' else 'writeup-revision' if phase == 'revising' else 'writeup'}",
+                            "role": "writeup_review" if phase == "reviewing" else "writeup_revision" if phase == "revising" else "writeup",
                             "resource": resource,
                         }
                     )
@@ -869,11 +886,21 @@ class DashboardServer:
             solver = self._writeup_solvers.get(name)
             phase = self._writeup_phases.get(name, "writing")
             status["phase"] = phase
-            status["phase_label"] = "Luna-Medium 검수" if phase == "reviewing" else "Terra-Medium 작성"
+            status["phase_label"] = (
+                "Luna-Medium 검수"
+                if phase == "reviewing"
+                else "Terra-Medium 수정"
+                if phase == "revising"
+                else "Terra-Medium 작성"
+            )
             status["activity"] = getattr(
                 solver,
                 "activity_summary",
-                "생성된 라이트업을 검수하는 중" if phase == "reviewing" else "풀이 내역으로 라이트업을 작성하는 중",
+                "생성된 라이트업을 검수하는 중"
+                if phase == "reviewing"
+                else "검수 반려 항목을 수정하는 중"
+                if phase == "revising"
+                else "풀이 내역으로 라이트업을 작성하는 중",
             )
             idle_reader = getattr(solver, "activity_idle_seconds", None)
             status["steps"] = getattr(solver, "_step_count", 0)
@@ -973,31 +1000,40 @@ class DashboardServer:
                 int(getattr(self.deps.settings, "writeup_generation_timeout_seconds", 1800)),
             )
             results = []
-            for phase, spec, task_mode in (
-                ("writing", model_spec, "writeup"),
-                ("reviewing", review_model_spec, "writeup_review"),
-            ):
-                self._writeup_phases[name] = phase
-                solver = self._create_writeup_solver(
-                    name,
-                    meta,
-                    challenge_dir,
-                    spec,
-                    flag,
-                    task_mode=task_mode,
-                )
-                self._writeup_solvers[name] = solver
-                try:
-                    results.append(
-                        await asyncio.wait_for(self._wait_for_writeup(solver), timeout=timeout)
+            # The configured limit applies to the complete writer + reviewer
+            # pipeline. Previously each stage received the full allowance, so a
+            # nominal 30-minute job could occupy resources for roughly an hour.
+            async with asyncio.timeout(timeout):
+                async def run_stage(phase: str, spec: str, task_mode: str) -> None:
+                    self._writeup_phases[name] = phase
+                    solver = self._create_writeup_solver(
+                        name, meta, challenge_dir, spec, flag, task_mode=task_mode
                     )
-                finally:
+                    self._writeup_solvers[name] = solver
                     try:
-                        await asyncio.wait_for(solver.stop(), timeout=15)
-                    except Exception as exc:
-                        logger.warning("Could not stop %s stage for %s: %s", phase, name, exc)
-                    if self._writeup_solvers.get(name) is solver:
-                        self._writeup_solvers.pop(name, None)
+                        results.append(await self._wait_for_writeup(solver))
+                    finally:
+                        try:
+                            await asyncio.wait_for(solver.stop(), timeout=15)
+                        except Exception as exc:
+                            logger.warning(
+                                "Could not stop %s stage for %s: %s", phase, name, exc
+                            )
+                        if self._writeup_solvers.get(name) is solver:
+                            self._writeup_solvers.pop(name, None)
+
+                stages = [
+                    ("writing", model_spec, "writeup"),
+                    ("reviewing", review_model_spec, "writeup_review"),
+                ]
+                for phase, spec, task_mode in stages:
+                    await run_stage(phase, spec, task_mode)
+                if writeup_review_verdict(self.deps.settings, name) == "rejected":
+                    for phase, spec, task_mode in (
+                        ("revising", model_spec, "writeup_revision"),
+                        ("reviewing", review_model_spec, "writeup_review"),
+                    ):
+                        await run_stage(phase, spec, task_mode)
             status = finalize_writeup(
                 self.deps.settings,
                 name,
@@ -1038,7 +1074,6 @@ class DashboardServer:
         finally:
             self._writeup_solvers.pop(name, None)
             self._writeup_phases.pop(name, None)
-            self._writeup_tasks.pop(name, None)
 
         if name in self.deps.results:
             self.deps.results[name]["writeup"] = status
@@ -1083,6 +1118,13 @@ class DashboardServer:
                 name=f"writeup-{name}",
             )
             self._writeup_tasks[name] = task
+            task.add_done_callback(
+                lambda completed, challenge=name: (
+                    self._writeup_tasks.pop(challenge, None)
+                    if self._writeup_tasks.get(challenge) is completed
+                    else None
+                )
+            )
             return status
 
     async def _request_writeup(self, request: web.Request) -> web.Response:

@@ -54,7 +54,7 @@ Delegate는 기본적으로 최대 4개, 동시에 2개까지만 실행됩니다
 - 문제 category별 playbook과 `/challenge/skills`의 CTF skill
 - solver별 CPU, memory, PID, network, block I/O 및 token/cost telemetry
 - 운영자 힌트, solver 제어, trace 및 evidence 조회가 가능한 로컬 dashboard
-- Terra 작성 → Luna 독립 검수의 2단계 한국어 writeup과 Markdown/evidence ZIP
+- Terra 작성 → Luna 독립 검수 → 반려 시 Terra 수정·Luna 재검수의 한국어 writeup과 Markdown/evidence ZIP
 - 고정 corpus 및 variant 비교를 위한 재현 가능한 benchmark harness
 
 ## 요구 사항

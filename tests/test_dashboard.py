@@ -151,8 +151,14 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("refresh({ renderSelected: true })", javascript)
             self.assertIn("captureDetailViewState", javascript)
             self.assertIn("document.createDocumentFragment()", javascript)
-            self.assertIn("if (changed && !editing)", javascript)
+            self.assertIn("if (changed && !editing && !selecting)", javascript)
             self.assertIn("refreshCodexUsage", javascript)
+            self.assertIn("syncFrontendClocks", javascript)
+            self.assertIn("renderLiveClocks", javascript)
+            self.assertIn("hasActiveTextSelection", javascript)
+            self.assertIn("data-challenge-elapsed", javascript)
+            self.assertIn('node("button", "challenge-name")', javascript)
+            self.assertNotIn("row.tabIndex = 0", javascript)
             self.assertIn("traces: new Map()", javascript)
             self.assertIn(
                 "state.traces.get(challenge.name)?.get(agent.model_spec)",
@@ -167,13 +173,20 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("minmax(280px, .618fr) minmax(0, 1fr)", stylesheet)
             self.assertIn("minmax(0, 1.618fr) minmax(340px, 1fr)", stylesheet)
             self.assertIn(".setup-form input.sr-only", stylesheet)
-            self.assertIn(".file-remove { flex: 0 0 auto; width: 36px; height: 36px", stylesheet)
-            self.assertIn(".segmented button { min-height: 36px", stylesheet)
+            self.assertIn(".file-remove { flex: 0 0 auto; width: 40px; height: 40px", stylesheet)
+            self.assertIn(".segmented button { min-height: 40px", stylesheet)
+            self.assertIn(".setup-form .setup-submit { min-height: 40px; }", stylesheet)
+            self.assertIn("outline: 3px solid var(--focus-ring)", stylesheet)
+            self.assertIn("@media (forced-colors: active)", stylesheet)
+            self.assertIn("body { user-select: text; }", stylesheet)
+            self.assertIn(".row-duration-copy", stylesheet)
 
         async with self.client.get(f"{self.base_url}/") as response:
             html = await response.text()
             self.assertIn('id="codex-usage-windows"', html)
             self.assertIn('id="codex-usage-refresh"', html)
+            self.assertIn('id="uptime-value"', html)
+            self.assertIn('aria-labelledby="dashboard-title"', html)
 
         html_ids = re.findall(r'\bid="([^"]+)"', html)
         javascript_refs = {
@@ -608,6 +621,63 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             activity_idle_seconds=lambda: 0,
         )
         self.assertIs(await self.server._wait_for_writeup(solver), result)
+
+    async def test_writeup_timeout_wraps_the_complete_two_stage_pipeline(self) -> None:
+        result = SimpleNamespace(status="incomplete")
+        solvers = [
+            SimpleNamespace(
+                run_until_done_or_gave_up=AsyncMock(return_value=result),
+                activity_idle_seconds=lambda: 0,
+                stop=AsyncMock(),
+            )
+            for _ in range(2)
+        ]
+        self.deps.settings.writeup_generation_timeout_seconds = 90
+        self.server._create_writeup_solver = MagicMock(side_effect=solvers)
+
+        with patch("backend.dashboard.server.asyncio.timeout", wraps=asyncio.timeout) as timeout:
+            await self.server._run_writeup_generation(
+                "web/intro",
+                ChallengeMeta(name="web/intro", category="Web"),
+                "codex/gpt-5.6-terra/medium",
+                "codex/gpt-5.6-luna/medium",
+                "TEAM{verified}",
+            )
+
+        timeout.assert_called_once_with(90)
+        self.assertEqual(self.server._create_writeup_solver.call_count, 2)
+        for solver in solvers:
+            solver.stop.assert_awaited_once()
+
+    async def test_rejected_writeup_is_revised_and_reviewed_once_more(self) -> None:
+        result = SimpleNamespace(status="incomplete")
+        solvers = [
+            SimpleNamespace(
+                run_until_done_or_gave_up=AsyncMock(return_value=result),
+                activity_idle_seconds=lambda: 0,
+                stop=AsyncMock(),
+            )
+            for _ in range(4)
+        ]
+        self.server._create_writeup_solver = MagicMock(side_effect=solvers)
+
+        with patch(
+            "backend.dashboard.server.writeup_review_verdict", return_value="rejected"
+        ):
+            await self.server._run_writeup_generation(
+                "web/intro",
+                ChallengeMeta(name="web/intro", category="Web"),
+                "codex/gpt-5.6-terra/medium",
+                "codex/gpt-5.6-luna/medium",
+                "TEAM{verified}",
+            )
+
+        self.assertEqual(
+            [call.kwargs["task_mode"] for call in self.server._create_writeup_solver.call_args_list],
+            ["writeup", "writeup_review", "writeup_revision", "writeup_review"],
+        )
+        for solver in solvers:
+            solver.stop.assert_awaited_once()
 
     async def test_writeup_watchdog_cancellation_drains_child_job(self) -> None:
         started = asyncio.Event()

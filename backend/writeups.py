@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,7 @@ _CORE_EVIDENCE_WORDS = (
 )
 _SUCCESS_EVIDENCE_WORDS = ("해결", "성공", "플래그", "flag", "정답", "결과", "복구")
 _APPROVED_REVIEW_RE = re.compile(r"(?im)^Verdict:\s*APPROVED\s*$")
+_REJECTED_REVIEW_RE = re.compile(r"(?im)^Verdict:\s*REJECTED\s*$")
 
 
 def _has_korean_narrative(text: str, minimum_characters: int = 20) -> bool:
@@ -133,7 +136,10 @@ def _valid_image(path: Path) -> bool:
     try:
         if path.stat().st_size > _MAX_IMAGE_BYTES:
             return False
-        magic = path.read_bytes()[:12]
+        # Reading the whole screenshot just to inspect its signature made large
+        # evidence directories needlessly expensive to inventory.
+        with path.open("rb") as image:
+            magic = image.read(12)
     except OSError:
         return False
     suffix = path.suffix.casefold()
@@ -150,31 +156,67 @@ def _relative(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
-def _discover_images(root: Path) -> list[Path]:
+def _discover_artifacts(root: Path) -> tuple[list[Path], list[Path]]:
+    """Inventory images and reproducers in one failure-tolerant tree walk."""
     candidates: list[tuple[int, int, Path]] = []
+    reproducers: list[Path] = []
     seen_hashes: set[str] = set()
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.casefold() not in _IMAGE_SUFFIXES:
-            continue
-        if not _valid_image(path):
-            continue
-        digest = _file_sha256(path)
-        if digest and digest in seen_hashes:
-            continue
-        if digest:
-            seen_hashes.add(digest)
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        name = path.name.casefold()
-        score = 20
-        if any(word in name for word in ("proof", "success", "flag", "exploit", "result")):
-            score += 50
-        if "screenshot" in name or "evidence" in path.as_posix().casefold():
-            score += 30
-        candidates.append((score, stat.st_mtime_ns, path))
-    return [item[2] for item in sorted(candidates, reverse=True)[:_MAX_IMAGES]]
+    for directory, dirnames, filenames in os.walk(root, topdown=True, onerror=lambda _exc: None):
+        # Never follow directory symlinks out of the challenge workspace.
+        dirnames[:] = [
+            name for name in dirnames if not (Path(directory) / name).is_symlink()
+        ]
+        for filename in filenames:
+            path = Path(directory) / filename
+            suffix = path.suffix.casefold()
+            try:
+                if path.is_symlink():
+                    continue
+                stat = path.stat()
+            except OSError:
+                # Solver processes may still be atomically replacing artifacts.
+                continue
+
+            if suffix in _IMAGE_SUFFIXES and _valid_image(path):
+                digest = _file_sha256(path)
+                if digest and digest in seen_hashes:
+                    continue
+                if digest:
+                    seen_hashes.add(digest)
+                name = path.name.casefold()
+                score = 20
+                if any(
+                    word in name for word in ("proof", "success", "flag", "exploit", "result")
+                ):
+                    score += 50
+                if "screenshot" in name or "evidence" in path.as_posix().casefold():
+                    score += 30
+                candidates.append((score, stat.st_mtime_ns, path))
+
+            if suffix in _REPRO_SUFFIXES:
+                try:
+                    relative_parts = path.relative_to(root).parts
+                except ValueError:
+                    continue
+                if (
+                    not any(part.startswith(".") for part in relative_parts)
+                    and stat.st_size <= 2 * 1024 * 1024
+                ):
+                    reproducers.append(path)
+
+    images = [item[2] for item in sorted(candidates, reverse=True)[:_MAX_IMAGES]]
+    reproducers.sort(
+        key=lambda path: (
+            not any(word in path.name.casefold() for word in ("solve", "exploit", "poc", "repro")),
+            len(path.parts),
+            path.name.casefold(),
+        )
+    )
+    return images, reproducers[:12]
+
+
+def _discover_images(root: Path) -> list[Path]:
+    return _discover_artifacts(root)[0]
 
 
 def _image_manifest_entry(path: Path, root: Path) -> dict[str, Any]:
@@ -187,27 +229,26 @@ def _image_manifest_entry(path: Path, root: Path) -> dict[str, Any]:
     }
 
 
+def _image_manifest_entries(paths: list[Path], root: Path) -> list[dict[str, Any]]:
+    """Ignore evidence removed between discovery and manifest serialization."""
+    entries: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            entries.append(_image_manifest_entry(path, root))
+        except (OSError, ValueError):
+            continue
+    return entries
+
+
 def _discover_reproducers(root: Path) -> list[Path]:
-    candidates: list[Path] = []
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.casefold() not in _REPRO_SUFFIXES:
-            continue
-        if any(part.startswith(".") for part in path.relative_to(root).parts):
-            continue
-        if path.stat().st_size > 2 * 1024 * 1024:
-            continue
-        candidates.append(path)
-    return sorted(
-        candidates,
-        key=lambda path: (
-            not any(word in path.name.casefold() for word in ("solve", "exploit", "poc", "repro")),
-            len(path.parts),
-            path.name.casefold(),
-        ),
-    )[:12]
+    return _discover_artifacts(root)[1]
 
 
-def _stage_writeup_reproducers(root: Path, output_dir: Path) -> list[Path]:
+def _stage_writeup_reproducers(
+    root: Path,
+    output_dir: Path,
+    sources: list[Path] | None = None,
+) -> list[Path]:
     """Expose solver scripts to fresh documentation containers through shared storage.
 
     Each writer/reviewer receives a new private `/challenge/workspace`, so paths
@@ -217,7 +258,7 @@ def _stage_writeup_reproducers(root: Path, output_dir: Path) -> list[Path]:
     """
     staged_root = output_dir / "reproducers"
     staged: list[Path] = []
-    for source in _discover_reproducers(root):
+    for source in sources if sources is not None else _discover_reproducers(root):
         try:
             relative = source.relative_to(root)
         except ValueError:
@@ -253,15 +294,22 @@ def _source_report(root: Path, prefer_canonical: bool = False) -> tuple[Path | N
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
+    _atomic_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _atomic_text(path: Path, content: str) -> None:
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(content, encoding="utf-8")
-    temp.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        temp.replace(path)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
 
 
 def _writeup_history(payload: dict[str, Any], event: str, detail: str = "") -> list[dict[str, str]]:
@@ -282,7 +330,11 @@ def _writeup_history(payload: dict[str, Any], event: str, detail: str = "") -> l
 
 def _file_sha256(path: Path) -> str:
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
     except OSError:
         return ""
 
@@ -306,9 +358,9 @@ def begin_writeup_generation(
         previous = {}
     writeup_path = output_dir / "WRITEUP.md"
     review_path = output_dir / "REVIEW.md"
-    staged_reproducers = _stage_writeup_reproducers(root, output_dir)
-    images = _discover_images(root)
-    reproducers = staged_reproducers or _discover_reproducers(root)
+    images, discovered_reproducers = _discover_artifacts(root)
+    staged_reproducers = _stage_writeup_reproducers(root, output_dir, discovered_reproducers)
+    reproducers = staged_reproducers or discovered_reproducers
     now = datetime.now(UTC).isoformat()
     payload = {
         "status": "generating",
@@ -326,7 +378,7 @@ def begin_writeup_generation(
         "previous_review_sha256": _file_sha256(review_path),
         "issues": [],
         "history": _writeup_history(previous, "started", "라이트업 작성 및 검수를 시작했습니다"),
-        "screenshots": [_image_manifest_entry(path, root) for path in images],
+        "screenshots": _image_manifest_entries(images, root),
         "reproducers": [_relative(path, root) for path in reproducers],
     }
     _atomic_json(manifest_path, payload)
@@ -402,6 +454,29 @@ def interrupted_writeup_status(payload: dict[str, Any]) -> dict[str, Any]:
     return recovered
 
 
+def writeup_review_verdict(settings: object, challenge_name: str) -> str:
+    """Return a fresh persisted review verdict, ignoring stale prior attempts."""
+    root = Path(challenge_workspace_path(settings, challenge_name))
+    output_dir = root / "_shared" / "writeup"
+    manifest_path = output_dir / "manifest.json"
+    review_path = output_dir / "REVIEW.md"
+    try:
+        state = json.loads(manifest_path.read_text(encoding="utf-8"))
+        review = review_path.read_text(encoding="utf-8", errors="replace")[:100_000]
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    previous_hash = str(state.get("previous_review_sha256", ""))
+    if previous_hash and previous_hash == _file_sha256(review_path):
+        return ""
+    if _APPROVED_REVIEW_RE.search(review):
+        return "approved"
+    if _REJECTED_REVIEW_RE.search(review):
+        return "rejected"
+    return ""
+
+
 def finalize_writeup(
     settings: object,
     challenge_name: str,
@@ -420,8 +495,7 @@ def finalize_writeup(
     writeup_path = output_dir / "WRITEUP.md"
     review_path = output_dir / "REVIEW.md"
     source, report = _source_report(root, prefer_canonical=prefer_canonical)
-    images = _discover_images(root)
-    reproducers = _discover_reproducers(root)
+    images, reproducers = _discover_artifacts(root)
     manifest_images = images
     try:
         generation_state = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -543,7 +617,7 @@ def finalize_writeup(
             "completed" if status == "complete" else "needs_attention",
             "라이트업 품질 검사를 완료했습니다",
         ),
-        "screenshots": [_image_manifest_entry(path, root) for path in manifest_images],
+        "screenshots": _image_manifest_entries(manifest_images, root),
         "reproducers": [_relative(path, root) for path in reproducers],
     }
     _atomic_json(manifest_path, payload)

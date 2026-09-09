@@ -920,6 +920,13 @@ class ChallengeSwarm:
                         model_spec,
                     )
                     continue
+                if result.stop_reason.startswith("compaction recovery:"):
+                    logger.warning(
+                        "[%s/%s] Compaction recovery created a fresh thread; resuming immediately",
+                        self.meta.name,
+                        model_spec,
+                    )
+                    continue
                 if progress_after == progress_before:
                     result = self._budget_result(
                         solver,

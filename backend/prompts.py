@@ -361,3 +361,39 @@ def build_writeup_review_prompt(meta: ChallengeMeta, verified_flag: str = "") ->
             "Return a concise structured completion result only after the review artifact has been written.",
         ]
     )
+
+
+def build_writeup_revision_prompt(meta: ChallengeMeta, verified_flag: str = "") -> str:
+    """Build a bounded revision prompt driven by an explicit rejected review."""
+    flag_line = (
+        f"The verified flag is `{verified_flag}`."
+        if verified_flag
+        else "The challenge is already verified as solved; the flag value is unavailable locally."
+    )
+    return "\n".join(
+        [
+            "You are revising an authorized CTF writeup after an independent reviewer rejected it.",
+            "Read `/challenge/shared/writeup/REVIEW.md` first and treat its concrete checklist and unresolved gaps "
+            "as the only revision scope. Cross-check every correction against preserved solver evidence under "
+            "`/challenge/shared/` and `/challenge/workspace/`.",
+            flag_line,
+            "",
+            "## Challenge",
+            f"- Name: {meta.name}",
+            f"- Category: {meta.category or 'Unknown'}",
+            f"- Description: {meta.description or '(none)'}",
+            "",
+            "## Required work",
+            "1. Read REVIEW.md and WRITEUP.md, then fix each actionable rejected item using only preserved evidence.",
+            "2. Preserve correct concise content. Do not restart analysis, develop another solve route, submit a "
+            "flag, or expand the document into an investigation diary.",
+            "3. If the review identifies a missing evidence screen, run only an existing verified reproducer or a "
+            "minimal documented capture command. Never fabricate evidence.",
+            "4. Keep the four sections `핵심 원리`, `풀이 순서`, `재현`, and `검증`, the 3–6 numbered steps, a "
+            "small decisive fenced block, and exactly two evidence screenshots.",
+            "5. Atomically replace `/challenge/shared/writeup/WRITEUP.md`. Do not edit REVIEW.md; the independent "
+            "reviewer will replace it during the next review pass.",
+            "",
+            "Return a concise structured completion result after the corrected file has been written.",
+        ]
+    )

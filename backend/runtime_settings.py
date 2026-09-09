@@ -49,6 +49,8 @@ class RuntimeSettings(BaseModel):
     solver_max_raw_tokens: int = Field(default=12_000_000, ge=0, le=500_000_000)
     solver_cached_token_weight: float = Field(default=0.10, ge=0.0, le=1.0)
     solver_turn_slice_tokens: int = Field(default=1_500_000, ge=0, le=100_000_000)
+    solver_compaction_timeout_seconds: int = Field(default=300, ge=30, le=3600)
+    solver_compaction_max_waits: int = Field(default=2, ge=1, le=10)
     solver_max_estimated_cost_usd: float = Field(default=0.0, ge=0.0, le=10_000.0)
     max_flag_submissions_per_challenge: int = Field(default=8, ge=1, le=100)
     max_command_timeout_seconds: int = Field(default=600, ge=1, le=3600)

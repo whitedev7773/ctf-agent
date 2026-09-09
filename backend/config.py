@@ -68,6 +68,10 @@ class Settings(BaseSettings):
     # End a long turn at a tool boundary, compact it, then resume. This prevents
     # a 150k context from being replayed for dozens of calls in one giant turn.
     solver_turn_slice_tokens: int = 1_500_000
+    # Compaction time grows with cached thread size. Wait in bounded windows so
+    # slow completion is not mislabeled as token-budget exhaustion.
+    solver_compaction_timeout_seconds: int = 300
+    solver_compaction_max_waits: int = 2
     solver_max_estimated_cost_usd: float = 0.0
     max_flag_submissions_per_challenge: int = 8
     max_command_timeout_seconds: int = 600

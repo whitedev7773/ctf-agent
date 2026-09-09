@@ -41,6 +41,7 @@ from backend.prompts import (
     build_prompt,
     build_writeup_prompt,
     build_writeup_review_prompt,
+    build_writeup_revision_prompt,
     list_distfiles,
 )
 from backend.reasoning_state import (
@@ -418,7 +419,7 @@ class CodexSolver:
         self.delegate_task_fn = delegate_task_fn
         self.delegate_status_fn = delegate_status_fn
         self.task_directive = task_directive.strip()[:6000]
-        if task_mode not in {"solve", "writeup", "writeup_review"}:
+        if task_mode not in {"solve", "writeup", "writeup_review", "writeup_revision"}:
             raise ValueError(f"unsupported Codex task mode: {task_mode}")
         self.task_mode = task_mode
         self.verified_flag = verified_flag.strip()[:2000]
@@ -492,6 +493,8 @@ class CodexSolver:
         self._activity_summary = (
             "풀이 내역을 바탕으로 라이트업 구성을 준비하는 중"
             if task_mode == "writeup"
+            else "검수 반려 항목을 바탕으로 라이트업 수정을 준비하는 중"
+            if task_mode == "writeup_revision"
             else "생성된 라이트업의 검수 기준을 준비하는 중"
             if task_mode == "writeup_review"
             else ""
@@ -502,6 +505,8 @@ class CodexSolver:
         self._reader_task: asyncio.Task | None = None
         self._turn_done: asyncio.Event = asyncio.Event()
         self._compact_done: asyncio.Event = asyncio.Event()
+        self._compacting_thread_id: str | None = None
+        self._thread_params: dict[str, Any] = {}
         self._reasoning_effort = effort_from_spec(self.model_spec) or LEGACY_REASONING_EFFORT.get(
             self.model_id
         )
@@ -515,6 +520,8 @@ class CodexSolver:
         distfile_names = list_distfiles(self.challenge_dir)
         if self.task_mode == "writeup":
             system_prompt = build_writeup_prompt(self.meta, self.verified_flag)
+        elif self.task_mode == "writeup_revision":
+            system_prompt = build_writeup_revision_prompt(self.meta, self.verified_flag)
         elif self.task_mode == "writeup_review":
             system_prompt = build_writeup_review_prompt(self.meta, self.verified_flag)
         else:
@@ -581,7 +588,7 @@ class CodexSolver:
 
         # thread/start — system prompt is supplied through baseInstructions
         # Prepend sandbox path reminder to prevent models from using host paths
-        if self.task_mode in {"writeup", "writeup_review"}:
+        if self.task_mode in {"writeup", "writeup_review", "writeup_revision"}:
             allowed = {"bash", "read_file", "write_file", "list_files", "view_image", "web_fetch"}
             dynamic_tools = [tool for tool in SANDBOX_TOOLS if tool["name"] in allowed]
         else:
@@ -607,6 +614,7 @@ class CodexSolver:
             "sandbox": "read-only",
             "dynamicTools": dynamic_tools,
         }
+        self._thread_params = thread_params
         resp = await self._rpc("thread/start", thread_params)
         # ThreadStartResponse: result.thread.id
         self._thread_id = resp.get("result", {}).get("thread", {}).get("id", "")
@@ -754,19 +762,94 @@ class CodexSolver:
     async def _compact_between_turns(self) -> bool:
         """Compact after an interrupted turn and report whether it completed."""
         self._compact_done.clear()
+        self._compacting_thread_id = self._thread_id
+        settings = getattr(self, "settings", None)
+        timeout = max(
+            1.0,
+            float(getattr(settings, "solver_compaction_timeout_seconds", 300)),
+        )
+        max_waits = max(1, int(getattr(settings, "solver_compaction_max_waits", 2)))
         try:
             await self._rpc("thread/compact/start", {"threadId": self._thread_id})
-            self.tracer.event("compact_requested", tokens=self._latest_raw_tokens)
-            try:
-                await asyncio.wait_for(self._compact_done.wait(), timeout=120)
-            except TimeoutError:
-                logger.warning("[%s] Compaction completion timed out", self.agent_name)
-                self.tracer.event("compact_timeout", tokens=self._latest_raw_tokens)
-                return False
+            self.tracer.event(
+                "compact_requested",
+                tokens=self._latest_raw_tokens,
+                timeout_seconds=timeout,
+                max_waits=max_waits,
+            )
+            for wait_number in range(1, max_waits + 1):
+                started_at = time.monotonic()
+                try:
+                    await asyncio.wait_for(self._compact_done.wait(), timeout=timeout)
+                    self.tracer.event(
+                        "compact_wait_complete",
+                        wait_number=wait_number,
+                        duration_seconds=round(time.monotonic() - started_at, 1),
+                    )
+                    self._compacting_thread_id = None
+                    return True
+                except TimeoutError:
+                    if wait_number < max_waits:
+                        logger.warning(
+                            "[%s] Compaction still pending after %.0fs; waiting again (%s/%s)",
+                            self.agent_name,
+                            timeout,
+                            wait_number,
+                            max_waits,
+                        )
+                        self.tracer.event(
+                            "compact_wait_retry",
+                            tokens=self._latest_raw_tokens,
+                            wait_number=wait_number,
+                            timeout_seconds=timeout,
+                        )
+                        continue
+                    logger.warning("[%s] Compaction completion timed out", self.agent_name)
+                    self.tracer.event(
+                        "compact_timeout",
+                        tokens=self._latest_raw_tokens,
+                        waits=max_waits,
+                        timeout_seconds=timeout,
+                    )
+                    self._compacting_thread_id = None
+                    return False
         except Exception as exc:
+            self._compacting_thread_id = None
             logger.warning("[%s] Compaction request failed: %s", self.agent_name, exc)
             self.tracer.event("compact_failed", error=str(exc))
             return False
+
+    async def _recover_from_compaction_failure(self, reason: str) -> bool:
+        """Move to a fresh thread that resumes from durable workspace artifacts."""
+        if not self._thread_params:
+            self.tracer.event("compact_recovery_failed", error="thread parameters unavailable")
+            return False
+        previous_thread_id = self._thread_id
+        try:
+            response = await self._rpc("thread/start", dict(self._thread_params))
+            new_thread_id = response.get("result", {}).get("thread", {}).get("id", "")
+            if not new_thread_id:
+                raise RuntimeError("thread/start returned no thread id")
+        except Exception as exc:
+            logger.warning("[%s] Fresh-thread checkpoint recovery failed: %s", self.agent_name, exc)
+            self.tracer.event("compact_recovery_failed", error=str(exc))
+            return False
+
+        self._thread_id = new_thread_id
+        self._latest_raw_tokens = 0
+        self._turn_start_raw_tokens = 0
+        self._resume_after_checkpoint = True
+        self.tracer.event(
+            "compact_recovered_new_thread",
+            previous_thread_id=previous_thread_id,
+            thread_id=new_thread_id,
+            reason=reason,
+        )
+        logger.warning(
+            "[%s] Compaction did not finish; resuming from workspace on fresh thread %s",
+            self.agent_name,
+            new_thread_id,
+        )
         return True
 
     async def _read_loop(self) -> None:
@@ -808,8 +891,21 @@ class CodexSolver:
                 if item.get("type") == "contextCompaction":
                     # Current app-server protocol. ``thread/compacted`` below is
                     # retained for compatibility with older Codex versions.
-                    self._compact_done.set()
-                    self.tracer.event("compact_complete", tokens=self._latest_raw_tokens)
+                    compact_thread_id = params.get("threadId")
+                    expected_thread_id = getattr(self, "_compacting_thread_id", None)
+                    if (
+                        expected_thread_id is None
+                        or not compact_thread_id
+                        or compact_thread_id == expected_thread_id
+                    ):
+                        self._compact_done.set()
+                        self.tracer.event("compact_complete", tokens=self._latest_raw_tokens)
+                    else:
+                        self.tracer.event(
+                            "compact_complete_ignored",
+                            thread_id=compact_thread_id,
+                            expected_thread_id=expected_thread_id,
+                        )
                 elif item.get("type") == "agentMessage":
                     text = item.get("text", "")
                     phase = item.get("phase")  # "commentary" | "final_answer" | null
@@ -862,8 +958,21 @@ class CodexSolver:
                 self._turn_done.set()
 
             elif method == "thread/compacted":
-                self._compact_done.set()
-                self.tracer.event("compact_complete", tokens=self._latest_raw_tokens)
+                compact_thread_id = params.get("threadId")
+                expected_thread_id = getattr(self, "_compacting_thread_id", None)
+                if (
+                    expected_thread_id is None
+                    or not compact_thread_id
+                    or compact_thread_id == expected_thread_id
+                ):
+                    self._compact_done.set()
+                    self.tracer.event("compact_complete", tokens=self._latest_raw_tokens)
+                else:
+                    self.tracer.event(
+                        "compact_complete_ignored",
+                        thread_id=compact_thread_id,
+                        expected_thread_id=expected_thread_id,
+                    )
 
             # Notification: token usage updated
             # params: {threadId, turnId, tokenUsage: {last: TokenUsageBreakdown, total: TokenUsageBreakdown}}
@@ -1056,7 +1165,8 @@ class CodexSolver:
     def _documentation_tool_activity(self, tool_name: str, args: dict) -> str:
         """Map low-level tool calls to a compact operator-facing status."""
         reviewing = self.task_mode == "writeup_review"
-        prefix = "검수: " if reviewing else "작성: "
+        revising = self.task_mode == "writeup_revision"
+        prefix = "검수: " if reviewing else "수정: " if revising else "작성: "
         raw_path = str(args.get("path", args.get("filename", ""))).casefold()
         command = str(args.get("command", "")).casefold()
         if tool_name == "view_image":
@@ -1338,6 +1448,13 @@ class CodexSolver:
                 "two decisive screenshot roles. If one is missing, rerun only the existing verified reproducer or "
                 "minimal documented capture command. Then write REVIEW.md with the final verdict."
             )
+        elif self.task_mode == "writeup_revision":
+            prompt_text = (
+                "Read the rejected REVIEW.md and revise WRITEUP.md against each concrete finding. Preserve correct "
+                "content, use only existing solver evidence, and rerun only a minimal verified capture command when "
+                "the review explicitly identifies missing evidence. Do not edit REVIEW.md; a fresh independent "
+                "review follows this pass."
+            )
         elif self._step_count == 0:
             prompt_text = "Solve this CTF challenge."
         else:
@@ -1407,12 +1524,17 @@ class CodexSolver:
                 compacted = await self._compact_between_turns()
                 if not compacted:
                     reason = (
-                        f"{self._checkpoint_stop_reason}; compaction did not complete, "
-                        "so starting another turn is unsafe"
+                        f"compaction recovery: {self._checkpoint_stop_reason}; "
+                        "compaction did not complete, "
+                        "switching to a fresh thread backed by saved workspace artifacts"
                     )
-                    self._resume_after_checkpoint = False
-                    self._findings = self._findings or reason
-                    return self._result(BUDGET_EXHAUSTED, reason)
+                    recovered = await self._recover_from_compaction_failure(reason)
+                    self._findings = reason
+                    if recovered:
+                        return self._result(PROGRESS_CHECKPOINT, reason)
+                    failure_reason = f"{reason}; fresh-thread recovery also failed"
+                    self._findings = failure_reason
+                    return self._result(ERROR, failure_reason)
                 self._resume_after_checkpoint = True
                 self._findings = self._findings or self._checkpoint_stop_reason
                 return self._result(PROGRESS_CHECKPOINT, self._checkpoint_stop_reason)

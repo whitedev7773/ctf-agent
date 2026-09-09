@@ -210,6 +210,8 @@ class ArtifactAndProfileTests(unittest.TestCase):
         self.assertEqual(settings.solver_max_tokens, 1_500_000)
         self.assertEqual(settings.solver_max_raw_tokens, 12_000_000)
         self.assertEqual(settings.solver_cached_token_weight, 0.10)
+        self.assertEqual(settings.solver_compaction_timeout_seconds, 300)
+        self.assertEqual(settings.solver_compaction_max_waits, 2)
         self.assertEqual(DEFAULT_MODELS, ["codex/gpt-5.6-sol/high"])
         self.assertTrue(settings.dynamic_delegation_enabled)
         self.assertEqual(settings.delegate_max_concurrent, 2)
@@ -224,6 +226,8 @@ class ArtifactAndProfileTests(unittest.TestCase):
             configured = RuntimeSettings(
                 models=["codex/gpt-5.6-sol/medium"],
                 max_concurrent_challenges=3,
+                solver_compaction_timeout_seconds=420,
+                solver_compaction_max_waits=3,
                 solver_max_estimated_cost_usd=2.5,
             )
             save_runtime_settings(configured, Path(root) / "challenges")
@@ -237,6 +241,8 @@ class ArtifactAndProfileTests(unittest.TestCase):
 
             self.assertEqual(loaded.models, ["codex/gpt-5.6-sol/medium"])
             self.assertEqual(restarted.max_concurrent_challenges, 3)
+            self.assertEqual(restarted.solver_compaction_timeout_seconds, 420)
+            self.assertEqual(restarted.solver_compaction_max_waits, 3)
             self.assertEqual(restarted.solver_max_estimated_cost_usd, 2.5)
             self.assertEqual(restarted.openai_api_key, settings.openai_api_key)
 
@@ -465,6 +471,28 @@ class _CheckpointSolver(_CandidateSolver):
                 0.01,
                 "trace.jsonl",
                 stop_reason="turn slice checkpoint",
+            )
+        return await super().run_until_done_or_gave_up()
+
+
+class _RecoveredCheckpointSolver(_CandidateSolver):
+    def __init__(self, workspace: str) -> None:
+        super().__init__(workspace)
+        self.sandbox.shared_workspace_dir = ""
+        self.calls = 0
+
+    async def run_until_done_or_gave_up(self) -> SolverResult:
+        self.calls += 1
+        self._step_count += 1
+        if self.calls == 1:
+            return SolverResult(
+                None,
+                PROGRESS_CHECKPOINT,
+                "fresh-thread recovery ready",
+                self._step_count,
+                0.01,
+                "trace.jsonl",
+                stop_reason="compaction recovery: timed out; switched to fresh thread",
             )
         return await super().run_until_done_or_gave_up()
 
@@ -752,6 +780,64 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
             [("thread/compact/start", {"threadId": "thread-compact"})],
         )
 
+    async def test_codex_compaction_waits_again_before_timing_out(self) -> None:
+        solver = object.__new__(CodexSolver)
+        solver._thread_id = "thread-compact"
+        solver._compact_done = asyncio.Event()
+        solver._latest_raw_tokens = 1_500_000
+        solver.settings = SimpleNamespace(
+            solver_compaction_timeout_seconds=30,
+            solver_compaction_max_waits=2,
+        )
+        solver.agent_name = "hard/codex/test"
+        solver.tracer = _Tracer()
+
+        async def fake_rpc(_method: str, _params: dict) -> dict:
+            return {"result": {}}
+
+        wait_calls = 0
+
+        async def fake_wait_for(awaitable, *, timeout: float):
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                awaitable.close()
+                raise TimeoutError
+            solver._compact_done.set()
+            return await awaitable
+
+        solver._rpc = fake_rpc
+        with patch("backend.agents.codex_solver.asyncio.wait_for", side_effect=fake_wait_for):
+            compacted = await solver._compact_between_turns()
+
+        self.assertTrue(compacted)
+        self.assertEqual(wait_calls, 2)
+        self.assertTrue(any(name == "compact_wait_retry" for name, _ in solver.tracer.events))
+
+    async def test_codex_compaction_failure_recovers_on_fresh_thread(self) -> None:
+        solver = object.__new__(CodexSolver)
+        solver._thread_id = "thread-old"
+        solver._thread_params = {"model": "gpt-test", "cwd": "/challenge"}
+        solver._latest_raw_tokens = 2_000_000
+        solver._turn_start_raw_tokens = 1_000_000
+        solver._resume_after_checkpoint = False
+        solver.agent_name = "hard/codex/test"
+        solver.tracer = _Tracer()
+        calls: list[tuple[str, dict]] = []
+
+        async def fake_rpc(method: str, params: dict) -> dict:
+            calls.append((method, params))
+            return {"result": {"thread": {"id": "thread-new"}}}
+
+        solver._rpc = fake_rpc
+        recovered = await solver._recover_from_compaction_failure("compaction timeout")
+
+        self.assertTrue(recovered)
+        self.assertEqual(solver._thread_id, "thread-new")
+        self.assertEqual(solver._latest_raw_tokens, 0)
+        self.assertTrue(solver._resume_after_checkpoint)
+        self.assertEqual(calls, [("thread/start", solver._thread_params)])
+
     async def test_codex_accepts_current_compaction_item_notification(self) -> None:
         class FakeStdout:
             def __init__(self, lines: list[bytes]) -> None:
@@ -783,6 +869,39 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(solver._compact_done.is_set())
         self.assertIn(("compact_complete", {"tokens": 42}), solver.tracer.events)
+
+    async def test_codex_ignores_late_compaction_from_replaced_thread(self) -> None:
+        class FakeStdout:
+            def __init__(self, lines: list[bytes]) -> None:
+                self.lines = lines
+
+            async def readline(self) -> bytes:
+                return self.lines.pop(0) if self.lines else b""
+
+        notification = {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-old",
+                "item": {"id": "item-compact", "type": "contextCompaction"},
+            },
+        }
+        solver = object.__new__(CodexSolver)
+        solver._proc = SimpleNamespace(
+            stdout=FakeStdout([(json.dumps(notification) + "\n").encode()]),
+        )
+        solver._pending_responses = {}
+        solver._turn_done = asyncio.Event()
+        solver._compact_done = asyncio.Event()
+        solver._compacting_thread_id = "thread-new"
+        solver._latest_raw_tokens = 42
+        solver.tracer = _Tracer()
+
+        await solver._read_loop()
+
+        self.assertFalse(solver._compact_done.is_set())
+        self.assertTrue(
+            any(name == "compact_complete_ignored" for name, _ in solver.tracer.events)
+        )
 
     async def test_codex_compaction_failure_is_reported(self) -> None:
         solver = object.__new__(CodexSolver)
@@ -831,6 +950,32 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.status, CANDIDATE_FOUND)
             self.assertEqual(solver.calls, 2)
             self.assertEqual(solver.bump_count, 0)
+
+    async def test_compaction_recovery_resumes_even_without_new_progress_file(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            settings = SimpleNamespace(
+                max_attempts_per_challenge=2,
+                solver_turn_timeout_seconds=30,
+                solver_max_runtime_seconds=120,
+                solver_max_steps=100,
+                solver_max_tokens=0,
+                solver_max_raw_tokens=0,
+                solver_max_estimated_cost_usd=0,
+            )
+            swarm = ChallengeSwarm(
+                challenge_dir=workspace,
+                meta=ChallengeMeta(name="checkpoint", category="pwn", flag_format="TEAM{...}"),
+                ctfd=SimpleNamespace(is_configured=False),
+                cost_tracker=CostTracker(),
+                settings=settings,
+                model_specs=["codex/gpt-5.6-sol/xhigh"],
+                no_submit=True,
+            )
+            solver = _RecoveredCheckpointSolver(workspace)
+            result, _ = await swarm._run_solver_loop(solver, "codex/gpt-5.6-sol/xhigh")
+
+            self.assertEqual(result.status, CANDIDATE_FOUND)
+            self.assertEqual(solver.calls, 2)
 
     async def test_codex_usage_notification_requests_live_interrupt(self) -> None:
         class FakeStdout:

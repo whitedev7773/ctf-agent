@@ -19,6 +19,7 @@
       </span>
     </a>
     <div class="topbar-status">
+      <span class="uptime-pill" id="uptime-value">UPTIME --</span>
       <span class="connection-pill" id="connection-pill">
         <span class="status-dot"></span>
         <span id="connection-label">연결 중</span>
@@ -29,7 +30,8 @@
     </div>
   </header>
 
-  <main class="shell dashboard-view" id="dashboard-view">
+  <main class="shell dashboard-view" id="dashboard-view" aria-labelledby="dashboard-title">
+    <h1 class="sr-only" id="dashboard-title">CTF Agent Command Center</h1>
     <section class="stats-grid" aria-label="대회 요약">
       <article class="stat-card accent-green">
         <span class="stat-label">SOLVED</span>
@@ -277,6 +279,8 @@
               <label><span>Delegate effective token</span><input id="runtime-delegate-max-tokens" type="number" min="0" max="100000000" step="1000" required></label>
               <label><span>Delegate raw token</span><input id="runtime-delegate-max-raw-tokens" type="number" min="0" max="500000000" step="1000" required></label>
               <label><span>Delegate turn slice</span><input id="runtime-delegate-turn-slice-tokens" type="number" min="0" max="100000000" step="1000" required></label>
+              <label><span>Compaction timeout (초)</span><input id="runtime-solver-compaction-timeout-seconds" type="number" min="30" max="3600" step="1" required></label>
+              <label><span>Compaction wait 횟수</span><input id="runtime-solver-compaction-max-waits" type="number" min="1" max="10" step="1" required></label>
             </div>
           </details>
 
@@ -355,7 +359,7 @@
             </label>
             <ul class="file-list" id="file-list" aria-live="polite"></ul>
           </div>
-          <button class="primary-button setup-submit wide-field" type="submit">등록하고 풀이 시작</button>
+          <button class="secondary-button setup-submit wide-field" type="submit">등록하고 풀이 시작</button>
         </form>
         </article>
       </div>
