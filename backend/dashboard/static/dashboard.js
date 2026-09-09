@@ -1283,7 +1283,16 @@ async function loadTrace(challenge, model, card) {
     (item) => item.dataset.challengeName === challenge && item.dataset.agentModel === model,
   );
   const currentOutput = currentCard?.querySelector(".trace-output");
-  if (currentOutput) currentOutput.textContent = traceText;
+  if (currentOutput) {
+    currentOutput.textContent = traceText;
+    currentOutput.tabIndex = 0;
+    currentOutput.setAttribute("role", "region");
+    currentOutput.setAttribute("aria-label", "최근 solver trace");
+    requestAnimationFrame(() => {
+      currentOutput.scrollTop = currentOutput.scrollHeight;
+      currentOutput.focus({ preventScroll: true });
+    });
+  }
 }
 
 async function runCommand(path, body, control = null) {

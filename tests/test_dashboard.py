@@ -165,6 +165,9 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
                 javascript,
             )
             self.assertIn("state.traces.delete(name)", javascript)
+            self.assertIn("currentOutput.scrollTop = currentOutput.scrollHeight", javascript)
+            self.assertIn('currentOutput.setAttribute("aria-label", "최근 solver trace")', javascript)
+            self.assertIn("currentOutput.focus({ preventScroll: true })", javascript)
 
         async with self.client.get(f"{self.base_url}/assets/dashboard.css") as response:
             stylesheet = await response.text()
