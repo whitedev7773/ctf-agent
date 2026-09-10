@@ -179,6 +179,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .primary-button, .secondary-button, .danger-button, .row-action { min-height: 40px; border: 1px solid transparent; border-radius: var(--radius-sm); cursor: pointer; transition: background .15s ease, border-color .15s ease, color .15s ease; font-size: 14px; font-weight: 500; line-height: 1; }
 .primary-button { flex: 0 0 auto; padding: 8px 16px; color: var(--ink); background: var(--primary); }
 .primary-button:hover { background: var(--primary-deep); }
+.primary-button:active:not(:disabled) { background: var(--primary-deep); }
 .primary-button:disabled, .secondary-button:disabled, .danger-button:disabled { opacity: .45; cursor: not-allowed; }
 .secondary-button, .danger-button { padding: 8px 16px; color: var(--ink); border-color: var(--hairline-strong); background: var(--canvas); }
 .secondary-button:hover, .danger-button:hover { border-color: var(--ink); }
@@ -196,7 +197,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .reset-dialog .destructive-button:not(:disabled) { color: var(--canvas); background: var(--danger); }
 .reset-dialog .destructive-button:not(:disabled):hover { background: var(--ink-secondary); }
 
-.reset-dialog { width: min(520px, calc(100% - 32px)); padding: 0; border: 1px solid var(--hairline-strong); border-radius: var(--radius-xl); color: var(--ink); background: var(--canvas); box-shadow: 0 24px 72px rgba(0,0,0,.2); }
+.reset-dialog { width: min(520px, calc(100% - 32px)); padding: 0; border: 1px solid var(--hairline-strong); border-radius: var(--radius-xl); color: var(--ink); background: var(--canvas); box-shadow: 0 16px 48px rgba(0,0,0,.12); }
 .reset-dialog::backdrop { background: rgba(23,23,23,.48); }
 .reset-dialog form { padding: 28px; }
 .reset-dialog h2 { margin: 0; font-size: 24px; font-weight: 500; line-height: 1.25; }
@@ -210,7 +211,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .filters { display: flex; gap: 8px; align-items: center; }
 .search-box { display: flex; align-items: center; gap: 8px; width: 260px; height: 38px; padding: 0 12px; border: 1px solid var(--hairline); border-radius: var(--radius-sm); color: var(--muted); background: var(--canvas); }
 .search-box:focus-within { border-color: var(--hairline-strong); }
-.search-box input { height: 100%; padding: 0; border: 0; outline: 0; background: transparent; font-size: 13px; }
+.search-box input { height: 100%; padding: 0; border: 0; outline: 0; background: transparent; font-size: 16px; }
 .segmented { display: flex; padding: 3px; border: 1px solid var(--hairline); border-radius: var(--radius-md); background: var(--canvas-soft); }
 .segmented button { min-height: 40px; padding: 6px 10px; border: 0; border-radius: var(--radius-sm); color: var(--muted); background: transparent; cursor: pointer; font-size: 12px; }
 .segmented button.active { color: var(--ink); background: var(--canvas); box-shadow: 0 1px 3px rgba(0,0,0,.06); }
@@ -317,7 +318,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .agent-skill { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: var(--canvas-soft); color: var(--ink-secondary); font: 500 12px/1.45 var(--mono); overflow-wrap: anywhere; }
 .agent-stop-reason { border-left: 3px solid var(--ink); }
 .trace-button { margin-top: 12px; padding: 0; border: 0; color: var(--ink); background: transparent; cursor: pointer; font-size: 13px; font-weight: 500; text-decoration: underline; text-underline-offset: 3px; }
-.trace-output { max-height: 320px; overflow: auto; margin: 12px 0 0; padding: 16px; border-radius: var(--radius-sm); color: var(--canvas); background: var(--night); font: 400 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.trace-output { max-height: 320px; overflow: auto; margin: 12px 0 0; padding: 16px; border-radius: var(--radius-sm); color: var(--canvas); background: var(--night); font: 400 14px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .detail-form { display: grid; gap: 8px; }
 .detail-form textarea { min-height: 112px; resize: vertical; padding: 10px 12px; border-radius: var(--radius-sm); line-height: 1.5; }
 .detail-form input { height: 42px; padding: 8px 12px; border-radius: var(--radius-sm); font-family: var(--mono); }

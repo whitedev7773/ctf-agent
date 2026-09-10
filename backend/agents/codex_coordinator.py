@@ -341,12 +341,14 @@ async def run_codex_coordinator(
     no_submit: bool = False,
     coordinator_model: str | None = None,
     msg_port: int = 0,
+    msg_host: str = "127.0.0.1",
 ) -> dict[str, Any]:
     """Run the Codex coordinator with the shared event loop."""
     ctfd, cost_tracker, deps = build_deps(
         settings, model_specs, challenges_root, no_submit,
     )
     deps.msg_port = msg_port
+    deps.msg_host = msg_host
 
     resolved_model = coordinator_model or "gpt-5.6-terra"
     coordinator = CodexCoordinator(deps, model=resolved_model)

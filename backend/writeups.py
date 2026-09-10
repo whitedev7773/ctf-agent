@@ -344,6 +344,9 @@ def begin_writeup_generation(
     challenge_name: str,
     model_spec: str,
     review_model_spec: str = "",
+    *,
+    targeted_revision: bool = False,
+    revision_scope: list[str] | None = None,
 ) -> dict[str, Any]:
     """Persist a restart-visible generating state before starting the model."""
     root = Path(challenge_workspace_path(settings, challenge_name))
@@ -362,6 +365,12 @@ def begin_writeup_generation(
     staged_reproducers = _stage_writeup_reproducers(root, output_dir, discovered_reproducers)
     reproducers = staged_reproducers or discovered_reproducers
     now = datetime.now(UTC).isoformat()
+    clean_revision_scope = [
+        " ".join(str(item).split())[:500]
+        for item in (revision_scope or [])
+        if str(item).strip()
+    ]
+    initial_phase = "revising" if targeted_revision else "writing"
     payload = {
         "status": "generating",
         "documented": False,
@@ -370,14 +379,22 @@ def begin_writeup_generation(
         "updated_at": now,
         "model_spec": model_spec,
         "review_model_spec": review_model_spec,
-        "phase": "writing",
+        "phase": initial_phase,
         "writeup_path": _relative(writeup_path, root) if writeup_path.is_file() else "",
         "review_path": _relative(review_path, root) if review_path.is_file() else "",
         "source_path": "",
         "previous_writeup_sha256": _file_sha256(writeup_path),
         "previous_review_sha256": _file_sha256(review_path),
-        "issues": [],
-        "history": _writeup_history(previous, "started", "라이트업 작성 및 검수를 시작했습니다"),
+        "issues": clean_revision_scope if targeted_revision else [],
+        "revision_scope": clean_revision_scope if targeted_revision else [],
+        "targeted_revision": targeted_revision,
+        "history": _writeup_history(
+            previous,
+            "revision_resumed" if targeted_revision else "started",
+            "완료된 검사에서 부족한 항목만 수정하고 재검수합니다"
+            if targeted_revision
+            else "라이트업 작성 및 검수를 시작했습니다",
+        ),
         "screenshots": _image_manifest_entries(images, root),
         "reproducers": [_relative(path, root) for path in reproducers],
     }

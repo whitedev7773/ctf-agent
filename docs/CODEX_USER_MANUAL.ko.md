@@ -19,10 +19,10 @@
 
 기본 구성은 문제 하나당 다음 주 solver 하나를 실행한다.
 
-| 역할 | 모델 스펙 | 용도 |
-|---|---|---|
-| 주 풀이 | `codex/gpt-5.6-sol/high` | 전체 풀이 경로, 작업 분할, 결과 통합과 최종 검증 |
-| 동적 하위 agent | `codex/gpt-5.6-luna/low` | SOL이 지정한 하나의 좁고 검증 가능한 보조 작업 |
+| 역할            | 모델 스펙                | 용도                                             |
+| --------------- | ------------------------ | ------------------------------------------------ |
+| 주 풀이         | `codex/gpt-5.6-sol/high` | 전체 풀이 경로, 작업 분할, 결과 통합과 최종 검증 |
+| 동적 하위 agent | `codex/gpt-5.6-luna/low` | SOL이 지정한 하나의 좁고 검증 가능한 보조 작업   |
 
 Coordinator의 기본 모델은 `gpt-5.6-terra`, reasoning effort는 `medium`이다. OpenAI는 Sol을 flagship, Terra를 성능·비용 균형형, Luna를 효율적인 대량 작업용 모델로 안내한다.
 
@@ -128,51 +128,51 @@ MAX_CONCURRENT_CHALLENGES=1
 
 주요 설정은 다음과 같다.
 
-| 환경 변수 | 기본값 | 설명 |
-|---|---:|---|
-| `CTFD_URL` | 빈 값 | 선택적인 CTFd base URL; 빈 값이면 독립 모드 |
-| `CTFD_TOKEN` | 빈 값 | CTFd API token |
-| `CTFD_USER` | `admin` | token이 없을 때 로그인 사용자 |
-| `CTFD_PASS` | `admin` | token이 없을 때 로그인 비밀번호 |
-| `OPENAI_API_KEY` | 빈 값 | Codex quota fallback용 API key |
-| `SANDBOX_IMAGE` | `ctf-sandbox` | 사용할 Docker image |
-| `CONTAINER_MEMORY_LIMIT` | `4g` | solver 컨테이너 하나의 memory limit |
-| `CONTAINER_CPU_LIMIT` | `2.0` | solver 컨테이너 하나의 CPU limit |
-| `MAX_CONCURRENT_CHALLENGES` | `1` | 동시에 실행할 문제 swarm 수 |
-| `WORKSPACE_ROOT` | `workspace` | 영구 exploit·solver·checkpoint 저장 경로 |
-| `EXPERIENCE_ROOT` | `experience` | 검증된 문제에서 승격한 문제 간 공유 풀이 경험 저장 경로 |
-| `LOGS_ROOT` | `logs` | Solver JSONL trace 저장 경로 |
-| `RESOURCE_SAMPLE_INTERVAL_SECONDS` | `2.0` | Docker CPU·메모리·PID·네트워크 계측 주기(초) |
-| `SOLVER_TURN_TIMEOUT_SECONDS` | `1800` | model turn 하나의 최대 실행 시간 |
-| `SOLVER_TURN_IDLE_TIMEOUT_SECONDS` | `300` | model/tool 활동이 없을 때 현재 turn만 회수하고 재개하는 시간, `0`이면 비활성화 |
-| `SOLVER_MAX_RUNTIME_SECONDS` | `10800` | solver 하나의 전체 최대 실행 시간 |
-| `SOLVER_HANDOFF_WAIT_SECONDS` | `180` | 여러 primary 모델을 직접 지정했을 때 단계별 handoff 대기 시간 |
-| `MAX_ATTEMPTS_PER_CHALLENGE` | `8` | SOL LEAD 최대 turn/slice 수; 역할별 배율 적용 |
-| `SOLVER_MAX_STEPS` | `300` | solver별 최대 tool step 수 |
-| `SOLVER_MAX_TOKENS` | `1500000` | 캐시 가중 유효 token 기준 상한; `0`이면 비활성화 |
-| `SOLVER_MAX_RAW_TOKENS` | `12000000` | 캐시 여부와 무관한 raw token 안전 상한 |
-| `SOLVER_CACHED_TOKEN_WEIGHT` | `0.10` | 유효 token 계산에서 cached input에 적용할 비율 |
-| `SOLVER_TURN_SLICE_TOKENS` | `1500000` | 긴 Codex turn을 checkpoint·compact할 raw token 간격 |
-| `SOLVER_MAX_ESTIMATED_COST_USD` | `0` | solver별 추정 비용 상한; `0`이면 비활성화 |
-| `MAX_FLAG_SUBMISSIONS_PER_CHALLENGE` | `8` | 문제별 live flag 제출 최대 횟수 |
-| `MAX_COMMAND_TIMEOUT_SECONDS` | `600` | container 명령 하나의 최대 실행 시간 |
-| `ENABLE_API_FALLBACK` | `false` | quota 소진 후 사용량 과금 API로 전환할지 여부 |
-| `DYNAMIC_DELEGATION_ENABLED` | `true` | SOL 주 solver의 실시간 하위 agent 생성 허용 |
-| `DELEGATE_MODEL_SPEC` | `codex/gpt-5.6-luna/low` | 하위 agent 모델과 effort |
-| `DELEGATE_MAX_AGENTS` | `4` | 문제 하나에서 생성할 수 있는 하위 agent 누적 상한 |
-| `DELEGATE_MAX_CONCURRENT` | `2` | 문제 하나에서 동시에 실행할 하위 agent 상한 |
-| `DELEGATE_MAX_ATTEMPTS` | `4` | 하위 agent 최대 turn/slice 수 |
-| `DELEGATE_MAX_RUNTIME_SECONDS` | `1800` | 하위 agent 전체 실행 시간 상한 |
-| `DELEGATE_TURN_TIMEOUT_SECONDS` | `600` | 하위 agent turn 하나의 상한 |
-| `DELEGATE_TURN_IDLE_TIMEOUT_SECONDS` | `180` | 하위 agent의 무활동 turn 회수 시간 |
-| `DELEGATE_MAX_STEPS` | `96` | 하위 agent tool step 상한 |
-| `DELEGATE_MAX_TOKENS` | `250000` | 하위 agent 캐시 가중 유효 token 상한 |
-| `DELEGATE_MAX_RAW_TOKENS` | `1200000` | 하위 agent raw token 안전 상한 |
-| `DELEGATE_TURN_SLICE_TOKENS` | `300000` | 하위 agent compact/resume 간격 |
-| `DELEGATE_POSTPROCESS_ON_BUDGET_STOP` | `true` | 중단된 delegate의 handoff가 없거나 불완전할 때 후처리 worker 생성 |
-| `DELEGATE_POSTPROCESS_MAX_AGENTS` | `1` | 문제당 후처리 worker 누적 상한 |
-| `DELEGATE_POSTPROCESS_MAX_TOKENS` | `80000` | 후처리 worker 유효 token 상한 |
-| `DELEGATE_POSTPROCESS_MAX_RAW_TOKENS` | `400000` | 후처리 worker raw token 안전 상한 |
+| 환경 변수                             |                   기본값 | 설명                                                                           |
+| ------------------------------------- | -----------------------: | ------------------------------------------------------------------------------ |
+| `CTFD_URL`                            |                    빈 값 | 선택적인 CTFd base URL; 빈 값이면 독립 모드                                    |
+| `CTFD_TOKEN`                          |                    빈 값 | CTFd API token                                                                 |
+| `CTFD_USER`                           |                  `admin` | token이 없을 때 로그인 사용자                                                  |
+| `CTFD_PASS`                           |                  `admin` | token이 없을 때 로그인 비밀번호                                                |
+| `OPENAI_API_KEY`                      |                    빈 값 | Codex quota fallback용 API key                                                 |
+| `SANDBOX_IMAGE`                       |            `ctf-sandbox` | 사용할 Docker image                                                            |
+| `CONTAINER_MEMORY_LIMIT`              |                     `4g` | solver 컨테이너 하나의 memory limit                                            |
+| `CONTAINER_CPU_LIMIT`                 |                    `2.0` | solver 컨테이너 하나의 CPU limit                                               |
+| `MAX_CONCURRENT_CHALLENGES`           |                      `1` | 동시에 실행할 문제 swarm 수                                                    |
+| `WORKSPACE_ROOT`                      |              `workspace` | 영구 exploit·solver·checkpoint 저장 경로                                       |
+| `EXPERIENCE_ROOT`                     |             `experience` | 검증된 문제에서 승격한 문제 간 공유 풀이 경험 저장 경로                        |
+| `LOGS_ROOT`                           |                   `logs` | Solver JSONL trace 저장 경로                                                   |
+| `RESOURCE_SAMPLE_INTERVAL_SECONDS`    |                    `2.0` | Docker CPU·메모리·PID·네트워크 계측 주기(초)                                   |
+| `SOLVER_TURN_TIMEOUT_SECONDS`         |                   `1800` | model turn 하나의 최대 실행 시간                                               |
+| `SOLVER_TURN_IDLE_TIMEOUT_SECONDS`    |                    `300` | model/tool 활동이 없을 때 현재 turn만 회수하고 재개하는 시간, `0`이면 비활성화 |
+| `SOLVER_MAX_RUNTIME_SECONDS`          |                  `10800` | solver 하나의 전체 최대 실행 시간                                              |
+| `SOLVER_HANDOFF_WAIT_SECONDS`         |                    `180` | 여러 primary 모델을 직접 지정했을 때 단계별 handoff 대기 시간                  |
+| `MAX_ATTEMPTS_PER_CHALLENGE`          |                      `8` | SOL LEAD 최대 turn/slice 수; 역할별 배율 적용                                  |
+| `SOLVER_MAX_STEPS`                    |                    `300` | solver별 최대 tool step 수                                                     |
+| `SOLVER_MAX_TOKENS`                   |                `1500000` | 캐시 가중 유효 token 기준 상한; `0`이면 비활성화                               |
+| `SOLVER_MAX_RAW_TOKENS`               |               `12000000` | 캐시 여부와 무관한 raw token 안전 상한                                         |
+| `SOLVER_CACHED_TOKEN_WEIGHT`          |                   `0.10` | 유효 token 계산에서 cached input에 적용할 비율                                 |
+| `SOLVER_TURN_SLICE_TOKENS`            |                `1500000` | 긴 Codex turn을 checkpoint·compact할 raw token 간격                            |
+| `SOLVER_MAX_ESTIMATED_COST_USD`       |                      `0` | solver별 추정 비용 상한; `0`이면 비활성화                                      |
+| `MAX_FLAG_SUBMISSIONS_PER_CHALLENGE`  |                      `8` | 문제별 live flag 제출 최대 횟수                                                |
+| `MAX_COMMAND_TIMEOUT_SECONDS`         |                    `600` | container 명령 하나의 최대 실행 시간                                           |
+| `ENABLE_API_FALLBACK`                 |                  `false` | quota 소진 후 사용량 과금 API로 전환할지 여부                                  |
+| `DYNAMIC_DELEGATION_ENABLED`          |                   `true` | SOL 주 solver의 실시간 하위 agent 생성 허용                                    |
+| `DELEGATE_MODEL_SPEC`                 | `codex/gpt-5.6-luna/low` | 하위 agent 모델과 effort                                                       |
+| `DELEGATE_MAX_AGENTS`                 |                      `4` | 문제 하나에서 생성할 수 있는 하위 agent 누적 상한                              |
+| `DELEGATE_MAX_CONCURRENT`             |                      `2` | 문제 하나에서 동시에 실행할 하위 agent 상한                                    |
+| `DELEGATE_MAX_ATTEMPTS`               |                      `4` | 하위 agent 최대 turn/slice 수                                                  |
+| `DELEGATE_MAX_RUNTIME_SECONDS`        |                   `1800` | 하위 agent 전체 실행 시간 상한                                                 |
+| `DELEGATE_TURN_TIMEOUT_SECONDS`       |                    `600` | 하위 agent turn 하나의 상한                                                    |
+| `DELEGATE_TURN_IDLE_TIMEOUT_SECONDS`  |                    `180` | 하위 agent의 무활동 turn 회수 시간                                             |
+| `DELEGATE_MAX_STEPS`                  |                     `96` | 하위 agent tool step 상한                                                      |
+| `DELEGATE_MAX_TOKENS`                 |                 `250000` | 하위 agent 캐시 가중 유효 token 상한                                           |
+| `DELEGATE_MAX_RAW_TOKENS`             |                `1200000` | 하위 agent raw token 안전 상한                                                 |
+| `DELEGATE_TURN_SLICE_TOKENS`          |                 `300000` | 하위 agent compact/resume 간격                                                 |
+| `DELEGATE_POSTPROCESS_ON_BUDGET_STOP` |                   `true` | 중단된 delegate의 handoff가 없거나 불완전할 때 후처리 worker 생성              |
+| `DELEGATE_POSTPROCESS_MAX_AGENTS`     |                      `1` | 문제당 후처리 worker 누적 상한                                                 |
+| `DELEGATE_POSTPROCESS_MAX_TOKENS`     |                  `80000` | 후처리 worker 유효 token 상한                                                  |
+| `DELEGATE_POSTPROCESS_MAX_RAW_TOKENS` |                 `400000` | 후처리 worker raw token 안전 상한                                              |
 
 Codex solver는 App Server의 실시간 usage 알림에서 token·추정 비용 상한을 감지하면 현재
 turn에 `turn/interrupt`를 보내며, tool step 상한에 도달해도 같은 방식으로 중단한다. 유효
@@ -183,13 +183,13 @@ token은 `uncached input + output + cached input × SOLVER_CACHED_TOKEN_WEIGHT`�
 
 기본 역할별 실제 상한은 다음과 같다.
 
-| 역할 | 유효 token | raw token | turn slice | 최대 slice/turn |
-|---|---:|---:|---:|---:|
-| SCOUT | 450k | 1.8M | 600k | 3 |
-| ANALYST | 1.275M | 10.2M | 1.5M | 7 |
-| LEAD (SOL) | 1.5M | 12M | 1.5M | 8 |
-| DELEGATE (Luna) | 250k | 1.2M | 300k | 4 |
-| SPECIALIST | 975k | 7.8M | 1.2M | 6 |
+| 역할            | 유효 token | raw token | turn slice | 최대 slice/turn |
+| --------------- | ---------: | --------: | ---------: | --------------: |
+| SCOUT           |       450k |      1.8M |       600k |               3 |
+| ANALYST         |     1.275M |     10.2M |       1.5M |               7 |
+| LEAD (SOL)      |       1.5M |       12M |       1.5M |               8 |
+| DELEGATE (Luna) |       250k |      1.2M |       300k |               4 |
+| SPECIALIST      |       975k |      7.8M |       1.2M |               6 |
 
 Slice 상한에 닿으면 전체 풀이를 실패로 끝내지 않는다. 현재 turn을 중단하고 App Server
 문맥을 compact한 뒤 같은 경로를 재개한다. 다만 private workspace 또는 shared handoff에
@@ -340,12 +340,12 @@ codex/<model-id>/<reasoning-effort>
 
 권장 조합:
 
-| 상황 | 조합 |
-|---|---|
-| 기능 점검·쉬운 문제 | `codex/gpt-5.6-luna/medium` |
-| 일반 대회 운영 | Terra `high` + Luna `medium` |
-| 어려운 결승 문제 | Sol `xhigh` + Terra `high` |
-| 최고 품질 단일 시도 | `codex/gpt-5.6-sol/max` |
+| 상황                | 조합                         |
+| ------------------- | ---------------------------- |
+| 기능 점검·쉬운 문제 | `codex/gpt-5.6-luna/medium`  |
+| 일반 대회 운영      | Terra `high` + Luna `medium` |
+| 어려운 결승 문제    | Sol `xhigh` + Terra `high`   |
+| 최고 품질 단일 시도 | `codex/gpt-5.6-sol/max`      |
 
 높은 reasoning effort가 항상 더 좋은 것은 아니다. 높은 단계는 지연 시간과 사용량이 늘 수 있으므로 실제 문제에서 측정해 선택한다. 대시보드에서 실행 설정을 저장하면 이미 실행 중인 swarm은 기존 정책을 유지하고 이후 시작하는 swarm부터 새 정책을 사용한다.
 
@@ -397,7 +397,7 @@ CTFd를 연결하지 않은 독립 모드에서는 flag를 외부에 제출하�
 
 대시보드의 실행 설정은 프로젝트 루트의 `.ctf-agent-settings.json`에 저장된다. 이 파일에는 모델과 비밀값이 아닌 실행 정책만 기록되며 API key와 CTFd 인증 정보는 포함되지 않는다. 설정을 저장해도 실행 중인 swarm은 생성 당시 정책을 유지하고, 이후 시작하는 swarm부터 새 모델·예산·컨테이너 한도를 사용한다. 동시 문제 수를 현재 실행 수보다 작게 낮춰도 기존 swarm은 종료되지 않으며 실행 수가 새 한도 아래로 내려갈 때까지 새 문제 시작만 제한된다.
 
-대시보드는 coordinator와 같은 프로세스에서 실행되며 `127.0.0.1`에만 bind된다. 문제 상태는 약 2.5초마다, 각 solver Docker의 CPU·메모리·PID·network 통계는 기본 1초마다 화면에 반영된다. 쓰기 요청은 브라우저가 같은 origin에서 받은 세션별 token을 요구한다.
+대시보드는 coordinator와 같은 프로세스에서 실행된다. 기본 CLI 실행은 `127.0.0.1`에 bind되며, `run-ctf-agent.bat`은 다른 로컬 컴퓨터에서도 접속할 수 있도록 `0.0.0.0`에 bind된다. 호스트 PC의 LAN IP와 port를 사용해 `http://<호스트-LAN-IP>:9400`으로 접속한다. 직접 실행할 때는 `--dashboard-host 0.0.0.0`을 사용한다. Windows Defender 방화벽이 물으면 Python 또는 TCP port 9400의 Private network 접근을 허용해야 한다. 문제 상태는 약 2.5초마다, 각 solver Docker의 CPU·메모리·PID·network 통계는 기본 1초마다 화면에 반영된다. 쓰기 요청은 브라우저가 같은 origin에서 받은 세션별 token을 요구한다.
 
 Flag 확인 뒤 Codex 문서화 pipeline이 자동으로 시작된다. 먼저 Terra-Medium 작성 에이전트 한 개가 Lead의 `SOLUTION.md` 또는 `WRITEUP.md`, 재현 스크립트와 실제 PNG/JPEG/WebP 증거를 바탕으로 `_shared/writeup/WRITEUP.md`를 작성한다. 이어서 Luna-Medium 검수 에이전트 한 개가 원본 증거와 문서를 독립적으로 대조하고 필요한 부분을 직접 수정한 뒤 `_shared/writeup/REVIEW.md`에 검수 내역과 `Verdict: APPROVED` 또는 `Verdict: REJECTED`를 기록한다. 이번 실행에서 새로 작성된 검수 결과가 `REJECTED`이면 Terra-Medium이 그 체크리스트와 미해결 항목만 범위로 삼아 `WRITEUP.md`를 한 번 보정하고 Luna-Medium이 다시 독립 검수한다. 보정 루프는 전체 생성 제한 시간 안에서 한 번만 수행하며 재검수도 반려되면 `보강 필요`로 종료한다. Luna의 새 승인 기록과 서버 품질 검사를 모두 통과해야 `DOCUMENTED`가 된다. 실행 중에는 기존 Writeup 섹션에 `Terra-Medium 작성`, `Luna-Medium 검수`, `Terra-Medium 수정` 단계와 현재 확인·작성 중인 부분이 짧게 표시되며 같은 문제의 중복 요청은 차단된다. 서버 종료로 작업이 중단되면 다음 실행에서 재요청 가능한 `보강 필요` 상태로 복구된다. Solver의 중간 기록 언어는 제한하지 않으며 최종 라이트업의 설명과 절별 서술만 한국어로 편집한다. Challenge 이름, vulnerability 용어, protocol, command, code, path 같은 기술 표기는 English를 그대로 사용할 수 있다. 최종본은 대회 관계자가 다른 파일을 열지 않아도 풀이를 검증할 수 있어야 한다. 따라서 핵심 exploit/solver 함수, 상수, payload 구성, parsing 또는 복구 로직과 실행 명령을 본문 code block에 직접 포함해야 하며, `.py에 구현했다` 또는 `스크립트를 참고하라`는 이유로 중요한 부분을 생략하면 완료 처리되지 않는다. 또한 핵심 취약점 또는 원리를 보여 주는 실제 화면과 해결 성공 또는 Flag 결과를 보여 주는 실제 화면을 최소 한 장씩 넣고, 각 화면이 증명하는 내용을 제목과 caption으로 명시해야 한다. 관련 없는 이미지의 자동 gallery 추가는 하지 않으며, 최종 Markdown에서 선택한 증거만 문제 상세의 evidence gallery에 표시한다. `Markdown + 사진 ZIP` 버튼은 링크를 압축 내부 `evidence/` 경로로 맞춘 `WRITEUP.md`, `REVIEW.md`, 선택된 실제 사진을 하나의 압축 파일로 내려받는다.
 
@@ -474,11 +474,11 @@ Codex solver는 기본적으로 현재 Codex CLI 로그인 세션을 사용한�
 
 Codex quota 관련 오류가 감지되어도 기본적으로 solver를 중단하며 유료 API로 자동 전환하지 않는다. `.env`에서 `ENABLE_API_FALLBACK=true`를 명시한 경우에만 다음 direct API fallback을 시도한다.
 
-| Codex 모델 | Fallback |
-|---|---|
-| `codex/gpt-5.6-sol/*` | `openai/gpt-5.6-sol` |
+| Codex 모델              | Fallback               |
+| ----------------------- | ---------------------- |
+| `codex/gpt-5.6-sol/*`   | `openai/gpt-5.6-sol`   |
 | `codex/gpt-5.6-terra/*` | `openai/gpt-5.6-terra` |
-| `codex/gpt-5.6-luna/*` | `openai/gpt-5.6-luna` |
+| `codex/gpt-5.6-luna/*`  | `openai/gpt-5.6-luna`  |
 
 Fallback을 실제로 사용하려면 `ENABLE_API_FALLBACK=true`와 유효한 `OPENAI_API_KEY`가 모두 필요하며, 이때는 사용량 기반 API 요금이 실제로 발생한다. 비용 표시는 App Server가 보낸 token usage와 내장 가격표를 기반으로 한 추정치이며 최종 청구서와 다를 수 있다.
 
@@ -607,21 +607,21 @@ Coordinator 실행 로그의 실제 port와 `ctf-msg --port` 값이 같은지 �
 
 ## 15. CLI 옵션 요약
 
-| 옵션 | 설명 |
-|---|---|
-| `--ctfd-url URL` | `.env`의 CTFd URL 덮어쓰기 |
-| `--ctfd-token TOKEN` | `.env`의 CTFd token 덮어쓰기 |
-| `--image NAME` | Docker sandbox image 이름 |
-| `--models SPEC` | Solver 모델 지정, 여러 번 사용 가능 |
-| `--challenge DIR` | 단일 문제 모드; 생략하면 전체 coordinator 모드 |
-| `--challenges-dir DIR` | 전체 대회 문제 저장 디렉터리 |
-| `--no-submit` | 실제 flag 제출 금지 |
-| `--coordinator codex` | Codex coordinator 사용; 현재 기본값 |
-| `--coordinator-model MODEL` | Coordinator model ID |
-| `--max-challenges N` | 동시에 실행할 문제 swarm 수 |
-| `--dashboard-port PORT` | 로컬 대시보드와 운영자 메시지 port, 기본 `9400`; `0`은 자동 선택 |
-| `--msg-port PORT` | `--dashboard-port`의 이전 버전 호환 alias |
-| `-v`, `--verbose` | 상세 로그 |
+| 옵션                        | 설명                                                             |
+| --------------------------- | ---------------------------------------------------------------- |
+| `--ctfd-url URL`            | `.env`의 CTFd URL 덮어쓰기                                       |
+| `--ctfd-token TOKEN`        | `.env`의 CTFd token 덮어쓰기                                     |
+| `--image NAME`              | Docker sandbox image 이름                                        |
+| `--models SPEC`             | Solver 모델 지정, 여러 번 사용 가능                              |
+| `--challenge DIR`           | 단일 문제 모드; 생략하면 전체 coordinator 모드                   |
+| `--challenges-dir DIR`      | 전체 대회 문제 저장 디렉터리                                     |
+| `--no-submit`               | 실제 flag 제출 금지                                              |
+| `--coordinator codex`       | Codex coordinator 사용; 현재 기본값                              |
+| `--coordinator-model MODEL` | Coordinator model ID                                             |
+| `--max-challenges N`        | 동시에 실행할 문제 swarm 수                                      |
+| `--dashboard-port PORT`     | 로컬 대시보드와 운영자 메시지 port, 기본 `9400`; `0`은 자동 선택 |
+| `--msg-port PORT`           | `--dashboard-port`의 이전 버전 호환 alias                        |
+| `-v`, `--verbose`           | 상세 로그                                                        |
 
 항상 현재 코드의 옵션을 최종 기준으로 확인한다.
 
@@ -681,11 +681,11 @@ uv run ctf-msg --help
 
 기본 실행은 SOL-high가 문제 전체의 소유권을 갖고 필요할 때만 작업을 분할한다.
 
-| 모델 | 역할 | 주요 산출물 |
-|---|---|---|
-| `codex/gpt-5.6-sol/high` | LEAD: 주 풀이, 작업 분할, 증거 통합, 최종 검증 | `/challenge/shared/lead/SOLUTION.md` |
-| `codex/gpt-5.6-luna/low/.../delegate-NN` | DELEGATE: 지정된 단일 가설의 저비용 검증 | `/challenge/shared/delegates/delegate-NN.md` |
-| `codex/gpt-5.6-luna/low/.../postprocess` | POSTPROCESS: 중단된 불완전 handoff 정리·충돌 검증 | `/challenge/shared/recovery/` |
+| 모델                                     | 역할                                              | 주요 산출물                                  |
+| ---------------------------------------- | ------------------------------------------------- | -------------------------------------------- |
+| `codex/gpt-5.6-sol/high`                 | LEAD: 주 풀이, 작업 분할, 증거 통합, 최종 검증    | `/challenge/shared/lead/SOLUTION.md`         |
+| `codex/gpt-5.6-luna/low/.../delegate-NN` | DELEGATE: 지정된 단일 가설의 저비용 검증          | `/challenge/shared/delegates/delegate-NN.md` |
+| `codex/gpt-5.6-luna/low/.../postprocess` | POSTPROCESS: 중단된 불완전 handoff 정리·충돌 검증 | `/challenge/shared/recovery/`                |
 
 SOL은 초기 triage를 직접 수행한 뒤 `delegate_task`로 좁고 독립적인 질문과 필요한 산출물을 지정한다. 여러 artifact나 subsystem을 함께 분석해야 하면 깊은 선형 분석 전에 서로 겹치지 않는 작업을 최대 두 개까지 조기에 병렬화한다. 하위 agent 생성은 즉시 반환되므로 SOL은 기다리지 않고 주 경로를 계속 푼다. Delegate의 `/challenge/workspace/`는 SOL이 볼 수 없으므로 재현에 필요한 script와 capture는 `/challenge/shared/delegates/<delegate-id>/`에 저장해야 하며, private workspace 경로를 참조하는 handoff는 evidence audit에서 거부된다. SOL은 `/challenge/shared/lead/STATE.md`에 확인된 사실, 충돌, 현재 blocker, 다음 실험을 유지한다. 정적 primitive가 구체화되면 추가적인 전체 추출보다 최소 harness·debugger 측정을 우선한다.
 

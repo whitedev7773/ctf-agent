@@ -92,6 +92,25 @@ def test_semantic_loop_groups_cosmetic_search_variants() -> None:
     )
 
 
+def test_resource_failures_block_expensive_family_until_pivot() -> None:
+    detector = LoopDetector()
+    first = {"command": "python3 solve_z3.py --seed A"}
+    second = {"command": "python3 solve_z3.py --seed B"}
+
+    assert detector.check("bash", first, "H-symbolic") is None
+    assert detector.record_result("bash", first, "[exit 137]", "H-symbolic") == "warn"
+    assert detector.check("bash", second, "H-symbolic") is None
+    assert detector.record_result("bash", second, "[exit 137]", "H-symbolic") == "warn"
+    assert detector.check(
+        "bash", {"command": "python3 solve_z3.py --seed C"}, "H-symbolic"
+    ) == "break"
+    assert detector.check(
+        "bash", {"command": "python3 solve_z3.py --reduced"}, "H-revised"
+    ) is None
+    assert "memory exhaustion" in detector.failure_reason("[exit 137]")
+    assert "assertion failed" in detector.failure_reason("AssertionError: model != native")
+
+
 @pytest.mark.asyncio
 async def test_machine_readable_reproducer_is_executed(tmp_path: Path) -> None:
     handoff = tmp_path / "handoff.md"

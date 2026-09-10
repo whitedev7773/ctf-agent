@@ -55,6 +55,12 @@ def _setup_logging(verbose: bool = False) -> None:
     show_default=True,
     help="Local dashboard and operator-message port (0 = auto)",
 )
+@click.option(
+    "--dashboard-host",
+    default="127.0.0.1",
+    show_default=True,
+    help="Dashboard and operator-message bind address (use 0.0.0.0 for LAN access)",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def main(
     ctfd_url: str | None,
@@ -68,6 +74,7 @@ def main(
     coordinator: str,
     max_challenges: int | None,
     msg_port: int,
+    dashboard_host: str,
     verbose: bool,
 ) -> None:
     """CTF Agent: multi-model solver swarm.
@@ -99,7 +106,7 @@ def main(
         if challenge:
             asyncio.run(_run_single(settings, challenge, model_specs, no_submit, max_challenges))
         else:
-            asyncio.run(_run_coordinator(settings, model_specs, challenges_dir, no_submit, coordinator_model, coordinator, max_challenges, msg_port))
+            asyncio.run(_run_coordinator(settings, model_specs, challenges_dir, no_submit, coordinator_model, coordinator, max_challenges, msg_port, dashboard_host))
     except CodexCLIError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -199,6 +206,7 @@ async def _run_coordinator(
     coordinator_backend: str,
     max_challenges: int,
     msg_port: int = 0,
+    dashboard_host: str = "127.0.0.1",
 ) -> None:
     """Run the full coordinator (continuous until Ctrl+C)."""
     from backend.sandbox import cleanup_orphan_containers, configure_semaphore
@@ -218,7 +226,7 @@ async def _run_coordinator(
     await cleanup_orphan_containers()
     console.print(f"[bold]Starting coordinator ({coordinator_backend}, Ctrl+C to stop)...[/bold]\n")
     if msg_port:
-        console.print(f"  Dashboard: [link=http://127.0.0.1:{msg_port}]http://127.0.0.1:{msg_port}[/link]\n")
+        console.print(f"  Dashboard bind: {dashboard_host}:{msg_port}\n")
 
     if coordinator_backend == "codex":
         from backend.agents.codex_coordinator import run_codex_coordinator
@@ -229,6 +237,7 @@ async def _run_coordinator(
             no_submit=no_submit,
             coordinator_model=coordinator_model,
             msg_port=msg_port,
+            msg_host=dashboard_host,
         )
     else:
         from backend.agents.claude_coordinator import run_claude_coordinator
@@ -239,6 +248,7 @@ async def _run_coordinator(
             no_submit=no_submit,
             coordinator_model=coordinator_model,
             msg_port=msg_port,
+            msg_host=dashboard_host,
         )
 
     console.print("\n[bold]Final Results:[/bold]")

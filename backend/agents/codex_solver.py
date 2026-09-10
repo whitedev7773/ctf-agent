@@ -548,7 +548,10 @@ class CodexSolver:
                 "evidence IDs. Before an expensive experiment record its expected signal, estimated "
                 "cost, and pivot if absent. Use `get_solve_state` after a restart and `sync_findings` "
                 "only at decision boundaries or for the current blocker. Use `search_experience` "
-                "only when a concrete symptom or blocker exists, and re-verify every retrieved lead."
+                "only when a concrete symptom or blocker exists, and re-verify every retrieved lead. "
+                "If an expected signal is absent, record the negative observation, mark the active "
+                "hypothesis refuted, and execute its pivot before another expensive call. Never leave "
+                "a contradicted hypothesis active or a failed experiment only in chat/tool logs."
             )
         if self.delegate_task_fn and self.task_mode == "solve":
             system_prompt += (
@@ -1081,7 +1084,18 @@ class CodexSolver:
         loop_status = self.loop_detector.check(tool_name, args, active_hypothesis)
         if loop_status == "break":
             self.tracer.event("loop_break", tool=tool_name, step=self._step_count)
-            result = "Loop detected — try a completely different approach."
+            result = (
+                "Loop guard blocked this call. Record the failed experiment and execute the "
+                "active hypothesis pivot before retrying this tool family."
+            )
+            family = self.loop_detector._action_family(tool_name, args)
+            await self.reasoning_state_store.update_context(
+                failed_experiment=(
+                    f"[{active_hypothesis or 'no-active-hypothesis'}] loop guard blocked "
+                    f"repeated {family} experiment"
+                ),
+                attempted_route=family,
+            )
         else:
             self._active_tool_calls += 1
             try:
@@ -1092,15 +1106,32 @@ class CodexSolver:
             outcome_status = self.loop_detector.record_result(
                 tool_name, args, result, active_hypothesis
             )
+            failure_reason = self.loop_detector.failure_reason(result)
+            if failure_reason:
+                family = self.loop_detector._action_family(tool_name, args)
+                await self.reasoning_state_store.update_context(
+                    failed_experiment=(
+                        f"[{active_hypothesis or 'no-active-hypothesis'}] {family}: "
+                        f"{failure_reason}"
+                    ),
+                    attempted_route=family,
+                )
+                self.tracer.event(
+                    "reasoning_event",
+                    event="EXECUTION_FAILURE_RECORDED",
+                    hypothesis_id=active_hypothesis or "",
+                    family=family,
+                    reason=failure_reason,
+                )
             if loop_status == "warn" and isinstance(result, str):
                 from backend.loop_detect import LOOP_WARNING_MESSAGE
 
                 result = f"{result}\n\n{LOOP_WARNING_MESSAGE}"
             elif outcome_status == "warn" and isinstance(result, str):
                 result = (
-                    f"{result}\n\nTwo consecutive emulator boots produced no usable signal. "
-                    "The next boot is blocked until a coordinator bump; pivot to static analysis "
-                    "or fix the concrete environment fault first."
+                    f"{result}\n\nThe experiment produced no new evidence or hit a hard resource "
+                    "failure. Record negative evidence when applicable and execute the active "
+                    "hypothesis pivot before retrying this expensive tool family."
                 )
 
         # Build content items — handle image tuples from view_image
@@ -1348,8 +1379,10 @@ class CodexSolver:
         elif name == "update_solve_context":
             try:
                 state = await self.reasoning_state_store.update_context(
-                    blocker=str(args.get("blocker", "")),
-                    next_experiment=str(args.get("next_experiment", "")),
+                    blocker=(str(args["blocker"]) if "blocker" in args else None),
+                    next_experiment=(
+                        str(args["next_experiment"]) if "next_experiment" in args else None
+                    ),
                     failed_experiment=str(args.get("failed_experiment", "")),
                     attempted_route=str(args.get("attempted_route", "")),
                     confirmed_fact=str(args.get("confirmed_fact", "")),
@@ -1450,10 +1483,10 @@ class CodexSolver:
             )
         elif self.task_mode == "writeup_revision":
             prompt_text = (
-                "Read the rejected REVIEW.md and revise WRITEUP.md against each concrete finding. Preserve correct "
-                "content, use only existing solver evidence, and rerun only a minimal verified capture command when "
-                "the review explicitly identifies missing evidence. Do not edit REVIEW.md; a fresh independent "
-                "review follows this pass."
+                "Read manifest.json revision_scope and REVIEW.md, then revise WRITEUP.md only against those concrete "
+                "findings. Preserve correct content, use only existing solver evidence, and rerun only a minimal "
+                "verified capture command when a scoped finding identifies missing evidence. Do not edit REVIEW.md; "
+                "a fresh independent review follows this pass."
             )
         elif self._step_count == 0:
             prompt_text = "Solve this CTF challenge."

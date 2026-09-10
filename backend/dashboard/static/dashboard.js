@@ -25,7 +25,7 @@ const state = {
   runtimeSettingsDirty: false,
   runtimeModels: [],
   codexUsage: null,
-  snapshotReceivedAt: 0,
+  snapshotReceivedAt: null,
   uptimeBaseSeconds: 0,
   challengeClocks: new Map(),
   clockTimer: null,
@@ -127,14 +127,14 @@ function hasActiveTextSelection() {
 }
 
 function sampledElapsedSeconds(baseSeconds) {
-  const delta = state.snapshotReceivedAt
+  const delta = state.snapshotReceivedAt !== null
     ? Math.max(0, (performance.now() - state.snapshotReceivedAt) / 1000)
     : 0;
   return Math.max(0, Number(baseSeconds || 0) + delta);
 }
 
 function observedChallengeDuration(challenge) {
-  return Math.max(0, ...challenge.agents.map((agent) => Number(agent.duration_seconds || 0)));
+  return Math.max(0, Number(challenge.elapsed_seconds || 0));
 }
 
 function challengeElapsedSeconds(challenge) {
@@ -146,20 +146,15 @@ function challengeElapsedSeconds(challenge) {
 
 function syncFrontendClocks(snapshot) {
   const now = performance.now();
-  const previousUptime = sampledElapsedSeconds(state.uptimeBaseSeconds);
   state.snapshotReceivedAt = now;
-  state.uptimeBaseSeconds = Math.max(previousUptime, Number(snapshot.uptime_seconds || 0));
+  state.uptimeBaseSeconds = Math.max(0, Number(snapshot.uptime_seconds || 0));
 
   const currentNames = new Set();
   for (const challenge of snapshot.challenges || []) {
     currentNames.add(challenge.name);
-    const previous = state.challengeClocks.get(challenge.name);
-    const previousElapsed = previous
-      ? previous.baseSeconds + (previous.active ? Math.max(0, (now - previous.sampledAt) / 1000) : 0)
-      : 0;
     state.challengeClocks.set(challenge.name, {
       active: Boolean(challenge.active),
-      baseSeconds: Math.max(previousElapsed, observedChallengeDuration(challenge)),
+      baseSeconds: observedChallengeDuration(challenge),
       sampledAt: now,
     });
   }
@@ -857,7 +852,9 @@ function buildWriteupSection(challenge) {
       ? "라이트업 생성 중…"
       : challenge.documented
       ? "라이트업 재생성"
-      : writeup.status === "needs_attention" || writeup.status === "pending"
+      : writeup.status === "needs_attention" && writeup.review_path
+        ? "부족 항목 수정 재개"
+        : writeup.status === "needs_attention" || writeup.status === "pending"
         ? "라이트업 생성 재개"
         : "라이트업 생성 요청";
     const request = button(

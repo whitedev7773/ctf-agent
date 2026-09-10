@@ -151,6 +151,47 @@ def _checkpoint_summary(root: Path) -> str:
     return f"- CHECKPOINT {root.name}: status={status}, attempt={attempt}; {details}"
 
 
+def _reasoning_summary(root: Path) -> str:
+    """Return the authoritative decision-state fields needed for a safe resume."""
+    state_path = root / "reasoning" / "state.json"
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    active_id = str(payload.get("active_hypothesis") or "")[:100]
+    active = next(
+        (
+            item for item in payload.get("hypotheses", [])
+            if isinstance(item, dict) and str(item.get("id", "")) == active_id
+        ),
+        None,
+    )
+    active_text = ""
+    if isinstance(active, dict):
+        statement = " ".join(str(active.get("statement", "")).split())[:300]
+        active_text = f"active={active_id}:{statement}"
+    blocker = " ".join(str(payload.get("current_blocker", "")).split())[:240]
+    next_experiment = " ".join(str(payload.get("next_experiment", "")).split())[:240]
+    failures = payload.get("failed_experiments", [])
+    last_failure = ""
+    if isinstance(failures, list) and failures:
+        last_failure = " ".join(str(failures[-1]).split())[:240]
+    details = "; ".join(
+        part
+        for part in (
+            f"phase={str(payload.get('phase', 'TRIAGE'))[:40]}",
+            active_text,
+            f"blocker={blocker}" if blocker else "",
+            f"last_failure={last_failure}" if last_failure else "",
+            f"next={next_experiment}" if next_experiment else "",
+        )
+        if part
+    )
+    return f"- REASONING {root.name}: {details}"
+
+
 def workspace_progress_signature(*roots: str) -> str:
     """Return a bounded signature of solver-created artifacts.
 
@@ -186,6 +227,7 @@ def workspace_resume_manifest(*roots: str, limit: int = 24) -> str:
     """Summarize the most useful existing artifacts for a fresh model thread."""
     candidates: list[tuple[int, int, str]] = []
     checkpoints: list[str] = []
+    reasoning: list[str] = []
     for raw_root in roots:
         if not raw_root:
             continue
@@ -195,6 +237,9 @@ def workspace_resume_manifest(*roots: str, limit: int = 24) -> str:
         checkpoint = _checkpoint_summary(root)
         if checkpoint:
             checkpoints.append(checkpoint)
+        state_summary = _reasoning_summary(root)
+        if state_summary:
+            reasoning.append(state_summary)
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
@@ -215,7 +260,7 @@ def workspace_resume_manifest(*roots: str, limit: int = 24) -> str:
             )
     selected = sorted(candidates, reverse=True)[: max(1, limit)]
     artifact_lines = [f"- {item[2]}" for item in selected]
-    return "\n".join(checkpoints + artifact_lines)
+    return "\n".join(checkpoints + reasoning + artifact_lines)
 
 
 def handoff_quality_issues(path: str | Path) -> list[str]:
@@ -411,6 +456,10 @@ def challenge_approach_notes(
     )
     if not root.is_dir() or len(notes) >= max_notes:
         return notes
+
+    reasoning_summary = _reasoning_summary(root)
+    if reasoning_summary:
+        add("reasoning/state.json", reasoning_summary.removeprefix("- REASONING _shared: "))
 
     candidates: list[tuple[int, int, Path]] = []
     for path in root.rglob("*.md"):

@@ -146,9 +146,12 @@ def build_prompt(
     if resume_manifest:
         lines += [
             "## Existing work — resume before new triage",
-            "A prior run left these curated checkpoints and reusable artifacts. Read the concise "
-            "checkpoint/STATE first, then open only the artifact needed for the narrowest unresolved "
-            "blocker. Do not re-run inventory or bulk extraction merely to rebuild context:",
+            "A prior run left these curated checkpoints and reusable artifacts. If "
+            "`get_solve_state` is available, call it first; otherwise start from the REASONING line "
+            "below. This evidence-backed state is authoritative over handwritten STATE files. "
+            "Reconcile any stale or contradictory note, then open only the artifact "
+            "needed for the narrowest unresolved blocker. Do not re-run inventory or bulk extraction "
+            "merely to rebuild context:",
             resume_manifest,
             "",
         ]
@@ -196,6 +199,15 @@ def build_prompt(
             "## Binary Analysis",
             "Available: pyghidra, radare2, gdb, angr and capstone. Request only the smallest "
             "function, symbol set or debugger snapshot that answers the current hypothesis.",
+            "Treat every decompiler translation, emulator, extracted round function, and solver as a "
+            "candidate model. Before inversion, broad symbolic search, or scaling to all rounds, "
+            "differentially compare it with the unmodified native program on at least two controlled "
+            "inputs at the same semantic checkpoints. Save the first mismatching vector as negative "
+            "evidence and refute the model instead of tuning constants around the mismatch.",
+            "For virtualized or signal/exception-driven code, lift and validate one complete state "
+            "transition end-to-end before generalizing the instruction set or round network. Runs with "
+            "LD_PRELOAD stubs, patched timing/output, manually injected signals, or forced branches are "
+            "instrumentation only until reconciled with one natural execution.",
             "",
         ]
 
@@ -228,6 +240,9 @@ def build_prompt(
         f"4. {image_hint} {web_hint}",
         "5. Before a long emulator, debugger, symbolic or algebra job, write the expected signal and "
         "the pivot if absent. Do not repeat a failed environment setup with cosmetic argument changes.",
+        "5a. Exit 137, timeout, assertion failure, or a model/native mismatch is a failed experiment, "
+        "not permission to rerun a larger variant. Record it immediately, reduce the experiment, and "
+        "take the hypothesis pivot before using that expensive tool family again.",
         '6. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.',
         f"7. {submit_hint}",
         "8. Use `flag_found` only after direct solve/exploit output produces the candidate. "
@@ -241,6 +256,12 @@ def build_prompt(
         "cite source/offsets and, when the environment permits, one observed dynamic result.",
         "13. If two handoffs disagree, record the conflict before using either conclusion and run the "
         "smallest discriminating experiment. Never silently combine incompatible layouts or arithmetic.",
+        "13a. Keep observed input length, solver variables, accepted input, and flag output as separate "
+        "concepts. Do not apply the challenge flag format to stdin or symbolic variables unless native "
+        "validation proves the flag itself is the accepted input.",
+        "13b. UNSAT proves only the exact path and constraints encoded. Report the concrete seed/path "
+        "policy and all format/printability constraints; remove artificial constraints and test a "
+        "different feasible path before concluding that no input exists.",
         "14. After a concrete static primitive is found, do not spend another bulk extraction or long analysis phase without "
         "creating or running a minimal reproducer, harness, solver, or debugger check for that primitive.",
         "15. Documentation is a required solve artifact. Preserve the final analysis, exact reproduction "
@@ -372,9 +393,10 @@ def build_writeup_revision_prompt(meta: ChallengeMeta, verified_flag: str = "") 
     )
     return "\n".join(
         [
-            "You are revising an authorized CTF writeup after an independent reviewer rejected it.",
-            "Read `/challenge/shared/writeup/REVIEW.md` first and treat its concrete checklist and unresolved gaps "
-            "as the only revision scope. Cross-check every correction against preserved solver evidence under "
+            "You are revising an authorized CTF writeup after its review and server quality checks found gaps.",
+            "Read `/challenge/shared/writeup/manifest.json` and `/challenge/shared/writeup/REVIEW.md` first. Treat "
+            "the manifest's `revision_scope` items plus the review's concrete checklist and unresolved gaps as the "
+            "only revision scope. Cross-check every correction against preserved solver evidence under "
             "`/challenge/shared/` and `/challenge/workspace/`.",
             flag_line,
             "",
@@ -384,7 +406,8 @@ def build_writeup_revision_prompt(meta: ChallengeMeta, verified_flag: str = "") 
             f"- Description: {meta.description or '(none)'}",
             "",
             "## Required work",
-            "1. Read REVIEW.md and WRITEUP.md, then fix each actionable rejected item using only preserved evidence.",
+            "1. Read manifest.json, REVIEW.md, and WRITEUP.md, then fix only each actionable scoped item using "
+            "preserved evidence. An APPROVED review does not cancel additional `revision_scope` quality issues.",
             "2. Preserve correct concise content. Do not restart analysis, develop another solve route, submit a "
             "flag, or expand the document into an investigation diary.",
             "3. If the review identifies a missing evidence screen, run only an existing verified reproducer or a "

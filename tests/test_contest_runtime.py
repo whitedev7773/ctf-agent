@@ -19,6 +19,7 @@ from backend.agents.coordinator_core import do_submit_flag as coordinator_submit
 from backend.agents.coordinator_loop import _unsolved_names
 from backend.agents.swarm import ChallengeSwarm
 from backend.artifacts import (
+    challenge_approach_notes,
     challenge_shared_path,
     handoff_quality_issues,
     solver_workspace_path,
@@ -143,6 +144,64 @@ class ArtifactAndProfileTests(unittest.TestCase):
             self.assertIn("CHECKPOINT", manifest)
             self.assertIn("flag reachability remains unproven", manifest)
 
+    def test_resume_manifest_surfaces_authoritative_reasoning_state(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            reasoning = Path(root) / "reasoning"
+            reasoning.mkdir()
+            (reasoning / "state.json").write_text(
+                json.dumps(
+                    {
+                        "phase": "HYPOTHESIS_TEST",
+                        "active_hypothesis": "H-vm",
+                        "current_blocker": "native checkpoint mismatch",
+                        "next_experiment": "lift one transition",
+                        "failed_experiments": ["additive model refuted"],
+                        "hypotheses": [
+                            {
+                                "id": "H-vm",
+                                "statement": "The emulator matches native execution.",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = workspace_resume_manifest(root)
+            self.assertIn("REASONING", manifest)
+            self.assertIn("native checkpoint mismatch", manifest)
+            self.assertIn("additive model refuted", manifest)
+            self.assertIn("lift one transition", manifest)
+
+    def test_dashboard_notes_prefer_reasoning_state_over_stale_state_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            settings = SimpleNamespace(workspace_root=root)
+            shared = Path(challenge_shared_path(settings, "stale-state"))
+            (shared / "lead").mkdir()
+            (shared / "lead" / "STATE.md").write_text(
+                "## Current blocker\nOld blocker from initial triage.", encoding="utf-8"
+            )
+            reasoning = shared / "reasoning"
+            reasoning.mkdir()
+            (reasoning / "state.json").write_text(
+                json.dumps(
+                    {
+                        "phase": "HYPOTHESIS_TEST",
+                        "active_hypothesis": "H-new",
+                        "current_blocker": "native differential mismatch",
+                        "next_experiment": "lift one transition",
+                        "hypotheses": [
+                            {"id": "H-new", "statement": "Revised measured model."}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            notes = challenge_approach_notes(settings, "stale-state")
+            self.assertEqual(notes[0]["source"], "reasoning/state.json")
+            self.assertIn("native differential mismatch", notes[0]["text"])
+
     def test_delegate_handoff_requires_reproducible_evidence_schema(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             handoff = Path(root) / "delegate.md"
@@ -184,6 +243,9 @@ class ArtifactAndProfileTests(unittest.TestCase):
         self.assertIn("/challenge/skills/ctf-pwn/SKILL.md", prompt)
         self.assertIn("smallest discriminating experiment", prompt)
         self.assertIn("bulk extraction", prompt)
+        self.assertIn("differentially compare", prompt)
+        self.assertIn("UNSAT proves only the exact path", prompt)
+        self.assertIn("Do not apply the challenge flag format to stdin", prompt)
         self.assertIn("lattice", category_playbook("crypto"))
         self.assertIn("Primary solve owner", solver_lane("codex/gpt-5.6-sol/xhigh"))
         self.assertEqual(solver_role("codex/gpt-5.6-sol/xhigh").key, "lead")

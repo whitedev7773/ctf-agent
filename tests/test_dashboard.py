@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import re
 import tempfile
@@ -207,6 +208,24 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(html_ids), len(set(html_ids)))
         self.assertEqual(javascript_refs - set(html_ids), set())
         self.assertEqual(codex_usage_refs - set(html_ids), set())
+
+    async def test_status_elapsed_is_independent_of_browser_requests(self) -> None:
+        from backend.runtime_clock import RuntimeClock
+
+        clock = RuntimeClock(started_at=10)
+        self.deps.swarms["web/intro"] = SimpleNamespace(
+            runtime_clock=clock, model_specs=[], findings={},
+            cancel_event=asyncio.Event(),
+        )
+        with patch("backend.runtime_clock.time.monotonic", return_value=130):
+            first = self.server._snapshot()
+            self.assertEqual(first["challenges"][0]["elapsed_seconds"], 120)
+        with patch("backend.runtime_clock.time.monotonic", return_value=310):
+            second = self.server._snapshot()
+            self.assertEqual(second["challenges"][0]["elapsed_seconds"], 300)
+            clock.stop()
+        with patch("backend.runtime_clock.time.monotonic", return_value=900):
+            self.assertEqual(self.server._snapshot()["challenges"][0]["elapsed_seconds"], 300)
 
     async def test_codex_usage_endpoint_supports_cached_and_forced_reads(self) -> None:
         await self.server.codex_usage_monitor.stop()
@@ -709,6 +728,67 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         )
         for solver in solvers:
             solver.stop.assert_awaited_once()
+
+    async def test_completed_quality_check_resumes_with_revision_only(self) -> None:
+        root = Path(challenge_workspace_path(self.deps.settings, "web/intro"))
+        output = root / "_shared" / "writeup"
+        output.mkdir(parents=True)
+        (output / "WRITEUP.md").write_text("# 기존 라이트업\n", encoding="utf-8")
+        (output / "REVIEW.md").write_text(
+            "# 검수\n\nVerdict: APPROVED\n", encoding="utf-8"
+        )
+        (output / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "status": "needs_attention",
+                    "documented": False,
+                    "phase": "needs_attention",
+                    "writeup_path": "_shared/writeup/WRITEUP.md",
+                    "review_path": "_shared/writeup/REVIEW.md",
+                    "issues": ["재현 절에 실행 명령이 필요합니다"],
+                    "history": [{"event": "needs_attention"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.server._run_writeup_generation = AsyncMock()
+
+        status = await self.server.start_writeup_generation("web/intro")
+        await self.server._writeup_tasks["web/intro"]
+
+        self.assertEqual(status["phase"], "revising")
+        self.assertTrue(status["targeted_revision"])
+        self.assertEqual(status["revision_scope"], ["재현 절에 실행 명령이 필요합니다"])
+        self.server._run_writeup_generation.assert_awaited_once()
+        self.assertTrue(
+            self.server._run_writeup_generation.await_args.kwargs["targeted_revision"]
+        )
+
+    async def test_targeted_writeup_resume_runs_revision_then_review(self) -> None:
+        result = SimpleNamespace(status="incomplete")
+        solvers = [
+            SimpleNamespace(
+                run_until_done_or_gave_up=AsyncMock(return_value=result),
+                activity_idle_seconds=lambda: 0,
+                stop=AsyncMock(),
+            )
+            for _ in range(2)
+        ]
+        self.server._create_writeup_solver = MagicMock(side_effect=solvers)
+
+        await self.server._run_writeup_generation(
+            "web/intro",
+            ChallengeMeta(name="web/intro", category="Web"),
+            "codex/gpt-5.6-terra/medium",
+            "codex/gpt-5.6-luna/medium",
+            "TEAM{verified}",
+            targeted_revision=True,
+        )
+
+        self.assertEqual(
+            [call.kwargs["task_mode"] for call in self.server._create_writeup_solver.call_args_list],
+            ["writeup_revision", "writeup_review"],
+        )
 
     async def test_writeup_watchdog_cancellation_drains_child_job(self) -> None:
         started = asyncio.Event()

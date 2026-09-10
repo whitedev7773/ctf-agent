@@ -104,8 +104,9 @@ class TracingToolset(WrapperToolset[SolverDeps]):
             result = f"{result}\n\n{LOOP_WARNING_MESSAGE}" if isinstance(result, str) else result
         elif outcome_status == "warn" and isinstance(result, str):
             result = (
-                f"{result}\n\nTwo consecutive emulator boots produced no usable signal. "
-                "The next boot is blocked until new coordinator guidance."
+                f"{result}\n\nThis expensive experiment family produced no new evidence or "
+                "hit a hard resource failure. Reduce the experiment and take the recorded pivot "
+                "before retrying it."
             )
 
         # Check for confirmed flag

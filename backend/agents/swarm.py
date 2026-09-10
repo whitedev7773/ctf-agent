@@ -35,6 +35,7 @@ from backend.message_bus import ChallengeMessageBus
 from backend.model_specs import provider_from_spec, quota_fallback_spec
 from backend.models import DEFAULT_MODELS
 from backend.prompts import ChallengeMeta
+from backend.runtime_clock import RuntimeClock
 from backend.solver_base import (
     BUDGET_EXHAUSTED,
     CANCELLED,
@@ -98,6 +99,8 @@ class ChallengeSwarm:
     _triage_ready: asyncio.Event = field(default_factory=asyncio.Event)
     _solution_ready: asyncio.Event = field(default_factory=asyncio.Event)
     _primary_tasks: set[asyncio.Task] = field(default_factory=set)
+    runtime_clock: RuntimeClock = field(default_factory=RuntimeClock)
+    agent_clocks: dict[str, RuntimeClock] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # A swarm may append live delegate aliases. Never mutate the coordinator's
@@ -609,6 +612,18 @@ class ChallengeSwarm:
             return display, is_confirmed
 
     async def _run_solver(
+        self,
+        model_spec: str,
+        task_directive: str = "",
+    ) -> SolverResult | None:
+        clock = self.agent_clocks.setdefault(model_spec, RuntimeClock())
+        clock.start()
+        try:
+            return await self._run_solver_timed(model_spec, task_directive)
+        finally:
+            clock.stop()
+
+    async def _run_solver_timed(
         self,
         model_spec: str,
         task_directive: str = "",
@@ -1134,6 +1149,13 @@ class ChallengeSwarm:
             logger.warning("Could not write solver checkpoint in %s: %s", workspace, exc)
 
     async def run(self) -> SolverResult | None:
+        self.runtime_clock.start()
+        try:
+            return await self._run_timed()
+        finally:
+            self.runtime_clock.stop()
+
+    async def _run_timed(self) -> SolverResult | None:
         """Return a verified winner, or a standalone candidate awaiting human review."""
         benchmark_started = time.monotonic()
         benchmark_started_wall = time.time()

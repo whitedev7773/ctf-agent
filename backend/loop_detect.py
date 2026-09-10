@@ -31,15 +31,43 @@ class LoopDetector:
 
     @staticmethod
     def _heavy_family(tool_name: str, args: dict | str | None) -> str:
-        """Return a semantic family for expensive environment boot commands."""
+        """Return a semantic family for expensive or memory-sensitive commands."""
         raw = str(args.get("command", "")) if isinstance(args, dict) else str(args or "")
-        if tool_name.casefold() in {"bash", "shell"} and re.search(
-            r"(?:^|[\\/\s])qemu-system-[\w.-]+",
+        if tool_name.casefold() not in {"bash", "shell"}:
+            return ""
+        if re.search(r"(?:^|[\\/\s])qemu-system-[\w.-]+", raw, flags=re.IGNORECASE):
+            return "qemu-system"
+        if re.search(r"\b(?:gdb|lldb|rr)\b", raw, flags=re.IGNORECASE):
+            return "debugger"
+        if re.search(
+            r"\b(?:angr|z3|claripy|symbolic|concolic)\b|(?:solve|symexec|concolic)[\w.-]*\.py",
             raw,
             flags=re.IGNORECASE,
         ):
-            return "qemu-system"
+            return "symbolic-solver"
+        if re.search(
+            r"(?:emulat|emulator|emulate|qiling|unicorn)[\w.-]*\.py",
+            raw,
+            flags=re.IGNORECASE,
+        ):
+            return "emulator"
         return ""
+
+    @staticmethod
+    def failure_reason(result: object) -> str:
+        """Classify hard execution failures that require a changed plan before retrying."""
+        folded = str(result).casefold()
+        markers = (
+            ("[exit 137]", "process killed (exit 137; probable memory exhaustion)"),
+            ("killed process", "process killed"),
+            ("out of memory", "out of memory"),
+            ("memoryerror", "memory exhaustion"),
+            ("[exit 124]", "command timeout (exit 124)"),
+            ("command timed out", "command timeout"),
+            ("assertionerror", "model or harness assertion failed"),
+            ("error in sourced command file", "debugger command file failed"),
+        )
+        return next((reason for marker, reason in markers if marker in folded), "")
 
     @staticmethod
     def _action_family(tool_name: str, args: dict | str | None) -> str:
@@ -98,6 +126,10 @@ class LoopDetector:
         family = self._action_family(tool_name, args)
         target = self._target(args)
         self._pending_semantic = f"{hypothesis_id or '-'}|{family}|{target}"
+        heavy_family = self._heavy_family(tool_name, args)
+        heavy_key = f"{hypothesis_id or '-'}|{heavy_family}" if heavy_family else ""
+        if heavy_key in self._blocked_heavy:
+            return "break"
         repeated_semantic = [
             item for item in self._semantic_recent if item.startswith(self._pending_semantic + "|")
         ]
@@ -111,10 +143,6 @@ class LoopDetector:
             if len(hashes) == 1:
                 self.duplicate_count += 1
                 return "warn"
-
-        heavy_family = self._heavy_family(tool_name, args)
-        if heavy_family in self._blocked_heavy:
-            return "break"
 
         count = sum(1 for s in self._recent if s == sig)
         if count >= self.break_threshold:
@@ -148,6 +176,14 @@ class LoopDetector:
         family = self._heavy_family(tool_name, args)
         if not family:
             return "warn" if semantic_count >= self.warn_threshold else None
+        heavy_key = f"{hypothesis_id or '-'}|{family}"
+        failure = self.failure_reason(result)
+        if failure:
+            failures = self._heavy_failures.get(heavy_key, 0) + 1
+            self._heavy_failures[heavy_key] = failures
+            if failures >= 2:
+                self._blocked_heavy.add(heavy_key)
+            return "warn"
         cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(result))
         ignored = (
             "qemu-system-",
@@ -163,13 +199,13 @@ class LoopDetector:
             if line.strip() and not any(marker in line.casefold() for marker in ignored)
         ]
         if meaningful:
-            self._heavy_failures[family] = 0
-            self._blocked_heavy.discard(family)
+            self._heavy_failures[heavy_key] = 0
+            self._blocked_heavy.discard(heavy_key)
             return "warn" if semantic_count >= self.warn_threshold else None
-        failures = self._heavy_failures.get(family, 0) + 1
-        self._heavy_failures[family] = failures
+        failures = self._heavy_failures.get(heavy_key, 0) + 1
+        self._heavy_failures[heavy_key] = failures
         if failures >= 2:
-            self._blocked_heavy.add(family)
+            self._blocked_heavy.add(heavy_key)
             return "warn"
         return None
 
@@ -192,10 +228,8 @@ class LoopDetector:
 
 
 LOOP_WARNING_MESSAGE = (
-    "⚠️ **You are stuck in a loop** — you have repeated the same command or expensive "
-    "environment boot family. STOP repeating it. Step back, reconsider your approach, "
-    "and try a **completely different** technique or tool. "
-    "If you were grepping/searching, try a Python script instead. "
-    "If you were analyzing one aspect of the file, switch to another. "
-    "What other angles haven't you explored?"
+    "LOOP GUARD: this experiment family has repeated without new evidence. Record the failed "
+    "experiment against the active hypothesis, refute it if its expected signal was absent, "
+    "and execute the recorded pivot. Cosmetic command, seed, breakpoint, or constant changes "
+    "do not count as a new approach."
 )

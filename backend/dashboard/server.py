@@ -1,4 +1,4 @@
-"""Loopback-only dashboard and control API for a running coordinator."""
+"""Dashboard and control API for a running coordinator."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ from backend.ctfd import CTFdClient
 from backend.experience import experience_root, experience_summary
 from backend.model_specs import provider_from_spec
 from backend.prompts import ChallengeMeta
+from backend.runtime_clock import RuntimeClock
 from backend.runtime_settings import (
     RuntimeSettings,
     apply_runtime_settings,
@@ -258,11 +259,13 @@ class DashboardServer:
         poller: CTFdPoller,
         cost_tracker: CostTracker,
         port: int = 9400,
+        host: str = "127.0.0.1",
     ) -> None:
         self.deps = deps
         self.poller = poller
         self.cost_tracker = cost_tracker
         self.port = port
+        self.host = host
         self.actual_port = port
         self.started_at = time.monotonic()
         self._startup_source_fingerprint = _runtime_source_fingerprint()
@@ -273,6 +276,7 @@ class DashboardServer:
         self._writeup_lock = asyncio.Lock()
         self._writeup_tasks: dict[str, asyncio.Task[None]] = {}
         self._writeup_solvers: dict[str, Any] = {}
+        self._writeup_clocks: dict[str, RuntimeClock] = {}
         self._writeup_phases: dict[str, str] = {}
         self.codex_usage_monitor = CodexUsageMonitor(
             getattr(self.deps.settings, "codex_cli_path", ""),
@@ -316,7 +320,7 @@ class DashboardServer:
         )
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
-        self._site = web.TCPSite(self._runner, "127.0.0.1", self.port)
+        self._site = web.TCPSite(self._runner, self.host, self.port)
         await self._site.start()
 
         server = getattr(self._site, "_server", None)
@@ -458,6 +462,9 @@ class DashboardServer:
                         swarm_settings,
                         spec,
                     )
+                    clock = getattr(swarm, "agent_clocks", {}).get(spec)
+                    if clock is not None:
+                        usage["duration_seconds"] = round(clock.elapsed_seconds, 1)
                     sandbox = getattr(solver, "sandbox", None) if solver else None
                     resource_reader = getattr(sandbox, "resource_snapshot", None)
                     resource = resource_reader() if callable(resource_reader) else {}
@@ -556,6 +563,9 @@ class DashboardServer:
                             self.deps.settings,
                             writeup_solver.model_spec,
                         ),
+                        "duration_seconds": round(
+                            self._writeup_clocks[name].elapsed_seconds, 1
+                        ) if name in self._writeup_clocks else 0.0,
                     }
                 )
                 total_agents += 1
@@ -590,6 +600,12 @@ class DashboardServer:
                     "solves": getattr(meta, "solves", 0) or 0,
                     "status": status,
                     "active": is_active,
+                    "elapsed_seconds": round(
+                        swarm.runtime_clock.elapsed_seconds
+                        if swarm is not None and hasattr(swarm, "runtime_clock")
+                        else max((agent["duration_seconds"] for agent in agents), default=0.0),
+                        1,
+                    ),
                     "solved": is_solved,
                     "flag": result.get("flag"),
                     "candidate": candidate.get("flag"),
@@ -992,6 +1008,8 @@ class DashboardServer:
         model_spec: str,
         review_model_spec: str,
         flag: str,
+        *,
+        targeted_revision: bool = False,
     ) -> None:
         challenge_dir = self.deps.challenge_dirs.get(name, self.deps.challenges_root)
         try:
@@ -1010,9 +1028,13 @@ class DashboardServer:
                         name, meta, challenge_dir, spec, flag, task_mode=task_mode
                     )
                     self._writeup_solvers[name] = solver
+                    clock = RuntimeClock()
+                    clock.start()
+                    self._writeup_clocks[name] = clock
                     try:
                         results.append(await self._wait_for_writeup(solver))
                     finally:
+                        clock.stop()
                         try:
                             await asyncio.wait_for(solver.stop(), timeout=15)
                         except Exception as exc:
@@ -1021,14 +1043,25 @@ class DashboardServer:
                             )
                         if self._writeup_solvers.get(name) is solver:
                             self._writeup_solvers.pop(name, None)
+                            self._writeup_clocks.pop(name, None)
 
-                stages = [
-                    ("writing", model_spec, "writeup"),
-                    ("reviewing", review_model_spec, "writeup_review"),
-                ]
+                stages = (
+                    [
+                        ("revising", model_spec, "writeup_revision"),
+                        ("reviewing", review_model_spec, "writeup_review"),
+                    ]
+                    if targeted_revision
+                    else [
+                        ("writing", model_spec, "writeup"),
+                        ("reviewing", review_model_spec, "writeup_review"),
+                    ]
+                )
                 for phase, spec, task_mode in stages:
                     await run_stage(phase, spec, task_mode)
-                if writeup_review_verdict(self.deps.settings, name) == "rejected":
+                if (
+                    not targeted_revision
+                    and writeup_review_verdict(self.deps.settings, name) == "rejected"
+                ):
                     for phase, spec, task_mode in (
                         ("revising", model_spec, "writeup_revision"),
                         ("reviewing", review_model_spec, "writeup_review"),
@@ -1090,6 +1123,21 @@ class DashboardServer:
             if not model_spec or not review_model_spec:
                 raise RuntimeError("writeup generation and review require configured Codex models")
 
+            previous_status = self._current_writeup_status(name, solved=True)
+            history = previous_status.get("history", [])
+            latest_event = ""
+            if isinstance(history, list) and history and isinstance(history[-1], dict):
+                latest_event = str(history[-1].get("event", ""))
+            targeted_revision = bool(
+                previous_status.get("status") == "needs_attention"
+                and previous_status.get("writeup_path")
+                and previous_status.get("review_path")
+                and (
+                    latest_event == "needs_attention"
+                    or previous_status.get("targeted_revision") is True
+                )
+            )
+
             meta = self.deps.challenge_metas.get(name)
             if meta is None:
                 meta = ChallengeMeta(name=name, category="Unknown")
@@ -1106,6 +1154,10 @@ class DashboardServer:
                 name,
                 model_spec,
                 review_model_spec,
+                targeted_revision=targeted_revision,
+                revision_scope=list(previous_status.get("issues") or [])
+                if targeted_revision
+                else None,
             )
             task = asyncio.create_task(
                 self._run_writeup_generation(
@@ -1114,6 +1166,7 @@ class DashboardServer:
                     model_spec,
                     review_model_spec,
                     flag,
+                    targeted_revision=targeted_revision,
                 ),
                 name=f"writeup-{name}",
             )
@@ -1148,7 +1201,11 @@ class DashboardServer:
         except RuntimeError as exc:
             raise web.HTTPConflict(text=str(exc)) from exc
 
-        message = f"{name} 라이트업 AI 재생성을 시작했습니다."
+        message = (
+            f"{name} 라이트업의 부족한 항목 수정과 재검수를 시작했습니다."
+            if status.get("targeted_revision")
+            else f"{name} 라이트업 AI 재생성을 시작했습니다."
+        )
         return web.json_response(
             {"ok": True, "message": message, "challenge": name, "writeup": status},
             status=202,

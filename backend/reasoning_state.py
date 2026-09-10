@@ -249,21 +249,37 @@ class ReasoningStateStore:
             for evidence_id in [*(evidence_for or []), *(evidence_against or [])]:
                 if evidence_id not in known_evidence:
                     raise ValueError(f"unknown evidence id: {evidence_id}")
-            if status in {"supported", "refuted"} and not [
-                *(evidence_for or []),
-                *(evidence_against or []),
-            ]:
-                raise ValueError(f"{status} hypothesis requires evidence")
             existing = next(
                 (item for item in state.hypotheses if item.id == hypothesis_id),
                 None,
             )
+            merged_for = list(dict.fromkeys(evidence_for or (existing.evidence_for if existing else [])))
+            merged_against = list(
+                dict.fromkeys(evidence_against or (existing.evidence_against if existing else []))
+            )
+            if status == "supported" and not merged_for:
+                raise ValueError("supported hypothesis requires supporting evidence")
+            if status == "refuted" and not merged_against:
+                raise ValueError("refuted hypothesis requires negative evidence")
+            if existing is not None and existing.status == "refuted" and status in {
+                "candidate",
+                "active",
+                "supported",
+            }:
+                raise ValueError(
+                    "a refuted hypothesis cannot be reactivated; create a new hypothesis "
+                    "with a materially revised statement"
+                )
             unresolved = [
                 item
                 for item in state.hypotheses
                 if item.status in {"candidate", "active", "blocked"}
             ]
-            if existing is None and len(unresolved) >= 4:
+            if (
+                existing is None
+                and status in {"candidate", "active", "blocked"}
+                and len(unresolved) >= 4
+            ):
                 raise ValueError("solve state is limited to four unresolved hypotheses")
             previous_status = existing.status if existing else ""
             item = existing or Hypothesis(
@@ -271,10 +287,8 @@ class ReasoningStateStore:
             )
             item.statement = statement
             item.status = status
-            item.evidence_for = list(dict.fromkeys(evidence_for or item.evidence_for))[:100]
-            item.evidence_against = list(dict.fromkeys(evidence_against or item.evidence_against))[
-                :100
-            ]
+            item.evidence_for = merged_for[:100]
+            item.evidence_against = merged_against[:100]
             item.expected_signal = expected_signal[:2000]
             item.next_experiment = next_experiment[:2000]
             item.pivot_if_absent = pivot_if_absent[:2000]
@@ -287,15 +301,34 @@ class ReasoningStateStore:
             if existing is None:
                 state.hypotheses.append(item)
             if status == "active":
+                for other in state.hypotheses:
+                    if other.id != item.id and other.status == "active":
+                        other.status = "candidate"
+                        other.updated_at = time.time()
                 state.active_hypothesis = item.id
                 state.phase = "HYPOTHESIS_TEST"
             elif state.active_hypothesis == item.id and status != "active":
                 state.active_hypothesis = None
             if status == "supported":
                 state.phase = "EXPLOIT_BUILD"
-            elif status == "refuted" and not state.active_hypothesis:
-                state.phase = "HYPOTHESIS_TEST"
-            state.next_experiment = item.next_experiment
+            elif status == "refuted":
+                if not state.active_hypothesis:
+                    state.phase = "HYPOTHESIS_TEST"
+                route = f"[{item.id}] {item.statement}"[:3000]
+                failure = (
+                    f"[{item.id}] expected signal absent or contradicted; "
+                    f"pivot: {item.pivot_if_absent or 'choose a materially different hypothesis'}"
+                )[:3000]
+                if route not in state.attempted_routes:
+                    state.attempted_routes.append(route)
+                if failure not in state.failed_experiments:
+                    state.failed_experiments.append(failure)
+                state.attempted_routes = state.attempted_routes[-100:]
+                state.failed_experiments = state.failed_experiments[-100:]
+            state.next_experiment = (
+                item.pivot_if_absent if status == "refuted" and item.pivot_if_absent
+                else item.next_experiment
+            )
             event = (
                 "HYPOTHESIS_SUPPORTED"
                 if status == "supported" and previous_status != status
@@ -310,8 +343,8 @@ class ReasoningStateStore:
     async def update_context(
         self,
         *,
-        blocker: str = "",
-        next_experiment: str = "",
+        blocker: str | None = None,
+        next_experiment: str | None = None,
         failed_experiment: str = "",
         attempted_route: str = "",
         confirmed_fact: str = "",
@@ -324,8 +357,10 @@ class ReasoningStateStore:
             known_evidence = {item.id for item in state.evidence}
             if (confirmed_fact or resolved_contradiction) and evidence_id not in known_evidence:
                 raise ValueError("confirmed facts and conflict resolution require known evidence")
-            state.current_blocker = blocker[:3000]
-            state.next_experiment = next_experiment[:3000]
+            if blocker is not None:
+                state.current_blocker = blocker[:3000]
+            if next_experiment is not None:
+                state.next_experiment = next_experiment[:3000]
             if failed_experiment:
                 state.failed_experiments.append(failed_experiment[:3000])
                 state.failed_experiments = state.failed_experiments[-100:]

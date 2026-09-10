@@ -151,6 +151,22 @@ class KnowledgeArtifactTests(unittest.TestCase):
         self.assertEqual(staged.read_text(encoding="utf-8"), "print('reproduced')\n")
         self.assertIn("_shared/writeup/reproducers/", " ".join(status["reproducers"]))
 
+    def test_begin_targeted_revision_preserves_quality_issue_scope(self) -> None:
+        status = begin_writeup_generation(
+            self.settings,
+            "targeted revision",
+            "codex/gpt-5.6-terra/medium",
+            "codex/gpt-5.6-luna/medium",
+            targeted_revision=True,
+            revision_scope=["  재현 절의 명령을 보강해야 합니다  "],
+        )
+
+        self.assertEqual(status["phase"], "revising")
+        self.assertTrue(status["targeted_revision"])
+        self.assertEqual(status["issues"], ["재현 절의 명령을 보강해야 합니다"])
+        self.assertEqual(status["revision_scope"], status["issues"])
+        self.assertEqual(status["history"][-1]["event"], "revision_resumed")
+
     def test_begin_writeup_inventories_workspace_only_once(self) -> None:
         root = Path(challenge_workspace_path(self.settings, "single inventory"))
         solver = root / "solver" / "solve.py"

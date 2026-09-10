@@ -49,6 +49,7 @@ class CoordinatorDeps:
     max_concurrent_challenges: int = 10
 
     msg_port: int = 9400  # Dashboard and operator-message port; 0 = auto-pick.
+    msg_host: str = "127.0.0.1"  # Dashboard and operator-message bind address.
 
     # Runtime state
     coordinator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)

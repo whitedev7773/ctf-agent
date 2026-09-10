@@ -163,10 +163,17 @@ async def run_event_loop(
     try:
         from backend.dashboard import DashboardServer
 
-        dashboard_server = DashboardServer(deps, poller, cost_tracker, deps.msg_port)
+        dashboard_server = DashboardServer(
+            deps,
+            poller,
+            cost_tracker,
+            deps.msg_port,
+            deps.msg_host,
+        )
         await dashboard_server.start()
         logger.info(
-            "Dashboard listening on http://127.0.0.1:%d",
+            "Dashboard listening on %s:%d",
+            deps.msg_host,
             dashboard_server.actual_port,
         )
     except Exception as e:

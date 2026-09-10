@@ -61,6 +61,103 @@ async def test_supported_hypothesis_requires_known_evidence(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_refutation_records_failure_pivot_and_cannot_be_reactivated(
+    tmp_path: Path,
+) -> None:
+    store = ReasoningStateStore(tmp_path)
+    observation = observation_from_result(
+        "OBS-mismatch",
+        "bash",
+        {"command": "python3 differential.py"},
+        "native=9f model=b4 mismatch",
+    )
+    evidence = await store.record_evidence(
+        kind="negative",
+        claim="The extracted round model disagrees with native execution.",
+        confidence=0.99,
+        observation=observation,
+    )
+    await store.upsert_hypothesis(
+        hypothesis_id="H-round",
+        statement="The nearby tables fully encode the round function.",
+        status="refuted",
+        evidence_against=[evidence.id],
+        expected_signal="Model and native checkpoints match.",
+        next_experiment="Try another table permutation.",
+        pivot_if_absent="Lift one native transition end-to-end.",
+    )
+
+    state = store.load()
+    assert state.next_experiment == "Lift one native transition end-to-end."
+    assert state.failed_experiments
+    assert state.attempted_routes
+    with pytest.raises(ValueError, match="cannot be reactivated"):
+        await store.upsert_hypothesis(
+            hypothesis_id="H-round",
+            statement="The nearby tables fully encode the round function.",
+            status="active",
+            expected_signal="A different constant makes it match.",
+            next_experiment="Tune constants.",
+        )
+
+
+@pytest.mark.asyncio
+async def test_only_one_hypothesis_is_active_and_context_updates_preserve_fields(
+    tmp_path: Path,
+) -> None:
+    store = ReasoningStateStore(tmp_path)
+    await store.upsert_hypothesis(
+        hypothesis_id="H-one",
+        statement="First route.",
+        status="active",
+        expected_signal="one",
+        next_experiment="test one",
+    )
+    await store.update_context(blocker="Need native checkpoint", next_experiment="trace once")
+    await store.update_context(failed_experiment="debugger timed out")
+    await store.upsert_hypothesis(
+        hypothesis_id="H-two",
+        statement="Second route.",
+        status="active",
+        expected_signal="two",
+        next_experiment="test two",
+    )
+
+    state = store.load()
+    statuses = {item.id: item.status for item in state.hypotheses}
+    assert statuses == {"H-one": "candidate", "H-two": "active"}
+    assert state.current_blocker == "Need native checkpoint"
+
+
+@pytest.mark.asyncio
+async def test_resolved_hypothesis_does_not_consume_unresolved_limit(tmp_path: Path) -> None:
+    store = ReasoningStateStore(tmp_path)
+    for index in range(4):
+        await store.upsert_hypothesis(
+            hypothesis_id=f"H-{index}",
+            statement=f"Unresolved route {index}.",
+            status="candidate",
+        )
+    observation = observation_from_result(
+        "OBS-negative", "bash", {"command": "./check"}, "mismatch"
+    )
+    evidence = await store.record_evidence(
+        kind="negative",
+        claim="A separate route was disproved.",
+        confidence=0.9,
+        observation=observation,
+    )
+
+    await store.upsert_hypothesis(
+        hypothesis_id="H-resolved",
+        statement="A separate disproved route.",
+        status="refuted",
+        evidence_against=[evidence.id],
+    )
+    assert store.load().hypotheses[-1].status == "refuted"
+
+
+@pytest.mark.asyncio
 async def test_hypotheses_are_ranked_by_value_over_cost(tmp_path: Path) -> None:
     store = ReasoningStateStore(tmp_path)
     slow = await store.upsert_hypothesis(

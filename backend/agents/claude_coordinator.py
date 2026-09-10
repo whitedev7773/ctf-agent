@@ -112,12 +112,14 @@ async def run_claude_coordinator(
     no_submit: bool = False,
     coordinator_model: str | None = None,
     msg_port: int = 0,
+    msg_host: str = "127.0.0.1",
 ) -> dict[str, Any]:
     """Run the Claude Agent SDK coordinator with the shared event loop."""
     ctfd, cost_tracker, deps = build_deps(
         settings, model_specs, challenges_root, no_submit,
     )
     deps.msg_port = msg_port
+    deps.msg_host = msg_host
 
     mcp_server = _build_coordinator_mcp(deps)
     resolved_model = coordinator_model or "claude-opus-4-6"
