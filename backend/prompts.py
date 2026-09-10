@@ -21,6 +21,7 @@ from backend.tools.core import IMAGE_EXTS_FOR_VISION as IMAGE_EXTS
 @dataclass
 class ChallengeMeta:
     name: str = "Unknown"
+    source: str = ""
     category: str = ""
     value: int = 0
     description: str = ""
@@ -36,6 +37,7 @@ class ChallengeMeta:
             data = yaml.safe_load(f) or {}
         return cls(
             name=data.get("name", "Unknown"),
+            source=data.get("source", ""),
             category=data.get("category", ""),
             value=data.get("value", 0),
             description=data.get("description", ""),

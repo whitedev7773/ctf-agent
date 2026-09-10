@@ -1,10 +1,24 @@
 "use strict";
 
+function defaultFilters() {
+  return {
+    query: "",
+    statuses: new Set(),
+    categories: new Set(),
+    documentation: "all",
+    assignment: "all",
+    minPoints: "",
+    maxPoints: "",
+    maxSolves: "",
+    maxCost: "",
+    sort: "name-asc",
+  };
+}
+
 const state = {
   csrfToken: "",
   snapshot: null,
-  filter: "all",
-  query: "",
+  filters: defaultFilters(),
   selectedChallenge: null,
   refreshTimer: null,
   resourceTimer: null,
@@ -20,6 +34,7 @@ const state = {
   traces: new Map(),
   detailSignature: "",
   deleteChallengeSupported: false,
+  updateChallengeSupported: false,
   deleteChallengeName: "",
   runtimeSettingsInitialized: false,
   runtimeSettingsDirty: false,
@@ -588,14 +603,268 @@ function renderGlobalResources(resources) {
     : "1초 간격으로 갱신";
 }
 
+function optionalNumber(value) {
+  if (value === "" || value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function challengeCategories(challenge) {
+  const aliases = {
+    binary: "pwn", exploitation: "pwn", pwnable: "pwn",
+    reverse: "reversing", rev: "reversing", re: "reversing", rerversing: "reversing",
+    crypto: "cryptography", forensic: "forensics", steg: "forensics", steganography: "forensics",
+    kernel: "pwn", mobile: "android", apk: "android", "smart contract": "blockchain", web3: "blockchain",
+  };
+  const source = Array.isArray(challenge.categories)
+    ? challenge.categories
+    : String(challenge.category || "").split(/\s*\/\s*/);
+  const seen = new Set();
+  return source
+    .map((category) => String(category || "").trim().toLocaleLowerCase("ko-KR"))
+    .map((category) => aliases[category] || category)
+    .filter((category) => {
+      if (!category || seen.has(category)) return false;
+      seen.add(category);
+      return true;
+    });
+}
+
+function challengeMatchesFilters(challenge, filters) {
+  const query = String(filters.query || "").trim().toLocaleLowerCase("ko-KR");
+  const categories = challengeCategories(challenge);
+  const haystack = `${challenge.name || ""} ${categories.join(" ")}`.toLocaleLowerCase("ko-KR");
+  if (query && !haystack.includes(query)) return false;
+  if (filters.statuses.size && !filters.statuses.has(challenge.status)) return false;
+  if (filters.categories.size && !categories.some((category) => filters.categories.has(category))) return false;
+  if (filters.documentation === "documented" && !challenge.documented) return false;
+  if (filters.documentation === "pending" && (!challenge.solved || challenge.documented)) return false;
+  const hasAgents = Array.isArray(challenge.agents) && challenge.agents.length > 0;
+  if (filters.assignment === "assigned" && !hasAgents) return false;
+  if (filters.assignment === "unassigned" && hasAgents) return false;
+
+  const points = Number(challenge.value || 0);
+  const solves = Number(challenge.solves || 0);
+  const cost = Number(challenge.cost_usd || 0);
+  const minPoints = optionalNumber(filters.minPoints);
+  const maxPoints = optionalNumber(filters.maxPoints);
+  const maxSolves = optionalNumber(filters.maxSolves);
+  const maxCost = optionalNumber(filters.maxCost);
+  return !(minPoints !== null && points < minPoints)
+    && !(maxPoints !== null && points > maxPoints)
+    && !(maxSolves !== null && solves > maxSolves)
+    && !(maxCost !== null && cost > maxCost);
+}
+
+function compareChallenges(left, right, sort) {
+  const nameOrder = String(left.name || "").localeCompare(String(right.name || ""), "ko-KR", {
+    numeric: true,
+    sensitivity: "base",
+  });
+  const numeric = (key, direction) => {
+    const difference = Number(left[key] || 0) - Number(right[key] || 0);
+    return (direction === "desc" ? -difference : difference) || nameOrder;
+  };
+  if (sort === "points-desc") return numeric("value", "desc");
+  if (sort === "points-asc") return numeric("value", "asc");
+  if (sort === "solves-asc") return numeric("solves", "asc");
+  if (sort === "solves-desc") return numeric("solves", "desc");
+  if (sort === "elapsed-desc") return numeric("elapsed_seconds", "desc");
+  if (sort === "cost-desc") return numeric("cost_usd", "desc");
+  return nameOrder;
+}
+
 function filteredChallenges() {
   if (!state.snapshot) return [];
-  const query = state.query.trim().toLocaleLowerCase("ko-KR");
-  return state.snapshot.challenges.filter((challenge) => {
-    const matchesFilter = state.filter === "all" || challenge.status === state.filter;
-    const haystack = `${challenge.name} ${challenge.category}`.toLocaleLowerCase("ko-KR");
-    return matchesFilter && (!query || haystack.includes(query));
+  return state.snapshot.challenges
+    .filter((challenge) => challengeMatchesFilters(challenge, state.filters))
+    .sort((left, right) => compareChallenges(left, right, state.filters.sort));
+}
+
+function filterConditionCount(filters, includeQuery = true) {
+  return Number(includeQuery && Boolean(String(filters.query || "").trim()))
+    + Number(filters.statuses.size > 0)
+    + Number(filters.categories.size > 0)
+    + Number(filters.documentation !== "all")
+    + Number(filters.assignment !== "all")
+    + Number(optionalNumber(filters.minPoints) !== null)
+    + Number(optionalNumber(filters.maxPoints) !== null)
+    + Number(optionalNumber(filters.maxSolves) !== null)
+    + Number(optionalNumber(filters.maxCost) !== null);
+}
+
+function filtersFromLocation() {
+  const params = new URL(window.location.href).searchParams;
+  const allowedStatuses = new Set(["active", "candidate", "solved", "idle"]);
+  const allowedDocumentation = new Set(["all", "documented", "pending"]);
+  const allowedAssignment = new Set(["all", "assigned", "unassigned"]);
+  const allowedSorts = new Set([
+    "name-asc", "points-desc", "points-asc", "solves-asc", "solves-desc", "elapsed-desc", "cost-desc",
+  ]);
+  const statuses = new Set(
+    (params.get("status") || "").split(",").filter((value) => allowedStatuses.has(value)),
+  );
+  const documentation = params.get("doc") || "all";
+  const assignment = params.get("agents") || "all";
+  const sort = params.get("sort") || "name-asc";
+  const numericParam = (name) => {
+    const value = params.get(name) || "";
+    return optionalNumber(value) === null ? "" : value;
+  };
+  return {
+    query: params.get("q") || "",
+    statuses,
+    categories: new Set(
+      params.getAll("category")
+        .flatMap((category) => category.split(/\s*\/\s*/))
+        .map((category) => category.trim())
+        .filter(Boolean),
+    ),
+    documentation: allowedDocumentation.has(documentation) ? documentation : "all",
+    assignment: allowedAssignment.has(assignment) ? assignment : "all",
+    minPoints: numericParam("min_points"),
+    maxPoints: numericParam("max_points"),
+    maxSolves: numericParam("max_solves"),
+    maxCost: numericParam("max_cost"),
+    sort: allowedSorts.has(sort) ? sort : "name-asc",
+  };
+}
+
+function syncFilterUrl() {
+  const url = new URL(window.location.href);
+  const filters = state.filters;
+  for (const key of [
+    "q", "status", "category", "doc", "agents", "min_points", "max_points", "max_solves", "max_cost", "sort",
+  ]) {
+    url.searchParams.delete(key);
+  }
+  if (filters.query.trim()) url.searchParams.set("q", filters.query.trim());
+  if (filters.statuses.size) url.searchParams.set("status", [...filters.statuses].sort().join(","));
+  for (const category of [...filters.categories].sort()) url.searchParams.append("category", category);
+  if (filters.documentation !== "all") url.searchParams.set("doc", filters.documentation);
+  if (filters.assignment !== "all") url.searchParams.set("agents", filters.assignment);
+  if (optionalNumber(filters.minPoints) !== null) url.searchParams.set("min_points", filters.minPoints);
+  if (optionalNumber(filters.maxPoints) !== null) url.searchParams.set("max_points", filters.maxPoints);
+  if (optionalNumber(filters.maxSolves) !== null) url.searchParams.set("max_solves", filters.maxSolves);
+  if (optionalNumber(filters.maxCost) !== null) url.searchParams.set("max_cost", filters.maxCost);
+  if (filters.sort !== "name-asc") url.searchParams.set("sort", filters.sort);
+  window.history.replaceState(window.history.state, "", url);
+}
+
+function renderCategoryFilters() {
+  if (!state.snapshot) return;
+  const container = byId("category-filter");
+  const counts = new Map();
+  for (const challenge of state.snapshot.challenges) {
+    for (const category of challengeCategories(challenge)) {
+      counts.set(category, (counts.get(category) || 0) + 1);
+    }
+  }
+  const categories = [...new Set([...counts.keys(), ...state.filters.categories])]
+    .sort((left, right) => left.localeCompare(right, "ko-KR", { sensitivity: "base" }));
+  const current = [...container.querySelectorAll("input")].map((input) => input.value);
+  if (current.join("\u0000") !== categories.join("\u0000")) {
+    container.replaceChildren();
+    for (const category of categories) {
+      const label = node("label", "filter-option");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.value = category;
+      label.append(input, node("span", "", `${category} ${formatNumber(counts.get(category) || 0)}`));
+      container.append(label);
+    }
+    if (!categories.length) container.append(node("span", "filter-placeholder", "사용 가능한 카테고리가 없습니다."));
+  } else {
+    for (const input of container.querySelectorAll("input")) {
+      input.nextElementSibling.textContent = `${input.value} ${formatNumber(counts.get(input.value) || 0)}`;
+    }
+  }
+}
+
+function renderFilterControls() {
+  renderCategoryFilters();
+  byId("challenge-search").value = state.filters.query;
+  byId("challenge-sort").value = state.filters.sort;
+  byId("documentation-filter").value = state.filters.documentation;
+  byId("assignment-filter").value = state.filters.assignment;
+  byId("min-points-filter").value = state.filters.minPoints;
+  byId("max-points-filter").value = state.filters.maxPoints;
+  byId("max-solves-filter").value = state.filters.maxSolves;
+  byId("max-cost-filter").value = state.filters.maxCost;
+  for (const input of byId("status-filter").querySelectorAll("input")) {
+    input.checked = state.filters.statuses.has(input.value);
+  }
+  for (const input of byId("category-filter").querySelectorAll("input")) {
+    input.checked = state.filters.categories.has(input.value);
+  }
+  const statusCounts = new Map();
+  for (const challenge of state.snapshot?.challenges || []) {
+    statusCounts.set(challenge.status, (statusCounts.get(challenge.status) || 0) + 1);
+  }
+  for (const input of byId("status-filter").querySelectorAll("input")) {
+    input.nextElementSibling.textContent = `${statusLabel(input.value)} ${formatNumber(statusCounts.get(input.value) || 0)}`;
+  }
+  const advancedCount = filterConditionCount(state.filters, false);
+  const count = byId("filter-count");
+  count.textContent = String(advancedCount);
+  count.hidden = advancedCount === 0;
+}
+
+function filterChip(label, remove) {
+  const chip = node("button", "active-filter-chip");
+  chip.type = "button";
+  chip.setAttribute("aria-label", `${label} 필터 제거`);
+  chip.append(node("span", "", label), node("span", "filter-chip-remove", "×"));
+  chip.addEventListener("click", () => {
+    remove();
+    applyFilterChange();
   });
+  return chip;
+}
+
+function renderFilterSummary(visibleCount) {
+  const total = state.snapshot?.challenges.length || 0;
+  byId("filter-result-count").textContent = `전체 ${formatNumber(total)}개 중 ${formatNumber(visibleCount)}개 표시`;
+  const chips = byId("active-filter-chips");
+  chips.replaceChildren();
+  if (state.filters.query.trim()) {
+    chips.append(filterChip(`검색: ${state.filters.query.trim()}`, () => { state.filters.query = ""; }));
+  }
+  for (const status of state.filters.statuses) {
+    chips.append(filterChip(`상태: ${statusLabel(status)}`, () => state.filters.statuses.delete(status)));
+  }
+  for (const category of state.filters.categories) {
+    chips.append(filterChip(`카테고리: ${category}`, () => state.filters.categories.delete(category)));
+  }
+  const documentationLabels = { documented: "라이트업 완료", pending: "해결 후 미작성" };
+  if (documentationLabels[state.filters.documentation]) {
+    chips.append(filterChip(documentationLabels[state.filters.documentation], () => { state.filters.documentation = "all"; }));
+  }
+  const assignmentLabels = { assigned: "Solver 배정됨", unassigned: "Solver 미배정" };
+  if (assignmentLabels[state.filters.assignment]) {
+    chips.append(filterChip(assignmentLabels[state.filters.assignment], () => { state.filters.assignment = "all"; }));
+  }
+  const ranges = [
+    ["minPoints", "최소 점수"], ["maxPoints", "최대 점수"],
+    ["maxSolves", "최대 풀이 수"], ["maxCost", "최대 비용 $"],
+  ];
+  for (const [key, label] of ranges) {
+    if (optionalNumber(state.filters[key]) !== null) {
+      chips.append(filterChip(`${label}: ${state.filters[key]}`, () => { state.filters[key] = ""; }));
+    }
+  }
+  byId("filter-reset").hidden = filterConditionCount(state.filters) === 0 && state.filters.sort === "name-asc";
+}
+
+function applyFilterChange() {
+  syncFilterUrl();
+  renderFilterControls();
+  renderRows();
+}
+
+function resetFilters() {
+  state.filters = defaultFilters();
+  applyFilterChange();
 }
 
 function currentChallenge(name) {
@@ -648,7 +917,7 @@ function updateChallengeRow(row, challenge) {
   detailLink.setAttribute("aria-label", `${challenge.name} 상세 보기`);
   const meta = nameCell.querySelector(".challenge-meta");
   meta.replaceChildren();
-  meta.append(node("span", "", challenge.category));
+  meta.append(node("span", "", challengeCategories(challenge).join(" / ") || "Unknown"));
   meta.append(node("span", "", `${formatNumber(challenge.value)} pts`));
   if (challenge.solves) meta.append(node("span", "", `${formatNumber(challenge.solves)} solves`));
   if (challenge.documented) meta.append(node("span", "documented-badge", "DOCUMENTED"));
@@ -702,13 +971,15 @@ function updateChallengeRow(row, challenge) {
 function renderRows() {
   const tbody = byId("challenge-rows");
   const challenges = filteredChallenges();
+  renderFilterControls();
+  renderFilterSummary(challenges.length);
   byId("empty-state").hidden = challenges.length !== 0;
   const hasRegisteredChallenges = Boolean(state.snapshot?.challenges.length);
   byId("empty-title").textContent = hasRegisteredChallenges
     ? "조건에 맞는 문제가 없습니다"
     : "아직 등록된 문제가 없습니다";
   byId("empty-copy").textContent = hasRegisteredChallenges
-    ? "검색어나 상태 필터를 바꿔보세요."
+    ? "검색어나 적용 중인 필터를 바꾸거나 전체 초기화해보세요."
     : "아래에서 CTFd를 연결하거나 로컬 문제를 추가하세요.";
 
   const rowsByName = new Map(
@@ -805,6 +1076,103 @@ function buildResourcePanel(challenge) {
     if (resource.error) item.append(node("p", "agent-stop-reason", resource.error));
     section.append(item);
   }
+  return section;
+}
+
+function buildRegistrationSection(challenge) {
+  const registration = challenge.registration || {};
+  const sourceLabels = { local: "로컬 등록", ctfd: "CTFd 가져오기", metadata: "메타데이터 파일" };
+  const source = sourceLabels[registration.source] || "메타데이터 파일";
+  const attachments = Array.isArray(registration.attachments) ? registration.attachments : [];
+  const section = detailSection("등록 정보", source.toUpperCase());
+
+  const fixed = node("dl", "registration-fixed-grid");
+  const fixedItem = (label, value) => {
+    const item = node("div", "registration-fixed-item");
+    item.append(node("dt", "", label), node("dd", "", value));
+    return item;
+  };
+  fixed.append(
+    fixedItem("등록 방식", source),
+    fixedItem("문제명", challenge.name),
+    fixedItem("첨부 파일", attachments.length ? `${formatNumber(attachments.length)}개` : "없음"),
+    fixedItem(
+      "메타데이터 갱신",
+      registration.metadata_updated_at
+        ? new Date(registration.metadata_updated_at).toLocaleString("ko-KR")
+        : "확인 불가",
+    ),
+  );
+  section.append(fixed);
+
+  if (attachments.length) {
+    const files = node("ul", "registration-files");
+    for (const filename of attachments) files.append(node("li", "", filename));
+    section.append(files);
+  }
+
+  const help = node(
+    "p",
+    "registration-help",
+    "등록 방식, 문제명과 첨부 파일은 고정 정보입니다. 아래 메타데이터 변경은 목록 검색과 필터에 즉시 반영됩니다.",
+  );
+  section.append(help);
+
+  const form = node("form", "registration-form");
+  const field = (labelText, name, value, options = {}) => {
+    const label = node("label", options.wide ? "wide-field" : "");
+    label.append(node("span", "", labelText));
+    const control = document.createElement(options.multiline ? "textarea" : "input");
+    control.name = name;
+    control.value = value ?? "";
+    if (!options.multiline) control.type = options.type || "text";
+    if (options.min !== undefined) control.min = String(options.min);
+    if (options.step !== undefined) control.step = String(options.step);
+    if (options.maxLength) control.maxLength = options.maxLength;
+    label.append(control);
+    return label;
+  };
+  form.append(
+    field(
+      "카테고리",
+      "category",
+      registration.category ?? challengeCategories(challenge).join(" / "),
+      { maxLength: 100 },
+    ),
+    field("점수", "value", challenge.value, { type: "number", min: 0, step: 1 }),
+    field("풀이 수", "solves", challenge.solves, { type: "number", min: 0, step: 1 }),
+    field("접속 정보", "connection_info", registration.connection_info, { maxLength: 2000 }),
+    field("Flag 형식", "flag_format", registration.flag_format, { maxLength: 500, wide: true }),
+    field("설명", "description", registration.description, { multiline: true, maxLength: 20000, wide: true }),
+  );
+  const actions = node("div", "registration-actions wide-field");
+  const save = node("button", "primary-button", "등록 정보 저장");
+  save.type = "submit";
+  save.disabled = !state.updateChallengeSupported;
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!form.reportValidity()) return;
+    const values = new FormData(form);
+    await runCommand(
+      "/api/challenges/update",
+      {
+        challenge: challenge.name,
+        category: values.get("category"),
+        value: values.get("value"),
+        solves: values.get("solves"),
+        connection_info: values.get("connection_info"),
+        flag_format: values.get("flag_format"),
+        description: values.get("description"),
+      },
+      save,
+    );
+  });
+  if (!state.updateChallengeSupported) {
+    save.title = "등록 정보 수정 API를 사용하려면 coordinator를 재시작해야 합니다.";
+  }
+  actions.append(save);
+  form.append(actions);
+  section.append(form);
   return section;
 }
 
@@ -980,7 +1348,8 @@ function renderDetailPage({ preserveScroll = false } = {}) {
 
   document.title = `${challenge.name} · CTF Agent`;
   byId("detail-title").textContent = challenge.name;
-  byId("detail-category").textContent = `${challenge.category.toUpperCase()} · ${formatNumber(challenge.value)} PTS`;
+  const categories = challengeCategories(challenge).join(" / ") || "Unknown";
+  byId("detail-category").textContent = `${categories.toUpperCase()} · ${formatNumber(challenge.value)} PTS`;
   const content = byId("detail-content");
   const savedView = preserveScroll ? captureDetailViewState(content) : null;
   const nextContent = document.createDocumentFragment();
@@ -1020,6 +1389,7 @@ function renderDetailPage({ preserveScroll = false } = {}) {
   const sideColumn = node("aside", "detail-side-column");
   layout.append(mainColumn, sideColumn);
   nextContent.append(layout);
+  mainColumn.append(buildRegistrationSection(challenge));
 
   if (challenge.flag) {
     const flagSection = detailSection(isStandalone ? "로컬 Flag 결과" : "확인된 Flag");
@@ -1412,12 +1782,18 @@ async function refreshResources() {
 }
 
 async function initialize() {
+  state.filters = filtersFromLocation();
   byId("refresh-button").addEventListener("click", refresh);
   byId("codex-usage-refresh").addEventListener("click", () => {
     refreshCodexUsage({ force: true });
   });
   byId("detail-back").addEventListener("click", () => closeChallengeDetail());
-  window.addEventListener("popstate", () => syncViewFromLocation());
+  window.addEventListener("popstate", () => {
+    state.filters = filtersFromLocation();
+    renderFilterControls();
+    renderRows();
+    syncViewFromLocation();
+  });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && state.selectedChallenge) {
       closeChallengeDetail();
@@ -1425,20 +1801,49 @@ async function initialize() {
   });
 
   byId("challenge-search").addEventListener("input", (event) => {
-    state.query = event.target.value;
+    state.filters.query = event.target.value;
+    syncFilterUrl();
     renderRows();
   });
 
-  byId("status-filter").addEventListener("click", (event) => {
-    const target = event.target.closest("button[data-filter]");
-    if (!target) return;
-    state.filter = target.dataset.filter;
-    for (const item of byId("status-filter").querySelectorAll("button")) {
-      item.classList.toggle("active", item === target);
-      item.setAttribute("aria-pressed", String(item === target));
-    }
-    renderRows();
+  byId("challenge-sort").addEventListener("change", (event) => {
+    state.filters.sort = event.target.value;
+    applyFilterChange();
   });
+
+  const advancedToggle = byId("advanced-filter-toggle");
+  const advancedPanel = byId("advanced-filter-panel");
+  advancedToggle.addEventListener("click", () => {
+    const expanded = advancedToggle.getAttribute("aria-expanded") !== "true";
+    advancedToggle.setAttribute("aria-expanded", String(expanded));
+    advancedPanel.hidden = !expanded;
+  });
+
+  const readAdvancedFilters = () => {
+    state.filters.statuses = new Set(
+      [...byId("status-filter").querySelectorAll("input:checked")].map((input) => input.value),
+    );
+    state.filters.categories = new Set(
+      [...byId("category-filter").querySelectorAll("input:checked")].map((input) => input.value),
+    );
+    state.filters.documentation = byId("documentation-filter").value;
+    state.filters.assignment = byId("assignment-filter").value;
+    const numericValue = (id) => {
+      const value = byId(id).value;
+      return optionalNumber(value) === null ? "" : value;
+    };
+    state.filters.minPoints = numericValue("min-points-filter");
+    state.filters.maxPoints = numericValue("max-points-filter");
+    state.filters.maxSolves = numericValue("max-solves-filter");
+    state.filters.maxCost = numericValue("max-cost-filter");
+    if (state.filters.minPoints !== "" && state.filters.maxPoints !== ""
+      && Number(state.filters.minPoints) > Number(state.filters.maxPoints)) {
+      [state.filters.minPoints, state.filters.maxPoints] = [state.filters.maxPoints, state.filters.minPoints];
+    }
+    applyFilterChange();
+  };
+  advancedPanel.addEventListener("change", readAdvancedFilters);
+  byId("filter-reset").addEventListener("click", resetFilters);
 
   const fileInput = byId("challenge-files");
   const fileDrop = byId("file-drop");
@@ -1643,6 +2048,7 @@ async function initialize() {
     const session = await api("/api/session");
     state.csrfToken = session.csrf_token;
     state.deleteChallengeSupported = session.capabilities?.delete_challenge === true;
+    state.updateChallengeSupported = session.capabilities?.update_challenge === true;
     const resetSupported = session.capabilities?.reset_runtime === true
       || await endpointAvailable("/api/control/reset-runtime");
     byId("reset-open").disabled = !resetSupported;

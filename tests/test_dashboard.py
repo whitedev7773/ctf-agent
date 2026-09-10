@@ -169,6 +169,8 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("currentOutput.scrollTop = currentOutput.scrollHeight", javascript)
             self.assertIn('currentOutput.setAttribute("aria-label", "최근 solver trace")', javascript)
             self.assertIn("currentOutput.focus({ preventScroll: true })", javascript)
+            self.assertIn("challengeMatchesFilters", javascript)
+            self.assertIn("filtersFromLocation", javascript)
 
         async with self.client.get(f"{self.base_url}/assets/dashboard.css") as response:
             stylesheet = await response.text()
@@ -178,7 +180,8 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("minmax(0, 1.618fr) minmax(340px, 1fr)", stylesheet)
             self.assertIn(".setup-form input.sr-only", stylesheet)
             self.assertIn(".file-remove { flex: 0 0 auto; width: 40px; height: 40px", stylesheet)
-            self.assertIn(".segmented button { min-height: 40px", stylesheet)
+            self.assertIn(".advanced-filter-panel", stylesheet)
+            self.assertIn(".filter-option input:checked + span", stylesheet)
             self.assertIn(".setup-form .setup-submit { min-height: 40px; }", stylesheet)
             self.assertIn("outline: 3px solid var(--focus-ring)", stylesheet)
             self.assertIn("@media (forced-colors: active)", stylesheet)
@@ -192,6 +195,9 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('id="codex-usage-windows"', html)
             self.assertIn('id="codex-usage-refresh"', html)
             self.assertIn('id="uptime-value"', html)
+            self.assertIn('id="advanced-filter-panel"', html)
+            self.assertIn('id="filter-result-count"', html)
+            self.assertIn('aria-controls="advanced-filter-panel"', html)
             self.assertIn('aria-labelledby="dashboard-title"', html)
 
         html_ids = re.findall(r'\bid="([^"]+)"', html)

@@ -99,14 +99,76 @@
             <span class="sr-only">문제 검색</span>
             <input id="challenge-search" type="search" placeholder="문제명 또는 카테고리 검색" aria-controls="challenge-rows">
           </label>
-          <div class="segmented" id="status-filter" aria-label="상태 필터">
-            <button type="button" data-filter="all" class="active" aria-pressed="true">전체</button>
-            <button type="button" data-filter="active" aria-pressed="false">실행 중</button>
-            <button type="button" data-filter="candidate" aria-pressed="false">후보 검토</button>
-            <button type="button" data-filter="solved" aria-pressed="false">해결</button>
-            <button type="button" data-filter="idle" aria-pressed="false">대기</button>
-          </div>
+          <label class="sort-control">
+            <span class="sr-only">문제 정렬</span>
+            <select id="challenge-sort" aria-label="문제 정렬">
+              <option value="name-asc">이름순</option>
+              <option value="points-desc">점수 높은순</option>
+              <option value="points-asc">점수 낮은순</option>
+              <option value="solves-asc">풀이 적은순</option>
+              <option value="solves-desc">풀이 많은순</option>
+              <option value="elapsed-desc">풀이 시간 긴순</option>
+              <option value="cost-desc">비용 높은순</option>
+            </select>
+          </label>
+          <button class="filter-toggle" id="advanced-filter-toggle" type="button" aria-expanded="false" aria-controls="advanced-filter-panel">
+            <span aria-hidden="true">☷</span>
+            고급 필터
+            <span class="filter-count" id="filter-count" hidden>0</span>
+          </button>
         </div>
+      </div>
+
+      <section class="advanced-filter-panel" id="advanced-filter-panel" aria-label="고급 문제 필터" hidden>
+        <fieldset class="filter-group">
+          <legend>상태</legend>
+          <div class="filter-options" id="status-filter">
+            <label class="filter-option"><input type="checkbox" value="active"><span>실행 중</span></label>
+            <label class="filter-option"><input type="checkbox" value="candidate"><span>후보 검토</span></label>
+            <label class="filter-option"><input type="checkbox" value="solved"><span>해결</span></label>
+            <label class="filter-option"><input type="checkbox" value="idle"><span>대기</span></label>
+          </div>
+        </fieldset>
+        <fieldset class="filter-group">
+          <legend>카테고리</legend>
+          <div class="filter-options filter-categories" id="category-filter">
+            <span class="filter-placeholder">문제를 불러오는 중…</span>
+          </div>
+        </fieldset>
+        <fieldset class="filter-group">
+          <legend>진행 조건</legend>
+          <div class="filter-selects">
+            <label>라이트업
+              <select id="documentation-filter">
+                <option value="all">전체</option>
+                <option value="documented">작성 완료</option>
+                <option value="pending">해결 후 미작성</option>
+              </select>
+            </label>
+            <label>Solver
+              <select id="assignment-filter">
+                <option value="all">전체</option>
+                <option value="assigned">배정됨</option>
+                <option value="unassigned">미배정</option>
+              </select>
+            </label>
+          </div>
+        </fieldset>
+        <fieldset class="filter-group filter-range-group">
+          <legend>수치 범위</legend>
+          <div class="filter-ranges">
+            <label>최소 점수<input id="min-points-filter" type="number" min="0" step="1" inputmode="numeric" placeholder="0"></label>
+            <label>최대 점수<input id="max-points-filter" type="number" min="0" step="1" inputmode="numeric" placeholder="제한 없음"></label>
+            <label>최대 풀이 수<input id="max-solves-filter" type="number" min="0" step="1" inputmode="numeric" placeholder="제한 없음"></label>
+            <label>최대 비용 ($)<input id="max-cost-filter" type="number" min="0" step="0.01" inputmode="decimal" placeholder="제한 없음"></label>
+          </div>
+        </fieldset>
+      </section>
+
+      <div class="filter-summary">
+        <p id="filter-result-count" aria-live="polite">문제를 불러오는 중입니다.</p>
+        <div class="active-filter-chips" id="active-filter-chips" aria-label="적용 중인 필터"></div>
+        <button class="filter-reset" id="filter-reset" type="button" hidden>전체 초기화</button>
       </div>
 
       <div class="challenge-table-wrap">
@@ -345,7 +407,11 @@
         </div>
         <form id="local-challenge-form" class="setup-form" enctype="multipart/form-data">
           <label><span>문제명</span><input name="name" maxlength="200" required placeholder="baby-pwn"></label>
-          <label><span>카테고리</span><input name="category" maxlength="100" placeholder="pwn"></label>
+          <label>
+            <span>카테고리</span>
+            <input name="category" maxlength="100" placeholder="reversing / misc">
+            <small><code>/</code>로 여러 카테고리를 구분할 수 있습니다.</small>
+          </label>
           <label><span>점수</span><input name="value" type="number" min="0" step="1" value="0"></label>
           <label><span>접속 정보</span><input name="connection_info" maxlength="2000" placeholder="nc host 31337"></label>
           <label class="wide-field"><span>Flag 형식</span><input name="flag_format" maxlength="500" required placeholder="TEAM{...}" autocomplete="off"></label>

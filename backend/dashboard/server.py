@@ -25,13 +25,13 @@ from backend.budgets import (
     solver_turn_idle_timeout_limit,
     token_metrics,
 )
-from backend.challenge_profiles import external_skill_path, solver_role
+from backend.challenge_profiles import external_skill_path, solver_role, split_categories
 from backend.codex_usage import CodexUsageMonitor
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.experience import experience_root, experience_summary
 from backend.model_specs import provider_from_spec
-from backend.prompts import ChallengeMeta
+from backend.prompts import ChallengeMeta, list_distfiles
 from backend.runtime_clock import RuntimeClock
 from backend.runtime_settings import (
     RuntimeSettings,
@@ -307,6 +307,7 @@ class DashboardServer:
                 web.post("/api/settings/runtime", self._configure_runtime),
                 web.post("/api/settings/runtime/reset", self._reset_runtime_settings),
                 web.post("/api/challenges/local", self._create_local_challenge),
+                web.post("/api/challenges/update", self._update_challenge),
                 web.post("/api/challenges/delete", self._delete_challenge),
                 web.post("/api/operator/message", self._operator_message),
                 web.post("/api/control/spawn", self._spawn),
@@ -384,6 +385,7 @@ class DashboardServer:
                     "reset_experience": True,
                     "request_writeup": True,
                     "delete_challenge": True,
+                    "update_challenge": True,
                     "runtime_settings": True,
                     "codex_usage": True,
                 },
@@ -431,6 +433,14 @@ class DashboardServer:
 
         for name in sorted(known, key=str.casefold):
             meta = self.deps.challenge_metas.get(name)
+            raw_category = getattr(meta, "category", "") or "Unknown"
+            categories = split_categories(raw_category) or ["Unknown"]
+            category = " / ".join(categories)
+            challenge_dir = self.deps.challenge_dirs.get(name, "")
+            metadata_path = Path(challenge_dir) / "metadata.yml" if challenge_dir else None
+            source = str(getattr(meta, "source", "") or "").strip().lower()
+            if source not in {"local", "ctfd", "metadata"}:
+                source = "local" if getattr(meta, "flag_format", "") else "metadata"
             swarm = self.deps.swarms.get(name)
             result = self.deps.results.get(name, {})
             candidate = candidates.get(name, {})
@@ -615,7 +625,8 @@ class DashboardServer:
             challenges.append(
                 {
                     "name": name,
-                    "category": getattr(meta, "category", "") or "Unknown",
+                    "category": category,
+                    "categories": categories,
                     "value": getattr(meta, "value", 0) or 0,
                     "solves": getattr(meta, "solves", 0) or 0,
                     "status": status,
@@ -632,6 +643,19 @@ class DashboardServer:
                     "resources": challenge_resources,
                     "agents": agents,
                     "cost_usd": round(sum(a["cost_usd"] for a in agents), 6),
+                    "registration": {
+                        "source": source,
+                        "category": getattr(meta, "category", "") or "",
+                        "description": getattr(meta, "description", "") or "",
+                        "connection_info": getattr(meta, "connection_info", "") or "",
+                        "flag_format": getattr(meta, "flag_format", "") or "",
+                        "tags": list(getattr(meta, "tags", []) or []),
+                        "hint_count": len(getattr(meta, "hints", []) or []),
+                        "attachments": list_distfiles(challenge_dir) if challenge_dir else [],
+                        "metadata_updated_at": datetime.fromtimestamp(
+                            metadata_path.stat().st_mtime, UTC,
+                        ).isoformat() if metadata_path is not None and metadata_path.is_file() else "",
+                    },
                 }
             )
 
@@ -1440,9 +1464,11 @@ class DashboardServer:
             except ValueError as exc:
                 raise web.HTTPBadRequest(text="value must be an integer") from exc
 
+            categories = split_categories(fields.get("category", "")[:100])
             metadata = {
                 "name": name,
-                "category": fields.get("category", "")[:100],
+                "source": "local",
+                "category": " / ".join(categories),
                 "description": fields.get("description", "")[:20000],
                 "value": value,
                 "connection_info": fields.get("connection_info", "")[:2000],
@@ -1468,6 +1494,66 @@ class DashboardServer:
                 "message": f"로컬 문제 '{name}'을 등록했습니다.{attachment_copy}",
                 "challenge": name,
                 "file_count": file_count,
+            }
+        )
+
+    async def _update_challenge(self, request: web.Request) -> web.Response:
+        """Update editable challenge metadata while preserving fixed registration data."""
+        self._require_csrf(request)
+        data = await self._json_body(request)
+        name = str(data.get("challenge", "")).strip()
+        if not name or name not in self.deps.challenge_metas:
+            raise web.HTTPNotFound(text="challenge not found")
+
+        root = Path(self.deps.challenges_root).expanduser().resolve()
+        challenge_dir_value = self.deps.challenge_dirs.get(name)
+        if not challenge_dir_value:
+            raise web.HTTPConflict(text="문제 메타데이터 경로를 찾을 수 없습니다.")
+        challenge_dir = Path(challenge_dir_value).expanduser().resolve()
+        if challenge_dir == root or not challenge_dir.is_relative_to(root):
+            raise web.HTTPConflict(text=f"unsafe challenge path: {challenge_dir}")
+        metadata_path = (challenge_dir / "metadata.yml").resolve()
+        if metadata_path.parent != challenge_dir:
+            raise web.HTTPConflict(text=f"unsafe metadata path: {metadata_path}")
+        if not metadata_path.is_file():
+            raise web.HTTPNotFound(text="metadata.yml not found")
+
+        try:
+            value = int(data.get("value", 0))
+            solves = int(data.get("solves", 0))
+        except (TypeError, ValueError) as exc:
+            raise web.HTTPBadRequest(text="점수와 풀이 수는 정수여야 합니다.") from exc
+        if value < 0 or solves < 0:
+            raise web.HTTPBadRequest(text="점수와 풀이 수는 0 이상이어야 합니다.")
+
+        categories = split_categories(str(data.get("category", ""))[:100])
+        with metadata_path.open(encoding="utf-8") as metadata_file:
+            metadata = yaml.safe_load(metadata_file) or {}
+        if not isinstance(metadata, dict):
+            raise web.HTTPConflict(text="metadata.yml 형식이 올바르지 않습니다.")
+        metadata.update(
+            {
+                "category": " / ".join(categories),
+                "value": value,
+                "solves": solves,
+                "connection_info": str(data.get("connection_info", ""))[:2000].strip(),
+                "flag_format": str(data.get("flag_format", ""))[:500].strip(),
+                "description": str(data.get("description", ""))[:20000].strip(),
+            }
+        )
+        temp_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+        temp_path.write_text(
+            yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        temp_path.replace(metadata_path)
+        self.deps.challenge_metas[name] = ChallengeMeta.from_yaml(metadata_path)
+        persist_deps_state(self.deps)
+        return web.json_response(
+            {
+                "ok": True,
+                "challenge": name,
+                "message": f"문제 '{name}'의 등록 정보를 수정했습니다.",
             }
         )
 

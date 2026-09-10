@@ -289,6 +289,7 @@ class CTFdClient:
         tags = [t["value"] if isinstance(t, dict) else str(t) for t in (challenge.get("tags") or [])]
         meta = {
             "name": name,
+            "source": "ctfd",
             "category": challenge.get("category", ""),
             "description": desc.strip(),
             "value": challenge.get("value", 0),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from backend.model_specs import model_id_from_spec
@@ -9,9 +10,11 @@ from backend.model_specs import model_id_from_spec
 _ALIASES = {
     "binary": "pwn",
     "exploitation": "pwn",
+    "pwnable": "pwn",
     "reverse": "reversing",
     "rev": "reversing",
     "re": "reversing",
+    "rerversing": "reversing",
     "crypto": "cryptography",
     "forensic": "forensics",
     "steg": "forensics",
@@ -81,9 +84,26 @@ _EXTERNAL_SKILLS_BY_CATEGORY = {
 }
 
 
+def split_categories(category: str) -> list[str]:
+    """Split slash-delimited input and collapse aliases into canonical keys."""
+    categories: list[str] = []
+    seen: set[str] = set()
+    for value in re.split(r"\s*/\s*", category or ""):
+        key = value.strip().casefold()
+        canonical = _ALIASES.get(key, key)
+        if canonical and canonical not in seen:
+            categories.append(canonical)
+            seen.add(canonical)
+    return categories
+
+
 def normalized_category(category: str) -> str:
-    value = (category or "").strip().lower()
-    return _ALIASES.get(value, value if value in _PLAYBOOKS else "misc")
+    for item in split_categories(category):
+        value = item.lower()
+        normalized = _ALIASES.get(value, value)
+        if normalized in _PLAYBOOKS:
+            return normalized
+    return "misc"
 
 
 def category_playbook(category: str) -> str:
