@@ -36,6 +36,9 @@ def _clean_records(value: Any) -> dict[str, dict]:
             item = raw_record.get(key)
             if isinstance(item, str):
                 record[key] = item[:4000]
+        elapsed_seconds = raw_record.get("elapsed_seconds")
+        if isinstance(elapsed_seconds, (int, float)) and elapsed_seconds >= 0:
+            record["elapsed_seconds"] = round(float(elapsed_seconds), 3)
         flags = raw_record.get("flags")
         if isinstance(flags, list):
             record["flags"] = [item[:4000] for item in flags if isinstance(item, str)][:20]

@@ -6,11 +6,17 @@ from dataclasses import dataclass
 
 @dataclass
 class RuntimeClock:
+    accumulated_seconds: float = 0.0
     started_at: float | None = None
     stopped_at: float | None = None
 
     def start(self) -> None:
-        self.started_at = time.monotonic()
+        now = time.monotonic()
+        if self.started_at is not None and self.stopped_at is None:
+            return
+        if self.started_at is not None and self.stopped_at is not None:
+            self.accumulated_seconds += max(0.0, self.stopped_at - self.started_at)
+        self.started_at = now
         self.stopped_at = None
 
     def stop(self) -> None:
@@ -19,7 +25,8 @@ class RuntimeClock:
 
     @property
     def elapsed_seconds(self) -> float:
-        if self.started_at is None:
-            return 0.0
-        end = self.stopped_at if self.stopped_at is not None else time.monotonic()
-        return max(0.0, end - self.started_at)
+        elapsed = self.accumulated_seconds
+        if self.started_at is not None:
+            end = self.stopped_at if self.stopped_at is not None else time.monotonic()
+            elapsed += max(0.0, end - self.started_at)
+        return max(0.0, elapsed)

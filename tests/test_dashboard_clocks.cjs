@@ -20,9 +20,13 @@ assert.equal(tab('challengeElapsedSeconds({name:"test"})'), 160);
 tab(snapshot(260, 150, false));
 now = 120000;
 assert.equal(tab('challengeElapsedSeconds({name:"test"})'), 150);
+// A resumed solve continues from the paused total instead of resetting.
+tab(snapshot(150, 150, true));
+now = 150000;
+assert.equal(tab('challengeElapsedSeconds({name:"test"})'), 180);
 const freshTab = browser();
-freshTab(snapshot(320, 150, false));
-assert.equal(freshTab('challengeElapsedSeconds({name:"test"})'), 150);
+freshTab(snapshot(320, 180, true));
+assert.equal(freshTab('challengeElapsedSeconds({name:"test"})'), 180);
 // A server or challenge restart must override older, larger browser values.
 tab(snapshot(2, 1, true));
 assert.equal(tab('sampledElapsedSeconds(state.uptimeBaseSeconds)'), 2);

@@ -22,7 +22,17 @@ class RuntimeClockTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(clock.elapsed_seconds, 120)
             clock.stop()
             clock.start()
-            self.assertEqual(clock.elapsed_seconds, 0)
+            self.assertEqual(clock.elapsed_seconds, 120)
+
+    async def test_resume_adds_only_active_intervals(self):
+        clock = RuntimeClock()
+        with patch("backend.runtime_clock.time.monotonic", side_effect=[10, 25, 100, 140]):
+            clock.start()
+            clock.stop()
+            self.assertEqual(clock.elapsed_seconds, 15)
+            clock.start()
+            clock.stop()
+        self.assertEqual(clock.elapsed_seconds, 55)
 
     async def test_lifecycle_freezes_on_completion_error_and_cancellation(self):
         for error in (None, RuntimeError("failed"), asyncio.CancelledError()):

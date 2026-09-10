@@ -277,6 +277,9 @@ class DashboardServer:
         self._writeup_tasks: dict[str, asyncio.Task[None]] = {}
         self._writeup_solvers: dict[str, Any] = {}
         self._writeup_clocks: dict[str, RuntimeClock] = {}
+        # Keep challenge clocks outside transient swarm objects so a paused
+        # swarm can be removed and later resumed without losing solve time.
+        self._challenge_clocks: dict[str, RuntimeClock] = {}
         self._writeup_phases: dict[str, str] = {}
         self.codex_usage_monitor = CodexUsageMonitor(
             getattr(self.deps.settings, "codex_cli_path", ""),
@@ -432,6 +435,9 @@ class DashboardServer:
             result = self.deps.results.get(name, {})
             candidate = candidates.get(name, {})
             is_active = name in active_names and swarm is not None and not swarm.cancel_event.is_set()
+            challenge_clock = self._challenge_clocks.get(name)
+            if challenge_clock is not None and not is_active:
+                challenge_clock.stop()
             is_solved = name in solved
 
             agents: list[dict[str, Any]] = []
@@ -585,6 +591,20 @@ class DashboardServer:
                 else "candidate" if candidate
                 else "idle"
             )
+            elapsed_seconds = round(
+                challenge_clock.elapsed_seconds
+                if challenge_clock is not None
+                else swarm.runtime_clock.elapsed_seconds
+                if swarm is not None and hasattr(swarm, "runtime_clock")
+                else result.get("elapsed_seconds", 0.0)
+                if is_solved
+                else max((agent["duration_seconds"] for agent in agents), default=0.0),
+                1,
+            )
+            if is_solved and challenge_clock is not None:
+                if result.get("elapsed_seconds") != elapsed_seconds:
+                    result["elapsed_seconds"] = elapsed_seconds
+                    persist_deps_state(self.deps)
             approach_notes = challenge_approach_notes(
                 self.deps.settings,
                 name,
@@ -600,12 +620,7 @@ class DashboardServer:
                     "solves": getattr(meta, "solves", 0) or 0,
                     "status": status,
                     "active": is_active,
-                    "elapsed_seconds": round(
-                        swarm.runtime_clock.elapsed_seconds
-                        if swarm is not None and hasattr(swarm, "runtime_clock")
-                        else max((agent["duration_seconds"] for agent in agents), default=0.0),
-                        1,
-                    ),
+                    "elapsed_seconds": elapsed_seconds,
                     "solved": is_solved,
                     "flag": result.get("flag"),
                     "candidate": candidate.get("flag"),
@@ -1544,6 +1559,7 @@ class DashboardServer:
             self._writeup_solvers.pop(name, None)
             self.deps.swarms.pop(name, None)
             self.deps.swarm_tasks.pop(name, None)
+            self._challenge_clocks.pop(name, None)
             self.deps.results.pop(name, None)
             self.deps.candidates.pop(name, None)
             self.deps.challenge_dirs.pop(name, None)
@@ -1598,6 +1614,8 @@ class DashboardServer:
             raise web.HTTPBadRequest(text="challenge required")
         async with self._command_lock:
             message = await do_spawn_swarm(self.deps, name)
+            if name in self.deps.swarms:
+                self._challenge_clocks.setdefault(name, RuntimeClock()).start()
         return web.json_response({"ok": True, "message": message})
 
     async def _stop_swarm(self, request: web.Request) -> web.Response:
@@ -1610,6 +1628,9 @@ class DashboardServer:
             raise web.HTTPBadRequest(text="challenge required")
         async with self._command_lock:
             message = await do_kill_swarm(self.deps, name)
+            clock = self._challenge_clocks.get(name)
+            if clock is not None:
+                clock.stop()
         return web.json_response({"ok": True, "message": message})
 
     async def _broadcast(self, request: web.Request) -> web.Response:
@@ -1709,6 +1730,7 @@ class DashboardServer:
 
             self.deps.swarms.clear()
             self.deps.swarm_tasks.clear()
+            self._challenge_clocks.clear()
             self.deps.results.clear()
             self.deps.candidates.clear()
             self.deps.dismissed_challenges.clear()
