@@ -82,7 +82,7 @@ Copy-Item .env.example .env
 ./run-ctf-agent.bat
 ```
 
-`run-ctf-agent.bat`은 가상환경이 없으면 `uv sync`를 실행한 뒤 coordinator와 dashboard를 시작합니다. 기본 dashboard 주소는 <http://127.0.0.1:9400>이고 launcher의 기본 동시 문제 수는 3개입니다. 자원이 제한된 PC에서는 먼저 `$env:CTF_AGENT_MAX_CHALLENGES = "1"`로 낮추세요.
+`run-ctf-agent.bat`은 가상환경이 없으면 `uv sync`를 실행한 뒤 coordinator와 dashboard를 시작합니다. 기본 dashboard 주소는 <http://127.0.0.1:9400>입니다. 동시 문제 수를 포함해 dashboard에서 저장한 실행 설정과 CTFd 연결은 다음 실행에도 복원됩니다. `CTF_AGENT_MAX_CHALLENGES`를 명시하면 해당 실행에 한해 저장된 동시 문제 수보다 우선합니다.
 
 ### PowerShell 또는 Linux/macOS에서 직접 실행
 
@@ -167,7 +167,7 @@ DELEGATE_MAX_AGENTS=4
 DELEGATE_MAX_CONCURRENT=2
 ```
 
-시간, token, step, writeup, postprocess 등 전체 설정과 기본값은 [.env.example](.env.example)을 참고하세요. 기본 `challenges/` 경로를 사용할 때 Dashboard에서 바꾼 비밀이 아닌 runtime 설정은 프로젝트 루트의 `.ctf-agent-settings.json`에 저장되며 다음 실행에도 적용됩니다.
+시간, token, step, writeup, postprocess 등 전체 설정과 기본값은 [.env.example](.env.example)을 참고하세요. 기본 `challenges/` 경로를 사용할 때 Dashboard에서 바꾼 runtime 설정과 CTFd 연결 정보는 프로젝트 루트의 git-ignore된 `.ctf-agent-settings.json`에 저장되며 다음 실행에도 적용됩니다. CTFd token과 password도 로컬 파일에 평문으로 저장되므로 이 파일을 외부에 공유하지 마세요.
 
 Windows에서 `codex`가 `PATH`에 없다면 `.env`에 실행 파일을 지정할 수 있습니다.
 

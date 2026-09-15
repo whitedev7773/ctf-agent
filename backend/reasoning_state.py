@@ -143,7 +143,7 @@ class ReasoningStateStore:
     def load(self) -> SolveState:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except FileNotFoundError, OSError, json.JSONDecodeError:
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
             return SolveState()
         if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:
             return SolveState()

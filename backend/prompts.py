@@ -105,7 +105,9 @@ def build_prompt(
     if meta.tags:
         lines.append(f"**Tags**    : {', '.join(meta.tags)}")
     if meta.flag_format:
-        lines.append(f"**Flag format**: `{meta.flag_format}`")
+        lines.append(
+            f"**Flag format**: `{meta.flag_format}` (expected platform hint; native verifier evidence may differ)"
+        )
     lines += ["", "## Description", meta.description or "_No description provided._", ""]
 
     if conn_info:
@@ -264,6 +266,13 @@ def build_prompt(
         "13b. UNSAT proves only the exact path and constraints encoded. Report the concrete seed/path "
         "policy and all format/printability constraints; remove artificial constraints and test a "
         "different feasible path before concluding that no input exists.",
+        "13c. The supplied flag format is a platform hint, not proof. If an unmodified target, service, "
+        "or verifier emits or accepts a different wrapper/prefix, preserve that exact value as an "
+        "alternate candidate. Never replace its prefix merely to satisfy metadata; report every "
+        "reproduced form and the evidence that produced it.",
+        "13d. Reproduce a validated invocation exactly, including argv and argc. Before a long trace, "
+        "confirm that the actual breakpoint or expected marker is reached with a format-valid smoke "
+        "test. Probe optional tools once and pivot when unavailable instead of retrying setup.",
         "14. After a concrete static primitive is found, do not spend another bulk extraction or long analysis phase without "
         "creating or running a minimal reproducer, harness, solver, or debugger check for that primitive.",
         "15. Documentation is a required solve artifact. Preserve the final analysis, exact reproduction "
@@ -382,6 +391,43 @@ def build_writeup_review_prompt(meta: ChallengeMeta, verified_flag: str = "") ->
             "your own unsupported assumption.",
             "",
             "Return a concise structured completion result only after the review artifact has been written.",
+        ]
+    )
+
+
+def build_solution_review_prompt(meta: ChallengeMeta) -> str:
+    """Build a read-only, one-shot audit prompt for work currently in progress."""
+    return "\n".join(
+        [
+            "You are an independent reviewer for an authorized CTF solve that may still be in progress.",
+            "Audit the current route; do not take ownership of solving the challenge. Do not submit a flag, "
+            "delegate work, edit another agent's artifacts, or continue the exploit on the solver's behalf.",
+            "",
+            "## Challenge",
+            f"- Name: {meta.name}",
+            f"- Category: {meta.category or 'Unknown'}",
+            f"- Description: {meta.description or '(none)'}",
+            f"- Connection: {meta.connection_info or '(none)'}",
+            "",
+            "## Review procedure",
+            "1. Read the current evidence ledger and compact handoffs under `/challenge/shared/`, then inspect only "
+            "the smallest relevant solver artifacts needed to check the active hypothesis, blocker, and next experiment.",
+            "2. Separate observed evidence from inference. Check whether supported/refuted hypotheses cite real "
+            "observations, whether failed experiments caused a meaningful pivot, and whether the next experiment is "
+            "the cheapest discriminating test available.",
+            "3. Check the route for duplicated work, unsupported assumptions, premature format constraints, stale "
+            "handoffs, and expensive analysis that lacks a native/runtime validation step.",
+            "4. Do not perform a fresh broad triage. You may run one small read-only validation command only when it "
+            "is necessary to verify a decisive claim already made by the solver.",
+            "5. Write a concise Korean report to "
+            "`/challenge/shared/review/CURRENT_SOLUTION_REVIEW.md`. Create the directory if needed and atomically "
+            "replace the report. Use exactly these sections: `판정`, `확인된 근거`, `위험 신호`, `다음 권고`.",
+            "6. Under `판정`, finish the first line with exactly one of `ON_TRACK`, `NEEDS_PIVOT`, or "
+            "`INSUFFICIENT_EVIDENCE`. In `다음 권고`, give at most three concrete actions ordered by expected "
+            "information gain. Cite artifact paths or evidence IDs for every decisive criticism.",
+            "",
+            "Return a concise structured completion result only after the report has been written. The report is the "
+            "authoritative deliverable and must not contain private chain-of-thought.",
         ]
     )
 

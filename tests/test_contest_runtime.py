@@ -5,10 +5,12 @@ import json
 import tempfile
 import time
 import unittest
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from backend.agents.codex_coordinator import CodexCoordinator
 from backend.agents.codex_solver import CodexSolver
 from backend.agents.coordinator_core import (
     _generate_or_finalize_writeup,
@@ -16,7 +18,8 @@ from backend.agents.coordinator_core import (
     do_spawn_swarm,
 )
 from backend.agents.coordinator_core import do_submit_flag as coordinator_submit_flag
-from backend.agents.coordinator_loop import _unsolved_names
+from backend.agents.coordinator_loop import _auto_spawn_one, _unsolved_names
+from backend.agents.solver import Solver
 from backend.agents.swarm import ChallengeSwarm
 from backend.artifacts import (
     challenge_approach_notes,
@@ -49,15 +52,24 @@ from backend.message_bus import ChallengeMessageBus
 from backend.models import DEFAULT_MODELS
 from backend.output_types import assess_solver_output, solver_output_json_schema
 from backend.prompts import ChallengeMeta, build_prompt
-from backend.runtime_settings import RuntimeSettings, load_runtime_settings, save_runtime_settings
+from backend.runtime_settings import (
+    CTFdSettings,
+    RuntimeSettings,
+    load_ctfd_settings,
+    load_runtime_settings,
+    save_ctfd_settings,
+    save_runtime_settings,
+)
 from backend.runtime_state import (
     load_dismissed_challenges,
     load_runtime_state,
     runtime_state_path,
     save_runtime_state,
 )
+from backend.sandbox import DockerSandbox, configure_semaphore
 from backend.solver_base import (
     BUDGET_EXHAUSTED,
+    CANCELLED,
     CANDIDATE_FOUND,
     FLAG_FOUND,
     GAVE_UP,
@@ -282,7 +294,7 @@ class ArtifactAndProfileTests(unittest.TestCase):
         self.assertTrue(settings.delegate_postprocess_on_budget_stop)
         self.assertEqual(settings.delegate_postprocess_max_agents, 1)
 
-    def test_dashboard_runtime_settings_survive_restart_without_secrets(self) -> None:
+    def test_dashboard_settings_survive_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             settings = Settings(_env_file=None)
             configured = RuntimeSettings(
@@ -292,6 +304,15 @@ class ArtifactAndProfileTests(unittest.TestCase):
                 solver_compaction_max_waits=3,
                 solver_max_estimated_cost_usd=2.5,
             )
+            save_ctfd_settings(
+                CTFdSettings(
+                    url="https://ctf.example.com/",
+                    token="saved-token",
+                    username="researcher",
+                    password="saved-password",
+                ),
+                Path(root) / "challenges",
+            )
             save_runtime_settings(configured, Path(root) / "challenges")
 
             restarted = Settings(_env_file=None)
@@ -300,6 +321,7 @@ class ArtifactAndProfileTests(unittest.TestCase):
                 list(DEFAULT_MODELS),
                 Path(root) / "challenges",
             )
+            connection = load_ctfd_settings(restarted, Path(root) / "challenges")
 
             self.assertEqual(loaded.models, ["codex/gpt-5.6-sol/medium"])
             self.assertEqual(restarted.max_concurrent_challenges, 3)
@@ -307,6 +329,41 @@ class ArtifactAndProfileTests(unittest.TestCase):
             self.assertEqual(restarted.solver_compaction_max_waits, 3)
             self.assertEqual(restarted.solver_max_estimated_cost_usd, 2.5)
             self.assertEqual(restarted.openai_api_key, settings.openai_api_key)
+            self.assertIsNotNone(connection)
+            self.assertEqual(restarted.ctfd_url, "https://ctf.example.com")
+            self.assertEqual(restarted.ctfd_token, "saved-token")
+            self.assertEqual(restarted.ctfd_user, "researcher")
+            self.assertEqual(restarted.ctfd_pass, "saved-password")
+
+            save_ctfd_settings(CTFdSettings(), Path(root) / "challenges")
+            disconnected = Settings(
+                _env_file=None,
+                ctfd_url="https://from-env.example.com",
+                ctfd_token="from-env",
+            )
+            restored_disconnect = load_ctfd_settings(
+                disconnected,
+                Path(root) / "challenges",
+            )
+            self.assertIsNotNone(restored_disconnect)
+            self.assertEqual(disconnected.ctfd_url, "")
+            self.assertEqual(disconnected.ctfd_token, "")
+
+            with self.assertRaisesRegex(ValueError, "absolute http"):
+                CTFdSettings(url="ctf.example.com")
+
+    def test_windows_launcher_only_overrides_saved_concurrency_when_requested(self) -> None:
+        launcher = Path(__file__).resolve().parents[1] / "run-ctf-agent.bat"
+        source = launcher.read_text(encoding="utf-8")
+
+        self.assertNotIn(
+            'if not defined CTF_AGENT_MAX_CHALLENGES set "CTF_AGENT_MAX_CHALLENGES=',
+            source,
+        )
+        self.assertIn(
+            'if defined CTF_AGENT_MAX_CHALLENGES set "CTF_AGENT_MAX_CHALLENGES_ARG=',
+            source,
+        )
 
     def test_postprocessor_has_small_non_recursive_budget(self) -> None:
         settings = Settings(_env_file=None)
@@ -382,6 +439,24 @@ class ArtifactAndProfileTests(unittest.TestCase):
         detector.reset()
         self.assertIsNone(detector.check("bash", {"command": "qemu-system-x86_64 -kernel fresh"}))
 
+    def test_session_read_polling_never_permanently_trips_loop_guard(self) -> None:
+        detector = LoopDetector()
+        for _ in range(20):
+            self.assertIsNone(detector.check("session_read", {"session_id": "debugger"}))
+            self.assertIsNone(
+                detector.record_result(
+                    "session_read",
+                    {"session_id": "debugger"},
+                    "(no output)",
+                )
+            )
+
+    def test_docker_memory_limit_parser_accepts_runtime_formats(self) -> None:
+        sandbox = DockerSandbox(image="unused", challenge_dir=".", memory_limit="1.5GB")
+        self.assertEqual(sandbox._parse_memory_limit(), int(1.5 * 1024**3))
+        sandbox.memory_limit = "768m"
+        self.assertEqual(sandbox._parse_memory_limit(), 768 * 1024**2)
+
     def test_tool_output_keeps_head_tail_and_candidate(self) -> None:
         text = "HEAD\n" + ("x" * 10_000) + "\nTEAM{preserve_me}\nTAIL"
         clipped = _truncate(text, 1_000)
@@ -396,12 +471,20 @@ class ArtifactAndProfileTests(unittest.TestCase):
             save_runtime_state(
                 settings,
                 {"done": {"flag": "TEAM{done}", "submit": "operator confirmed"}},
-                {"review": {"flag": "TEAM{maybe}", "flags": ["TEAM{maybe}"], "review_required": True}},
+                {"review": {
+                    "flag": "GoN{native}",
+                    "flags": ["GoN{native}"],
+                    "format_hint": "DH{...}",
+                    "format_mismatches": ["GoN{native}"],
+                    "review_required": True,
+                }},
                 {"deleted"},
             )
             results, candidates = load_runtime_state(settings)
             self.assertEqual(results["done"]["flag"], "TEAM{done}")
             self.assertTrue(candidates["review"]["review_required"])
+            self.assertEqual(candidates["review"]["format_hint"], "DH{...}")
+            self.assertEqual(candidates["review"]["format_mismatches"], ["GoN{native}"])
             self.assertEqual(load_dismissed_challenges(settings), {"deleted"})
             self.assertTrue(runtime_state_path(settings).is_file())
 
@@ -428,6 +511,17 @@ class ArtifactAndProfileTests(unittest.TestCase):
         )
         self.assertEqual(candidate.status, CANDIDATE_FOUND)
         self.assertEqual(candidate.flag, "TEAM{guess}")
+
+        alternate = assess_solver_output(
+            output_type="flag_found",
+            flag="GoN{native_output}",
+            method="unmodified verifier stdout",
+            confirmed_flag=None,
+            flag_format="DH{...}",
+        )
+        self.assertEqual(alternate.status, CANDIDATE_FOUND)
+        self.assertEqual(alternate.flag, "GoN{native_output}")
+        self.assertIn("preserve it verbatim", alternate.findings)
 
         verified = assess_solver_output(
             output_type="flag_found",
@@ -596,6 +690,71 @@ class _IdleThenCandidateSolver(_CandidateSolver):
 
 
 class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_container_limit_is_held_for_full_sandbox_lifetime(self) -> None:
+        class FakeContainer:
+            def __init__(self, suffix: str) -> None:
+                self.id = suffix * 64
+
+            async def start(self) -> None:
+                return None
+
+            async def put_archive(self, _path: str, _data: bytes) -> None:
+                return None
+
+            async def show(self) -> dict:
+                return {"Id": self.id}
+
+            async def stats(self, **_kwargs) -> list[dict]:
+                return [{}]
+
+            async def delete(self, **_kwargs) -> None:
+                return None
+
+        class FakeContainers:
+            def __init__(self, container: FakeContainer) -> None:
+                self.container = container
+
+            async def create(self, _config: dict) -> FakeContainer:
+                return self.container
+
+        class FakeDocker:
+            def __init__(self, container: FakeContainer) -> None:
+                self.containers = FakeContainers(container)
+
+            async def close(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as root:
+            first = DockerSandbox(
+                image="unused",
+                challenge_dir=root,
+                workspace_dir=str(Path(root) / "first"),
+                keep_workspace=True,
+            )
+            second = DockerSandbox(
+                image="unused",
+                challenge_dir=root,
+                workspace_dir=str(Path(root) / "second"),
+                keep_workspace=True,
+            )
+            dockers = iter(
+                [FakeDocker(FakeContainer("a")), FakeDocker(FakeContainer("b"))]
+            )
+            configure_semaphore(1)
+            try:
+                with patch("backend.sandbox.aiodocker.Docker", side_effect=lambda: next(dockers)):
+                    await first.start()
+                    second_start = asyncio.create_task(second.start())
+                    await asyncio.sleep(0)
+                    self.assertFalse(second_start.done())
+
+                    await first.stop()
+                    await asyncio.wait_for(second_start, timeout=1)
+                    self.assertIsNotNone(second._container)
+                    await second.stop()
+            finally:
+                configure_semaphore(50)
+
     async def test_idle_turn_is_interrupted_and_resumed_without_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             settings = SimpleNamespace(
@@ -664,6 +823,12 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(solver._resume_after_checkpoint)
         self.assertEqual(solver.tracer.events[-1][0], "resume_interrupt_sent")
 
+        solver._interrupt_requested = False
+        solver._resume_stop_reason = ""
+        solver.bump("a second background update")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(solver.tracer.events[-1][0], "resume_interrupt_deferred")
+
     async def test_solved_challenge_starts_ai_writeup_generation(self) -> None:
         requested: list[str] = []
 
@@ -704,6 +869,66 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         message = await do_spawn_swarm(spawn_deps, "already solved")
         self.assertIn("Already solved", message)
 
+    async def test_auto_spawn_honors_retry_backoff_and_run_cap(self) -> None:
+        now = asyncio.get_running_loop().time()
+        deps = SimpleNamespace(
+            dismissed_challenges=set(),
+            swarms={},
+            swarm_tasks={},
+            swarm_run_counts={"retry": 1},
+            swarm_retry_after={"retry": now + 60},
+            settings=SimpleNamespace(coordinator_max_swarm_runs_per_challenge=2),
+            max_concurrent_challenges=1,
+        )
+        with patch(
+            "backend.agents.coordinator_core.do_spawn_swarm",
+            new=AsyncMock(return_value="spawned"),
+        ) as spawn:
+            await _auto_spawn_one(deps, "retry")
+            spawn.assert_not_awaited()
+
+            deps.swarm_retry_after["retry"] = 0
+            await _auto_spawn_one(deps, "retry")
+            spawn.assert_awaited_once_with(deps, "retry")
+
+            spawn.reset_mock()
+            deps.swarm_run_counts["retry"] = 2
+            await _auto_spawn_one(deps, "retry")
+            spawn.assert_not_awaited()
+
+    async def test_api_fallback_keeps_original_delegate_lane_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            settings = Settings(
+                _env_file=None,
+                workspace_root=str(Path(root) / "workspace"),
+                experience_root=str(Path(root) / "experience"),
+                logs_root=str(Path(root) / "logs"),
+            )
+            lane = "codex/gpt-5.6-luna/low/delegate-01"
+            swarm = ChallengeSwarm(
+                challenge_dir=root,
+                meta=ChallengeMeta(name="fallback", category="misc"),
+                ctfd=SimpleNamespace(is_configured=False),
+                cost_tracker=CostTracker(),
+                settings=settings,
+                model_specs=[lane],
+                no_submit=True,
+            )
+            solver = swarm._create_pydantic_solver(
+                "openai/gpt-5.6-sol/high",
+                sandbox=SimpleNamespace(),
+                owns_sandbox=False,
+                lane_model_spec=lane,
+            )
+
+            self.assertIsInstance(solver, Solver)
+            self.assertEqual(solver.model_spec, "openai/gpt-5.6-sol/high")
+            self.assertEqual(solver.lane_model_spec, lane)
+            self.assertEqual(solver.deps.model_spec, lane)
+            self.assertEqual(solver.agent_name, f"fallback/{lane}")
+            self.assertEqual(solver_role(solver.lane_model_spec).key, "delegate")
+            solver.tracer.close()
+
     async def test_new_swarm_gets_an_isolated_runtime_settings_snapshot(self) -> None:
         settings = Settings(_env_file=None, solver_max_steps=300)
         gate = asyncio.Event()
@@ -732,6 +957,7 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         with patch("backend.agents.swarm.ChallengeSwarm.run", new=fake_run):
             await do_spawn_swarm(deps, "snapshot")
             swarm = deps.swarms["snapshot"]
+            self.assertEqual(deps.swarm_run_counts["snapshot"], 1)
             settings.solver_max_steps = 50
             task = deps.swarm_tasks["snapshot"]
             task.cancel()
@@ -740,6 +966,56 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(swarm.settings, settings)
         self.assertEqual(swarm.settings.solver_max_steps, 300)
         self.assertEqual(swarm.model_specs, ["codex/gpt-5.6-sol/high"])
+
+    async def test_restarted_swarm_receives_persisted_solution_review(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_root:
+            settings = Settings(_env_file=None, workspace_root=workspace_root)
+            review = (
+                Path(challenge_shared_path(settings, "reviewed restart"))
+                / "review"
+                / "CURRENT_SOLUTION_REVIEW.md"
+            )
+            review.parent.mkdir(parents=True)
+            review.write_text(
+                "## 판정\nPIVOT\n\n## 다음 권고\n- parser 경계를 먼저 재현합니다.\n",
+                encoding="utf-8",
+            )
+            gate = asyncio.Event()
+
+            async def fake_run(_swarm: ChallengeSwarm) -> None:
+                await gate.wait()
+
+            deps = SimpleNamespace(
+                swarms={},
+                swarm_tasks={},
+                results={},
+                candidates={},
+                dismissed_challenges=set(),
+                max_concurrent_challenges=1,
+                ctfd=SimpleNamespace(is_configured=False),
+                challenges_root="challenges",
+                challenge_dirs={"reviewed restart": "."},
+                challenge_metas={
+                    "reviewed restart": ChallengeMeta(
+                        name="reviewed restart", category="misc"
+                    )
+                },
+                cost_tracker=CostTracker(),
+                settings=settings,
+                model_specs=["codex/gpt-5.6-sol/high"],
+                no_submit=True,
+                coordinator_inbox=asyncio.Queue(),
+            )
+
+            with patch("backend.agents.swarm.ChallengeSwarm.run", new=fake_run):
+                await do_spawn_swarm(deps, "reviewed restart")
+                swarm = deps.swarms["reviewed restart"]
+                task = deps.swarm_tasks["reviewed restart"]
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+            self.assertIn("CURRENT_SOLUTION_REVIEW.md", swarm.solution_review_directive)
+            self.assertIn("PIVOT", swarm.solution_review_directive)
 
     async def test_kill_cancels_primary_solver_task_immediately(self) -> None:
         swarm = ChallengeSwarm(
@@ -965,6 +1241,56 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
             any(name == "compact_complete_ignored" for name, _ in solver.tracer.events)
         )
 
+    async def test_codex_transport_failure_wakes_pending_rpc_immediately(self) -> None:
+        solver = object.__new__(CodexSolver)
+        pending = asyncio.get_running_loop().create_future()
+        solver._pending_responses = {7: pending}
+        solver._turn_done = asyncio.Event()
+        solver._transport_failed = asyncio.Event()
+        solver._stderr_tail = deque(["fatal startup error"])
+        solver._turn_error = None
+
+        solver._fail_transport(RuntimeError("app-server EOF"))
+
+        with self.assertRaisesRegex(RuntimeError, "app-server EOF"):
+            await pending
+        self.assertTrue(solver._turn_done.is_set())
+        self.assertTrue(solver._transport_failed.is_set())
+        self.assertIn("fatal startup error", solver._turn_error)
+
+    async def test_codex_coordinator_interrupts_timed_out_turn(self) -> None:
+        deps = SimpleNamespace(settings=SimpleNamespace(), model_specs=[])
+        coordinator = CodexCoordinator(deps)
+        coordinator._proc = SimpleNamespace(returncode=None)
+        coordinator._thread_id = "thread-1"
+        calls: list[tuple[str, dict]] = []
+
+        async def fake_rpc(method: str, params: dict, **_kwargs) -> dict:
+            calls.append((method, params))
+            if method == "turn/start":
+                return {"result": {"turn": {"id": "turn-1"}}}
+            if method == "turn/interrupt":
+                coordinator._turn_done.set()
+            return {"result": {}}
+
+        coordinator._rpc = fake_rpc
+        real_wait_for = asyncio.wait_for
+        waits = 0
+
+        async def timeout_once(awaitable, timeout):
+            nonlocal waits
+            waits += 1
+            if waits == 1:
+                awaitable.close()
+                raise TimeoutError
+            return await real_wait_for(awaitable, timeout)
+
+        with patch("backend.agents.codex_coordinator.asyncio.wait_for", new=timeout_once):
+            await coordinator.turn("status")
+
+        self.assertEqual([method for method, _ in calls], ["turn/start", "turn/interrupt"])
+        self.assertEqual(calls[1][1], {"threadId": "thread-1", "turnId": "turn-1"})
+
     async def test_codex_compaction_failure_is_reported(self) -> None:
         solver = object.__new__(CodexSolver)
         solver._thread_id = "thread-compact"
@@ -989,7 +1315,9 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
     async def test_productive_checkpoint_resumes_without_bump_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             settings = SimpleNamespace(
-                max_attempts_per_challenge=2,
+                # The productive turn-slice checkpoint must not consume this
+                # sole attempt; the following candidate turn must still run.
+                max_attempts_per_challenge=1,
                 solver_turn_timeout_seconds=30,
                 solver_max_runtime_seconds=120,
                 solver_max_steps=100,
@@ -1229,6 +1557,25 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         worker_gate.set()
         await asyncio.gather(*swarm.delegate_tasks.values())
 
+    async def test_delegate_rejects_lead_private_input_paths(self) -> None:
+        swarm = ChallengeSwarm(
+            challenge_dir=".",
+            meta=ChallengeMeta(name="private-input", category="reversing"),
+            ctfd=SimpleNamespace(is_configured=False),
+            cost_tracker=CostTracker(),
+            settings=Settings(_env_file=None),
+            model_specs=list(DEFAULT_MODELS),
+            no_submit=True,
+        )
+
+        message = await swarm._spawn_delegate(
+            "Analyze /challenge/workspace/tnt/output.bin for the recovered state",
+            "Write a reproducer to /challenge/shared/delegates/delegate-01.md",
+        )
+
+        self.assertIn("private to the lead lane", message)
+        self.assertEqual(swarm.delegate_tasks, {})
+
     async def test_audited_delegate_handoff_stops_without_bump(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             settings = Settings(_env_file=None, workspace_root=root)
@@ -1309,6 +1656,11 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
                 await loop_task
 
             self.assertTrue(solver.cancelled.is_set())
+            checkpoint = json.loads(
+                (Path(root) / ".ctf-agent-state.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(checkpoint["status"], CANCELLED)
+            self.assertIn("cancelled", checkpoint["stop_reason"])
 
     async def test_interrupted_delegate_routes_state_and_repairs_unsafe_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -1371,6 +1723,43 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
             )
             await swarm._handle_delegate_budget_stop(postprocess_spec, result)
             self.assertEqual(swarm._postprocess_count, 1)
+
+    async def test_budget_stop_without_shared_evidence_skips_postprocessor(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            settings = Settings(_env_file=None, workspace_root=root)
+            lead = "codex/gpt-5.6-sol/xhigh"
+            source = "codex/gpt-5.6-luna/low/delegate-01"
+            swarm = ChallengeSwarm(
+                challenge_dir=".",
+                meta=ChallengeMeta(name="empty-budget-handoff", category="reversing"),
+                ctfd=SimpleNamespace(is_configured=False),
+                cost_tracker=CostTracker(),
+                settings=settings,
+                model_specs=[lead, source],
+                no_submit=True,
+            )
+            swarm.delegate_requests[source] = {
+                "task": "Test one bounded branch",
+                "deliverable": "Observed output",
+                "handoff": "/challenge/shared/delegates/delegate-01.md",
+                "host_handoff": str(Path(root) / "missing.md"),
+            }
+            result = SolverResult(
+                flag=None,
+                status=BUDGET_EXHAUSTED,
+                findings_summary="No result before interruption.",
+                step_count=3,
+                cost_usd=0.01,
+                log_path="",
+                stop_reason="effective token budget exhausted",
+            )
+
+            await swarm._handle_delegate_budget_stop(source, result)
+
+            unread = await swarm.message_bus.check(lead)
+            self.assertIn("no recoverable shared evidence", unread[0].content)
+            self.assertEqual(swarm._postprocess_count, 0)
+            self.assertEqual(swarm.delegate_tasks, {})
 
     async def test_valid_budget_stop_handoff_is_sent_without_extra_worker(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -1464,15 +1853,73 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         )
 
         message, confirmed = await swarm.try_submit_flag("flag{wrong}", "codex/test")
-        self.assertIn("does not match", message)
+        self.assertIn("FORMAT-HINT MISMATCH", message)
         self.assertFalse(confirmed)
-        self.assertEqual(ctfd.calls, [])
+        self.assertEqual(ctfd.calls, ["flag{wrong}"])
+        self.assertEqual(swarm.all_candidate_flags(), ["flag{wrong}"])
+        swarm.discard_candidate("flag{wrong}")
+        self.assertEqual(swarm.all_candidate_flags(), [])
 
-        await swarm.try_submit_flag("cce2026{first}", "codex/test")
-        message, confirmed = await swarm.try_submit_flag("cce2026{second}", "codex/test")
+        message, confirmed = await swarm.try_submit_flag("cce2026{first}", "codex/test")
         self.assertIn("SUBMISSION LIMIT", message)
         self.assertFalse(confirmed)
-        self.assertEqual(ctfd.calls, ["cce2026{first}"])
+        self.assertEqual(ctfd.calls, ["flag{wrong}"])
+
+    async def test_retryable_submission_preserves_and_retries_exact_candidate(self) -> None:
+        class FlakyCTFd:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def submit_flag(self, _challenge: str, flag: str):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError("temporary network failure")
+                return SimpleNamespace(status="correct", display=f"CORRECT: {flag}")
+
+        ctfd = FlakyCTFd()
+        swarm = ChallengeSwarm(
+            challenge_dir=".",
+            meta=ChallengeMeta(name="retry", category="misc", flag_format="TEAM{...}"),
+            ctfd=ctfd,
+            cost_tracker=CostTracker(),
+            settings=SimpleNamespace(max_flag_submissions_per_challenge=1),
+            model_specs=["codex/test"],
+        )
+
+        message, confirmed = await swarm.try_submit_flag("TEAM{same}", "codex/test")
+        self.assertIn("RETRYABLE SUBMISSION ERROR", message)
+        self.assertFalse(confirmed)
+        self.assertEqual(swarm._total_submit_count, 0)
+        self.assertNotIn("TEAM{same}", swarm._submitted_flags)
+        self.assertEqual(swarm.all_candidate_flags(), ["TEAM{same}"])
+
+        _message, confirmed = await swarm.try_submit_flag("TEAM{same}", "codex/test")
+        self.assertTrue(confirmed)
+        self.assertEqual(ctfd.calls, 2)
+        self.assertEqual(swarm.confirmed_flag, "TEAM{same}")
+
+    async def test_already_solved_does_not_confirm_submitted_candidate(self) -> None:
+        class SolvedCTFd:
+            async def submit_flag(self, _challenge: str, _flag: str):
+                return SimpleNamespace(
+                    status="already_solved",
+                    display="ALREADY SOLVED EXTERNALLY",
+                )
+
+        swarm = ChallengeSwarm(
+            challenge_dir=".",
+            meta=ChallengeMeta(name="external", category="misc", flag_format="TEAM{...}"),
+            ctfd=SolvedCTFd(),
+            cost_tracker=CostTracker(),
+            settings=SimpleNamespace(max_flag_submissions_per_challenge=2),
+            model_specs=["codex/test"],
+        )
+
+        message, confirmed = await swarm.try_submit_flag("TEAM{unverified}", "codex/test")
+        self.assertIn("ALREADY SOLVED EXTERNALLY", message)
+        self.assertFalse(confirmed)
+        self.assertIsNone(swarm.confirmed_flag)
+        self.assertEqual(swarm.all_candidate_flags(), ["TEAM{unverified}"])
 
     async def test_standalone_candidate_pauses_for_operator_review(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -1518,6 +1965,15 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("LOCAL CANDIDATE", message)
         self.assertEqual(deps.candidates["local"]["flag"], "TEAM{guess}")
         self.assertNotIn("local", deps.results)
+
+        alternate = await coordinator_submit_flag(deps, "local", "GoN{native}")
+        self.assertIn("FORMAT-HINT MISMATCH", alternate)
+        self.assertIn("LOCAL CANDIDATE", alternate)
+        self.assertEqual(
+            deps.candidates["local"]["flags"],
+            ["TEAM{guess}", "GoN{native}"],
+        )
+        self.assertEqual(deps.candidates["local"]["format_mismatches"], ["GoN{native}"])
 
         confirmed = await do_review_candidate(deps, "local", "TEAM{guess}", True)
         self.assertIn("LOCAL CONFIRMED", confirmed)

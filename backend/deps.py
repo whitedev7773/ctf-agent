@@ -56,6 +56,8 @@ class CoordinatorDeps:
     operator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
     swarms: dict[str, Any] = field(default_factory=dict)
     swarm_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    swarm_run_counts: dict[str, int] = field(default_factory=dict)
+    swarm_retry_after: dict[str, float] = field(default_factory=dict)
     results: dict[str, dict] = field(default_factory=dict)
     candidates: dict[str, dict] = field(default_factory=dict)
     # Challenges explicitly deleted by the operator stay hidden and cannot be

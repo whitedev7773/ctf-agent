@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import boto3
+from google.genai.types import ThinkingLevel
 from pydantic_ai.models import Model
 from pydantic_ai.models.bedrock import BedrockConverseModel, BedrockModelSettings
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
@@ -137,7 +138,7 @@ def resolve_model_settings(spec: str) -> ModelSettings:
             return GoogleModelSettings(
                 max_tokens=64_000,
                 google_thinking_config={
-                    "thinking_level": "high",
+                    "thinking_level": ThinkingLevel.HIGH,
                     "include_thoughts": True,
                 },
             )

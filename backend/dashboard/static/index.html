@@ -19,6 +19,7 @@
       </span>
     </a>
     <div class="topbar-status">
+      <button class="secondary-button" id="operations-open" type="button" aria-haspopup="dialog">운영 설정</button>
       <span class="uptime-pill" id="uptime-value">UPTIME --</span>
       <span class="connection-pill" id="connection-pill">
         <span class="status-dot"></span>
@@ -55,7 +56,13 @@
       </article>
     </section>
 
-    <section class="codex-usage-panel" aria-labelledby="codex-usage-title">
+    <details class="dashboard-disclosure system-disclosure">
+      <summary>
+        <span><strong>시스템 모니터</strong><small>Codex 사용 한도와 Docker 리소스</small></span>
+        <span class="disclosure-action">열기</span>
+      </summary>
+      <div class="dashboard-disclosure-content">
+      <section class="codex-usage-panel" aria-labelledby="codex-usage-title">
       <div class="codex-usage-heading">
         <div>
           <p class="eyebrow">CODEX ACCOUNT</p>
@@ -73,9 +80,9 @@
           <strong>—</strong>
         </article>
       </div>
-    </section>
+      </section>
 
-    <section class="live-resources" aria-label="실시간 Docker 리소스">
+      <section class="live-resources" aria-label="실시간 Docker 리소스">
       <div class="live-resource-title">
         <span class="live-dot" aria-hidden="true"></span>
         <div><strong>LIVE RESOURCES</strong><small id="resource-updated">샘플 대기 중</small></div>
@@ -85,7 +92,9 @@
       <div class="live-resource-metric"><span>MEMORY</span><strong id="resource-memory">0 B</strong></div>
       <div class="live-resource-metric"><span>PROCESSES</span><strong id="resource-pids">0</strong></div>
       <div class="live-resource-metric"><span>NETWORK</span><strong id="resource-network">0 B</strong></div>
-    </section>
+      </section>
+      </div>
+    </details>
 
     <section class="workspace" aria-labelledby="challenge-title">
       <div class="section-heading">
@@ -94,6 +103,7 @@
           <h2 id="challenge-title">문제 현황</h2>
         </div>
         <div class="filters" role="search">
+          <button class="secondary-button" id="add-challenge" type="button">문제 추가</button>
           <label class="search-box">
             <span aria-hidden="true">⌕</span>
             <span class="sr-only">문제 검색</span>
@@ -177,9 +187,7 @@
             <tr>
               <th>문제</th>
               <th>상태</th>
-              <th>Solver</th>
               <th>진행</th>
-              <th>비용</th>
               <th><span class="sr-only">작업</span></th>
             </tr>
           </thead>
@@ -189,6 +197,7 @@
           <span>∅</span>
           <h3 id="empty-title">표시할 문제가 없습니다</h3>
           <p id="empty-copy">검색어나 상태 필터를 바꿔보세요.</p>
+          <button class="secondary-button" id="empty-add-challenge" type="button">첫 문제 추가</button>
         </div>
       </div>
     </section>
@@ -208,6 +217,12 @@
       </form>
     </section>
 
+    <details class="dashboard-disclosure operations-disclosure">
+      <summary>
+        <span><strong>문제 및 운영 설정</strong><small>문제 추가 · Solver 정책 · 연결 · 초기화</small></span>
+        <span class="disclosure-action">관리</span>
+      </summary>
+      <div class="dashboard-disclosure-content operations-content">
     <section class="runtime-settings-section" aria-labelledby="runtime-settings-title">
       <div class="section-heading source-heading">
         <div>
@@ -323,8 +338,11 @@
             <summary>고급 예산과 timeout 설정</summary>
             <div class="runtime-advanced-grid">
               <label><span>최대 시도 횟수</span><input id="runtime-max-attempts-per-challenge" type="number" min="1" max="100" step="1" required></label>
+              <label><span>문제별 swarm 실행 한도</span><input id="runtime-coordinator-max-swarm-runs-per-challenge" type="number" min="1" max="10" step="1" required></label>
+              <label><span>swarm 재시도 대기 (초)</span><input id="runtime-coordinator-swarm-retry-delay-seconds" type="number" min="0" max="3600" step="1" required></label>
               <label><span>Turn timeout (초)</span><input id="runtime-solver-turn-timeout-seconds" type="number" min="30" max="86400" step="1" required></label>
               <label><span>Idle timeout (초)</span><input id="runtime-solver-turn-idle-timeout-seconds" type="number" min="0" max="86400" step="1" required></label>
+              <label><span>Guidance interrupt 최소 간격 (초)</span><input id="runtime-solver-guidance-interrupt-min-interval-seconds" type="number" min="0" max="3600" step="1" required></label>
               <label><span>최대 Tool step</span><input id="runtime-solver-max-steps" type="number" min="1" max="10000" step="1" required></label>
               <label><span>Effective token 상한</span><input id="runtime-solver-max-tokens" type="number" min="0" max="100000000" step="1000" required></label>
               <label><span>Raw token 상한</span><input id="runtime-solver-max-raw-tokens" type="number" min="0" max="500000000" step="1000" required></label>
@@ -457,6 +475,8 @@
         </div>
       </article>
     </section>
+      </div>
+    </details>
   </main>
 
   <main class="detail-page" id="detail-page" hidden aria-labelledby="detail-title">
@@ -472,6 +492,24 @@
     </header>
     <div class="detail-content" id="detail-content"></div>
   </main>
+
+  <dialog class="workspace-dialog" id="workspace-dialog" aria-labelledby="workspace-dialog-title">
+    <header class="modal-header">
+      <h2 id="workspace-dialog-title">작업</h2>
+      <button class="secondary-button" id="workspace-dialog-close" type="button" aria-label="작업 창 닫기">닫기</button>
+    </header>
+    <nav id="workspace-dialog-tabs" class="modal-tabs" aria-label="운영 작업" hidden></nav>
+    <div id="workspace-dialog-body" class="modal-body"></div>
+  </dialog>
+
+  <dialog class="confirmation-dialog" id="confirmation-dialog" aria-labelledby="confirmation-title" aria-describedby="confirmation-message">
+    <h2 id="confirmation-title">작업 확인</h2>
+    <p id="confirmation-message"></p>
+    <div class="confirmation-actions">
+      <button class="secondary-button" id="confirmation-cancel" type="button" autofocus>취소</button>
+      <button class="primary-button" id="confirmation-accept" type="button">확인</button>
+    </div>
+  </dialog>
 
   <dialog class="reset-dialog" id="reset-dialog" aria-labelledby="reset-dialog-title">
     <form id="reset-form">

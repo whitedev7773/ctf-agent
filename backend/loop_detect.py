@@ -116,6 +116,11 @@ class LoopDetector:
             "warn": approaching loop threshold
             "break": exceeded loop threshold, should force-break
         """
+        # Polling is observational: repeated empty reads can legitimately precede
+        # delayed debugger, emulator, or remote-service output. Never make a
+        # session unreadable merely because its output has not arrived yet.
+        if tool_name.casefold() == "session_read":
+            return None
         if args:
             raw = json.dumps(args, sort_keys=True) if isinstance(args, dict) else str(args)
             sig = f"{tool_name}:{raw[:500]}"
@@ -163,6 +168,8 @@ class LoopDetector:
         Distinct emulator boots are legitimate during exploit development. They
         are blocked only after two consecutive empty/timeout-only outcomes.
         """
+        if tool_name.casefold() == "session_read":
+            return None
         output_hash = hashlib.sha256(
             str(result).encode("utf-8", errors="replace")
         ).hexdigest()[:16]

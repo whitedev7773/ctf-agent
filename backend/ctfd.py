@@ -194,7 +194,12 @@ class CTFdClient:
             return SubmitResult("correct", message, f'CORRECT — "{flag}" accepted. {message}'.strip())
         if status == "already_solved":
             return SubmitResult(
-                "already_solved", message, f'ALREADY SOLVED — "{flag}" accepted. {message}'.strip()
+                "already_solved",
+                message,
+                (
+                    f'ALREADY SOLVED EXTERNALLY - challenge was already solved; candidate "{flag}" '
+                    f'was not verified by this response. {message}'
+                ).strip(),
             )
         if status == "incorrect":
             return SubmitResult(

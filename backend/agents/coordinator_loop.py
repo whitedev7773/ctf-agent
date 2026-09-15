@@ -198,11 +198,19 @@ async def run_event_loop(
         "Spawn swarms for available unsolved challenges."
     )
 
-    try:
-        await turn_fn(initial_msg)
+    async def safe_turn(message: str) -> None:
+        """Keep coordinator control-plane failures from terminating active solvers."""
+        try:
+            await turn_fn(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Coordinator turn failed; solver swarms continue: %s", exc, exc_info=True)
 
-        # Auto-spawn swarms for unsolved challenges if coordinator LLM didn't
+    try:
+        # Solver work must not wait for a slow or unavailable coordinator model.
         await _auto_spawn_unsolved(deps, poller)
+        await safe_turn(initial_msg)
 
         last_status = asyncio.get_event_loop().time()
 
@@ -231,14 +239,67 @@ async def run_event_loop(
                     await _auto_spawn_one(deps, evt.challenge_name)
                 elif evt.kind == "challenge_solved":
                     parts.append(f"SOLVED: '{evt.challenge_name}' — swarm auto-killed.")
+                    getattr(deps, "swarm_retry_after", {}).pop(evt.challenge_name, None)
 
             # Detect finished swarms
+            retired_any = False
             for name, task in list(deps.swarm_tasks.items()):
                 if task.done():
-                    parts.append(
-                        f"SOLVER FINISHED: Swarm for '{name}' completed. Check results or retry."
-                    )
+                    retired_any = True
+                    try:
+                        task.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        parts.append(f"SOLVER ERROR: Swarm for '{name}' failed: {exc}")
+                    has_terminal_state = name in deps.results or name in deps.candidates
+                    if has_terminal_state:
+                        parts.append(f"SOLVER FINISHED: Swarm for '{name}' completed.")
+                    else:
+                        runs = getattr(deps, "swarm_run_counts", {}).get(name, 1)
+                        max_runs = max(
+                            1,
+                            int(
+                                getattr(
+                                    deps.settings,
+                                    "coordinator_max_swarm_runs_per_challenge",
+                                    2,
+                                )
+                            ),
+                        )
+                        if runs < max_runs:
+                            base_delay = max(
+                                0.0,
+                                float(
+                                    getattr(
+                                        deps.settings,
+                                        "coordinator_swarm_retry_delay_seconds",
+                                        30,
+                                    )
+                                ),
+                            )
+                            delay = base_delay * (2 ** max(0, runs - 1))
+                            retry_after = getattr(deps, "swarm_retry_after", None)
+                            if retry_after is None:
+                                retry_after = {}
+                                deps.swarm_retry_after = retry_after
+                            retry_after[name] = asyncio.get_running_loop().time() + delay
+                            parts.append(
+                                f"SOLVER FINISHED: Swarm for '{name}' produced no terminal result; "
+                                f"automatic retry {runs + 1}/{max_runs} is queued after {int(delay)}s."
+                            )
+                        else:
+                            parts.append(
+                                f"SOLVER EXHAUSTED: Swarm for '{name}' used {runs}/{max_runs} "
+                                "bounded runs; operator review is required."
+                            )
                     deps.swarm_tasks.pop(name, None)
+                    deps.swarms.pop(name, None)
+
+            # Fill every free slot deterministically. This also activates retries
+            # once their backoff expires, without depending on an LLM tool call.
+            if retired_any or len(deps.swarm_tasks) < deps.max_concurrent_challenges:
+                await _auto_spawn_unsolved(deps, poller)
 
             # Drain solver-to-coordinator messages
             while True:
@@ -279,9 +340,9 @@ async def run_event_loop(
             if parts:
                 msg = "\n\n".join(parts)
                 logger.info("Event -> coordinator: %s", msg[:200])
-                await turn_fn(msg)
+                await safe_turn(msg)
 
-    except KeyboardInterrupt, asyncio.CancelledError:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Coordinator shutting down...")
     except Exception as e:
         logger.error("Coordinator fatal: %s", e, exc_info=True)
@@ -314,6 +375,16 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
     if challenge_name in getattr(deps, "dismissed_challenges", set()):
         return
     if challenge_name in deps.swarms:
+        return
+    run_counts = getattr(deps, "swarm_run_counts", {})
+    max_runs = max(
+        1,
+        int(getattr(deps.settings, "coordinator_max_swarm_runs_per_challenge", 2)),
+    )
+    if run_counts.get(challenge_name, 0) >= max_runs:
+        return
+    retry_after = getattr(deps, "swarm_retry_after", {}).get(challenge_name, 0.0)
+    if retry_after > asyncio.get_running_loop().time():
         return
     active = sum(1 for t in deps.swarm_tasks.values() if not t.done())
     if active >= deps.max_concurrent_challenges:

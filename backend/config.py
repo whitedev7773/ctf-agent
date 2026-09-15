@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     # Desktop-safe default: one SOL-led challenge at a time.
     max_concurrent_challenges: int = 1
     max_attempts_per_challenge: int = 8
+    coordinator_max_swarm_runs_per_challenge: int = 2
+    coordinator_swarm_retry_delay_seconds: int = 30
     container_memory_limit: str = "4g"
     container_cpu_limit: float = 2.0
     workspace_root: str = "workspace"
@@ -80,6 +82,9 @@ class Settings(BaseSettings):
     # Downstream roles wait for SCOUT evidence before starting. VERIFIER uses
     # twice this duration. Set to zero to start every role immediately.
     solver_handoff_wait_seconds: int = 180
+    # Guidance is always queued, but repeated background updates should not
+    # repeatedly tear down the same active model turn.
+    solver_guidance_interrupt_min_interval_seconds: int = 120
 
     # SOL-led adaptive delegation. The lead keeps ownership of the solve and
     # creates small Luna workers only for narrow, independent investigations.

@@ -47,9 +47,11 @@ def assess_solver_output(
             return OutputAssessment(GAVE_UP, None, "Rejected empty flag candidate.")
         if not flag_matches_format(candidate, flag_format):
             return OutputAssessment(
-                GAVE_UP,
-                None,
-                f'Rejected candidate that does not match flag format "{flag_format}".',
+                CANDIDATE_FOUND,
+                candidate,
+                f'Alternate unverified candidate via {method_text}: {candidate}. '
+                f'The exact observed value does not match the expected flag-format hint "{flag_format}"; '
+                "preserve it verbatim and do not rewrite its wrapper without verifier evidence.",
             )
         return OutputAssessment(
             CANDIDATE_FOUND,

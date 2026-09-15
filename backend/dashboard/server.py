@@ -15,11 +15,16 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import yaml
-from aiohttp import web
+from aiohttp import BodyPartReader, web
 
-from backend.artifacts import challenge_approach_notes, challenge_workspace_path
+from backend.artifacts import (
+    challenge_approach_notes,
+    challenge_shared_path,
+    challenge_workspace_path,
+)
 from backend.budgets import (
     solver_token_limits,
     solver_turn_idle_timeout_limit,
@@ -34,10 +39,12 @@ from backend.model_specs import provider_from_spec
 from backend.prompts import ChallengeMeta, list_distfiles
 from backend.runtime_clock import RuntimeClock
 from backend.runtime_settings import (
+    CTFdSettings,
     RuntimeSettings,
     apply_runtime_settings,
     reset_runtime_settings,
     runtime_settings_from,
+    save_ctfd_settings,
     save_runtime_settings,
 )
 from backend.runtime_state import persist_deps_state
@@ -63,7 +70,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 logger = logging.getLogger(__name__)
 RESET_CONFIRMATION = "초기화"
 RESET_EXPERIENCE_CONFIRMATION = "경험 초기화"
-RUNTIME_REVISION = 20
+RUNTIME_REVISION = 21
 
 
 def _runtime_source_fingerprint(project_root: Path | None = None) -> str:
@@ -274,9 +281,14 @@ class DashboardServer:
         self._site: web.TCPSite | None = None
         self._command_lock = asyncio.Lock()
         self._writeup_lock = asyncio.Lock()
+        self._solution_review_lock = asyncio.Lock()
         self._writeup_tasks: dict[str, asyncio.Task[None]] = {}
         self._writeup_solvers: dict[str, Any] = {}
         self._writeup_clocks: dict[str, RuntimeClock] = {}
+        self._solution_review_tasks: dict[str, asyncio.Task[None]] = {}
+        self._solution_reviewers: dict[str, Any] = {}
+        self._solution_review_clocks: dict[str, RuntimeClock] = {}
+        self._solution_review_errors: dict[str, str] = {}
         # Keep challenge clocks outside transient swarm objects so a paused
         # swarm can be removed and later resumed without losing solve time.
         self._challenge_clocks: dict[str, RuntimeClock] = {}
@@ -299,8 +311,10 @@ class DashboardServer:
                 web.get("/api/codex/usage", self._codex_usage),
                 web.get("/api/resources", self._resources),
                 web.get("/api/writeup", self._writeup),
+                web.get("/api/solution-review", self._solution_review),
                 web.get("/api/writeup/archive", self._writeup_archive),
                 web.get("/api/artifact", self._artifact),
+                web.get("/api/attachment", self._attachment),
                 web.get("/api/trace", self._trace),
                 web.get("/api/settings/runtime", self._runtime_settings),
                 web.post("/api/settings/ctfd", self._configure_ctfd),
@@ -316,6 +330,7 @@ class DashboardServer:
                 web.post("/api/control/submit", self._submit),
                 web.post("/api/control/review-candidate", self._review_candidate),
                 web.post("/api/control/request-writeup", self._request_writeup),
+                web.post("/api/control/review-solution", self._request_solution_review),
                 web.post("/api/control/reset-runtime", self._reset_runtime),
                 web.post("/api/control/reset-experience", self._reset_experience),
                 # Backward-compatible endpoint used by the ctf-msg command.
@@ -333,7 +348,10 @@ class DashboardServer:
             self.actual_port = sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
-        tasks = list(self._writeup_tasks.values())
+        tasks = [
+            *self._writeup_tasks.values(),
+            *self._solution_review_tasks.values(),
+        ]
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -384,6 +402,7 @@ class DashboardServer:
                     "reset_runtime": True,
                     "reset_experience": True,
                     "request_writeup": True,
+                    "solution_review": True,
                     "delete_challenge": True,
                     "update_challenge": True,
                     "runtime_settings": True,
@@ -444,6 +463,27 @@ class DashboardServer:
             swarm = self.deps.swarms.get(name)
             result = self.deps.results.get(name, {})
             candidate = candidates.get(name, {})
+            pending_candidate_flags = list(
+                dict.fromkeys(
+                    item
+                    for item in [candidate.get("flag"), *candidate.get("flags", [])]
+                    if isinstance(item, str) and item.strip()
+                )
+            )
+            rejected_candidate_flags = list(
+                dict.fromkeys(
+                    item
+                    for item in candidate.get("rejected_flags", [])
+                    if isinstance(item, str) and item.strip()
+                )
+            )
+            format_mismatch_candidates = list(
+                dict.fromkeys(
+                    item
+                    for item in candidate.get("format_mismatches", [])
+                    if isinstance(item, str) and item.strip() and item in pending_candidate_flags
+                )
+            )
             is_active = name in active_names and swarm is not None and not swarm.cancel_event.is_set()
             challenge_clock = self._challenge_clocks.get(name)
             if challenge_clock is not None and not is_active:
@@ -598,7 +638,7 @@ class DashboardServer:
             status = (
                 "solved" if is_solved
                 else "active" if is_active
-                else "candidate" if candidate
+                else "candidate" if pending_candidate_flags
                 else "idle"
             )
             elapsed_seconds = round(
@@ -611,16 +651,23 @@ class DashboardServer:
                 else max((agent["duration_seconds"] for agent in agents), default=0.0),
                 1,
             )
-            if is_solved and challenge_clock is not None:
-                if result.get("elapsed_seconds") != elapsed_seconds:
-                    result["elapsed_seconds"] = elapsed_seconds
-                    persist_deps_state(self.deps)
+            if (
+                is_solved
+                and challenge_clock is not None
+                and result.get("elapsed_seconds") != elapsed_seconds
+            ):
+                result["elapsed_seconds"] = elapsed_seconds
+                persist_deps_state(self.deps)
             approach_notes = challenge_approach_notes(
                 self.deps.settings,
                 name,
                 live_findings=getattr(swarm, "findings", {}) if swarm else {},
             )
             writeup = self._current_writeup_status(name, solved=is_solved)
+            solution_review = self._current_solution_review_status(name)
+            if solution_review.get("active"):
+                total_agents += 1
+                active_agents += 1
             documented_count += int(bool(writeup.get("documented")))
             challenges.append(
                 {
@@ -634,15 +681,23 @@ class DashboardServer:
                     "elapsed_seconds": elapsed_seconds,
                     "solved": is_solved,
                     "flag": result.get("flag"),
-                    "candidate": candidate.get("flag"),
-                    "candidates": candidate.get("flags", []),
-                    "candidate_review_required": bool(candidate.get("review_required")),
+                    "candidate": pending_candidate_flags[0] if pending_candidate_flags else "",
+                    "candidates": pending_candidate_flags,
+                    "rejected_candidates": rejected_candidate_flags,
+                    "format_mismatch_candidates": format_mismatch_candidates,
+                    "candidate_format_hint": candidate.get("format_hint", ""),
+                    "candidate_review_required": bool(pending_candidate_flags),
                     "approach_notes": approach_notes,
+                    "solution_review": solution_review,
                     "writeup": writeup,
                     "documented": bool(writeup.get("documented")),
                     "resources": challenge_resources,
                     "agents": agents,
-                    "cost_usd": round(sum(a["cost_usd"] for a in agents), 6),
+                    "cost_usd": round(
+                        sum(a["cost_usd"] for a in agents)
+                        + float(solution_review.get("cost_usd", 0) or 0),
+                        6,
+                    ),
                     "registration": {
                         "source": source,
                         "category": getattr(meta, "category", "") or "",
@@ -704,6 +759,11 @@ class DashboardServer:
                     self.deps.settings,
                     "solver_turn_idle_timeout_seconds",
                     300,
+                ),
+                "guidance_interrupt_min_interval_seconds": getattr(
+                    self.deps.settings,
+                    "solver_guidance_interrupt_min_interval_seconds",
+                    120,
                 ),
                 "max_runtime_seconds": getattr(self.deps.settings, "solver_max_runtime_seconds", 10800),
                 "max_steps": getattr(self.deps.settings, "solver_max_steps", 300),
@@ -783,7 +843,9 @@ class DashboardServer:
             "stats": {
                 "total": len(known),
                 "solved": len(solved),
-                "candidates": len(set(candidates) - solved),
+                "candidates": sum(
+                    challenge["status"] == "candidate" for challenge in challenges
+                ),
                 "active_swarms": len(active_names),
                 "active_agents": active_agents,
                 "total_agents": total_agents,
@@ -801,7 +863,11 @@ class DashboardServer:
     async def _resources(self, _request: web.Request) -> web.Response:
         challenges: list[dict[str, Any]] = []
         live: list[dict[str, Any]] = []
-        names = set(self.deps.swarms) | set(self._writeup_solvers)
+        names = (
+            set(self.deps.swarms)
+            | set(self._writeup_solvers)
+            | set(self._solution_reviewers)
+        )
         for name in names:
             swarm = self.deps.swarms.get(name)
             agents: list[dict[str, Any]] = []
@@ -832,6 +898,20 @@ class DashboardServer:
                         {
                             "model_spec": f"{writeup_solver.model_spec}/{'writeup-review' if phase == 'reviewing' else 'writeup-revision' if phase == 'revising' else 'writeup'}",
                             "role": "writeup_review" if phase == "reviewing" else "writeup_revision" if phase == "revising" else "writeup",
+                            "resource": resource,
+                        }
+                    )
+                    if resource.get("status") != "stopped":
+                        live.append(resource)
+            solution_reviewer = self._solution_reviewers.get(name)
+            if solution_reviewer is not None:
+                reader = getattr(solution_reviewer.sandbox, "resource_snapshot", None)
+                resource = reader() if callable(reader) else {}
+                if resource:
+                    agents.append(
+                        {
+                            "model_spec": f"{solution_reviewer.model_spec}/solution-review",
+                            "role": "solution_review",
                             "resource": resource,
                         }
                     )
@@ -973,6 +1053,91 @@ class DashboardServer:
                 status["resource"] = resource_reader()
             return status
         return interrupted_writeup_status(status)
+
+    def _solution_review_path(self, name: str) -> Path:
+        return (
+            Path(challenge_shared_path(self.deps.settings, name))
+            / "review"
+            / "CURRENT_SOLUTION_REVIEW.md"
+        )
+
+    def _solution_review_model_spec(self) -> str:
+        model_spec = str(
+            getattr(
+                self.deps.settings,
+                "writeup_review_model_spec",
+                "codex/gpt-5.6-luna/medium",
+            )
+        ).strip()
+        return model_spec if provider_from_spec(model_spec) == "codex" else ""
+
+    def _current_solution_review_status(self, name: str) -> dict[str, Any]:
+        task = self._solution_review_tasks.get(name)
+        reviewer = self._solution_reviewers.get(name)
+        model_spec = (
+            str(getattr(reviewer, "model_spec", ""))
+            if reviewer is not None
+            else self._solution_review_model_spec()
+        )
+        accounting_spec = f"{model_spec}/solution-review" if model_spec else ""
+        usage = (
+            _usage_payload(
+                self.cost_tracker,
+                solver_agent_name(name, accounting_spec),
+                self.deps.settings,
+                model_spec,
+            )
+            if accounting_spec
+            else {}
+        )
+        if task is not None and not task.done():
+            idle_reader = getattr(reviewer, "activity_idle_seconds", None)
+            idle = max(0.0, float(idle_reader())) if callable(idle_reader) else None
+            return {
+                "status": "running",
+                "active": True,
+                "model_spec": model_spec,
+                "activity": getattr(
+                    reviewer,
+                    "activity_summary",
+                    "현재 풀이의 근거와 다음 실험을 독립적으로 점검하는 중",
+                ),
+                "steps": getattr(reviewer, "_step_count", 0),
+                "idle_seconds": round(idle, 1) if idle is not None else None,
+                "report": "",
+                **usage,
+            }
+
+        report_path = self._solution_review_path(name)
+        report = ""
+        updated_at = ""
+        if report_path.is_file():
+            try:
+                report = report_path.read_text(encoding="utf-8")[:20_000]
+                updated_at = datetime.fromtimestamp(report_path.stat().st_mtime, UTC).isoformat()
+            except OSError:
+                report = ""
+        error = self._solution_review_errors.get(name, "")
+        return {
+            "status": "error" if error else "complete" if report else "not_requested",
+            "active": False,
+            "model_spec": model_spec,
+            "activity": error,
+            "steps": 0,
+            "idle_seconds": None,
+            "report": report,
+            "updated_at": updated_at,
+            **usage,
+        }
+
+    async def _solution_review(self, request: web.Request) -> web.Response:
+        name = request.query.get("challenge", "").strip()
+        known = self.poller.known_challenges | set(self.deps.challenge_metas) | set(self.deps.results)
+        if not name or name not in known:
+            raise web.HTTPNotFound(text="challenge not found")
+        return web.json_response(
+            {"challenge": name, "review": self._current_solution_review_status(name)}
+        )
 
     def _writeup_model_specs(self) -> tuple[str, str]:
         writer = str(
@@ -1250,6 +1415,151 @@ class DashboardServer:
             status=202,
         )
 
+    def _create_solution_reviewer(
+        self,
+        name: str,
+        meta: ChallengeMeta,
+        challenge_dir: str,
+        model_spec: str,
+    ):
+        from backend.agents.codex_solver import CodexSolver
+
+        return CodexSolver(
+            model_spec=model_spec,
+            challenge_dir=challenge_dir,
+            meta=meta,
+            ctfd=self.deps.ctfd,
+            cost_tracker=self.cost_tracker,
+            settings=self.deps.settings,
+            no_submit=True,
+            task_mode="solution_review",
+        )
+
+    async def _run_solution_review(
+        self,
+        name: str,
+        meta: ChallengeMeta,
+        model_spec: str,
+    ) -> None:
+        challenge_dir = self.deps.challenge_dirs.get(name, self.deps.challenges_root)
+        report_path = self._solution_review_path(name)
+        previous_mtime = report_path.stat().st_mtime_ns if report_path.is_file() else None
+        reviewer = self._create_solution_reviewer(name, meta, challenge_dir, model_spec)
+        self._solution_reviewers[name] = reviewer
+        clock = RuntimeClock()
+        clock.start()
+        self._solution_review_clocks[name] = clock
+        try:
+            timeout = max(
+                60,
+                int(getattr(self.deps.settings, "solution_review_timeout_seconds", 900)),
+            )
+            async with asyncio.timeout(timeout):
+                result = await self._wait_for_writeup(reviewer)
+            if result.status in {"error", "quota_error", "cancelled"}:
+                raise RuntimeError(
+                    getattr(result, "findings_summary", "")
+                    or "풀이 검토 에이전트가 완료되지 않았습니다"
+                )
+            current_mtime = report_path.stat().st_mtime_ns if report_path.is_file() else None
+            if current_mtime is None or current_mtime == previous_mtime:
+                raise RuntimeError("풀이 검토 보고서가 새로 작성되지 않았습니다")
+            self._solution_review_errors.pop(name, None)
+            try:
+                from backend.agents.coordinator_core import deliver_solution_review
+
+                await deliver_solution_review(self.deps, name)
+            except Exception as exc:
+                # The persisted report is still attached by do_spawn_swarm on
+                # the next solve even if a transient live delivery fails.
+                logger.warning(
+                    "Could not deliver completed solution review for %s: %s",
+                    name,
+                    exc,
+                    exc_info=True,
+                )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            self._solution_review_errors[name] = "풀이 검토 제한 시간을 초과했습니다. 다시 요청할 수 있습니다."
+        except Exception as exc:
+            logger.warning("Solution review failed for %s: %s", name, exc, exc_info=True)
+            self._solution_review_errors[name] = f"풀이 검토 실패: {type(exc).__name__}: {exc}"
+        finally:
+            clock.stop()
+            try:
+                await asyncio.wait_for(reviewer.stop(), timeout=15)
+            except Exception as exc:
+                logger.warning("Could not stop solution reviewer for %s: %s", name, exc)
+            if self._solution_reviewers.get(name) is reviewer:
+                self._solution_reviewers.pop(name, None)
+            self._solution_review_clocks.pop(name, None)
+
+    async def start_solution_review(self, name: str) -> dict[str, Any]:
+        """Start one reviewer only for the duration of the requested audit."""
+        async with self._solution_review_lock:
+            existing = self._solution_review_tasks.get(name)
+            if existing is not None and not existing.done():
+                raise RuntimeError("solution review is already running")
+            model_spec = self._solution_review_model_spec()
+            if not model_spec:
+                raise RuntimeError("solution review requires a configured Codex reviewer model")
+            meta = self.deps.challenge_metas.get(name)
+            if meta is None:
+                meta = ChallengeMeta(name=name, category="Unknown")
+            self._solution_review_errors.pop(name, None)
+            task = asyncio.create_task(
+                self._run_solution_review(name, meta, model_spec),
+                name=f"solution-review-{name}",
+            )
+            self._solution_review_tasks[name] = task
+            task.add_done_callback(
+                lambda completed, challenge=name: (
+                    self._solution_review_tasks.pop(challenge, None)
+                    if self._solution_review_tasks.get(challenge) is completed
+                    else None
+                )
+            )
+            return self._current_solution_review_status(name)
+
+    async def _request_solution_review(self, request: web.Request) -> web.Response:
+        self._require_csrf(request)
+        data = await self._json_body(request)
+        name = str(data.get("challenge", "")).strip()
+        known = self.poller.known_challenges | set(self.deps.challenge_metas) | set(self.deps.results)
+        if not name or name not in known:
+            raise web.HTTPNotFound(text="challenge not found")
+        try:
+            status = await self.start_solution_review(name)
+        except RuntimeError as exc:
+            raise web.HTTPConflict(text=str(exc)) from exc
+        return web.json_response(
+            {
+                "ok": True,
+                "message": f"{name}의 현재 풀이를 독립적으로 검토하기 시작했습니다.",
+                "challenge": name,
+                "review": status,
+            },
+            status=202,
+        )
+
+    async def _attachment(self, request: web.Request) -> web.StreamResponse:
+        name = request.query.get("challenge", "").strip()
+        filename = request.query.get("path", "")
+        directory = self.deps.challenge_dirs.get(name)
+        if not directory or filename not in list_distfiles(directory):
+            raise web.HTTPNotFound(text="attachment not found")
+        challenge_root = Path(directory).resolve()
+        root = (challenge_root / "distfiles").resolve()
+        path = (root / filename).resolve()
+        if not root.is_relative_to(challenge_root) or not path.is_relative_to(root) or not path.is_file():
+            raise web.HTTPNotFound(text="attachment not found")
+        return web.FileResponse(path, headers={
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename, safe='')}",
+            "X-Content-Type-Options": "nosniff",
+        })
+
     async def _artifact(self, request: web.Request) -> web.StreamResponse:
         name = request.query.get("challenge", "").strip()
         relative = request.query.get("path", "").strip()
@@ -1368,6 +1678,12 @@ class DashboardServer:
 
         async with self._command_lock:
             if not url:
+                try:
+                    save_ctfd_settings(CTFdSettings(), self.deps.challenges_root)
+                except OSError as exc:
+                    raise web.HTTPInternalServerError(
+                        text=f"CTFd 연결 설정을 저장하지 못했습니다: {exc}"
+                    ) from exc
                 await self.deps.ctfd.configure("")
                 self.deps.settings.ctfd_url = ""
                 self.deps.settings.ctfd_token = ""
@@ -1397,6 +1713,18 @@ class DashboardServer:
             finally:
                 await candidate.close()
 
+            connection = CTFdSettings(
+                url=normalized,
+                token=token,
+                username=username,
+                password=password,
+            )
+            try:
+                save_ctfd_settings(connection, self.deps.challenges_root)
+            except OSError as exc:
+                raise web.HTTPInternalServerError(
+                    text=f"CTFd 연결 설정을 저장하지 못했습니다: {exc}"
+                ) from exc
             await self.deps.ctfd.configure(normalized, token, username, password)
             self.deps.settings.ctfd_url = normalized
             self.deps.settings.ctfd_token = token
@@ -1415,8 +1743,6 @@ class DashboardServer:
     async def _create_local_challenge(self, request: web.Request) -> web.Response:
         """Create one standalone challenge and save optional attachments locally."""
         self._require_csrf(request)
-        if not request.content_type.startswith("multipart/"):
-            raise web.HTTPUnsupportedMediaType(text="multipart/form-data required")
 
         root = Path(self.deps.challenges_root).resolve()
         root.mkdir(parents=True, exist_ok=True)
@@ -1425,23 +1751,44 @@ class DashboardServer:
 
         with _staging_directory(root) as temp_dir:
             dist_dir = temp_dir / "distfiles"
-            reader = await request.multipart()
-            async for part in reader:
-                if part.filename:
-                    filename = Path(part.filename).name
-                    filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename).strip(". ")
-                    if not filename:
-                        raise web.HTTPBadRequest(text="invalid attachment filename")
-                    dist_dir.mkdir(exist_ok=True)
-                    destination = dist_dir / filename
-                    if destination.exists():
-                        raise web.HTTPConflict(text=f"duplicate attachment: {filename}")
-                    with destination.open("wb") as output:
-                        while chunk := await part.read_chunk():
-                            output.write(chunk)
-                    file_count += 1
-                else:
-                    fields[part.name or ""] = (await part.text()).strip()
+            if request.content_type.startswith("multipart/"):
+                reader = await request.multipart()
+                async for part in reader:
+                    if not isinstance(part, BodyPartReader):
+                        raise web.HTTPBadRequest(text="nested multipart sections are not supported")
+                    if part.filename:
+                        filename = Path(part.filename).name
+                        filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename).strip(". ")
+                        if not filename:
+                            raise web.HTTPBadRequest(text="invalid attachment filename")
+                        dist_dir.mkdir(exist_ok=True)
+                        destination = dist_dir / filename
+                        if destination.exists():
+                            raise web.HTTPConflict(text=f"duplicate attachment: {filename}")
+                        with destination.open("wb") as output:
+                            while chunk := await part.read_chunk():
+                                output.write(chunk)
+                        file_count += 1
+                    else:
+                        fields[part.name or ""] = (await part.text()).strip()
+            elif request.content_type == "application/x-www-form-urlencoded":
+                form = await request.post()
+                fields.update(
+                    (str(key), str(value).strip())
+                    for key, value in form.items()
+                    if isinstance(value, str)
+                )
+            elif request.content_type == "application/json":
+                data = await self._json_body(request)
+                fields.update(
+                    (str(key), str(value).strip())
+                    for key, value in data.items()
+                    if value is not None and not isinstance(value, (dict, list))
+                )
+            else:
+                raise web.HTTPUnsupportedMediaType(
+                    text="multipart/form-data, form-urlencoded, or JSON required"
+                )
 
             name = fields.get("name", "")[:200]
             if not name:
@@ -1449,7 +1796,7 @@ class DashboardServer:
             flag_format = fields.get("flag_format", "")[:500]
             if not flag_format:
                 raise web.HTTPBadRequest(text="flag format required")
-            if name in self.deps.challenge_dirs:
+            if name in self.deps.challenge_dirs or name in self.deps.challenge_metas:
                 raise web.HTTPConflict(text=f"challenge already exists: {name}")
 
             slug = re.sub(r'[<>:"/\\|?*.\x00-\x1f]', "", name.lower())
@@ -1482,11 +1829,22 @@ class DashboardServer:
             )
             temp_dir.replace(destination_dir)
 
-        meta = ChallengeMeta.from_yaml(destination_dir / "metadata.yml")
-        self.deps.dismissed_challenges.discard(name)
-        self.deps.challenge_dirs[name] = str(destination_dir)
-        self.deps.challenge_metas[name] = meta
-        persist_deps_state(self.deps)
+        was_dismissed = name in self.deps.dismissed_challenges
+        try:
+            meta = ChallengeMeta.from_yaml(destination_dir / "metadata.yml")
+            self.deps.dismissed_challenges.discard(name)
+            self.deps.challenge_dirs[name] = str(destination_dir)
+            self.deps.challenge_metas[name] = meta
+            persist_deps_state(self.deps)
+        except BaseException:
+            if self.deps.challenge_dirs.get(name) == str(destination_dir):
+                self.deps.challenge_dirs.pop(name, None)
+            self.deps.challenge_metas.pop(name, None)
+            if was_dismissed:
+                self.deps.dismissed_challenges.add(name)
+            if destination_dir.parent == root and destination_dir.exists():
+                shutil.rmtree(destination_dir, ignore_errors=True)
+            raise
         attachment_copy = f" 첨부 파일 {file_count}개를 저장했습니다." if file_count else ""
         return web.json_response(
             {
@@ -1612,6 +1970,10 @@ class DashboardServer:
         removed_entries = 0
         retained: list[Path] = []
         async with self._command_lock:
+            review_task = self._solution_review_tasks.get(name)
+            if review_task is not None and not review_task.done():
+                review_task.cancel()
+                await asyncio.gather(review_task, return_exceptions=True)
             writeup_task = self._writeup_tasks.get(name)
             if writeup_task is not None and not writeup_task.done():
                 writeup_task.cancel()
@@ -1643,6 +2005,10 @@ class DashboardServer:
 
             self._writeup_tasks.pop(name, None)
             self._writeup_solvers.pop(name, None)
+            self._solution_review_tasks.pop(name, None)
+            self._solution_reviewers.pop(name, None)
+            self._solution_review_clocks.pop(name, None)
+            self._solution_review_errors.pop(name, None)
             self.deps.swarms.pop(name, None)
             self.deps.swarm_tasks.pop(name, None)
             self._challenge_clocks.pop(name, None)
@@ -1699,10 +2065,27 @@ class DashboardServer:
         if not name:
             raise web.HTTPBadRequest(text="challenge required")
         async with self._command_lock:
-            message = await do_spawn_swarm(self.deps, name)
-            if name in self.deps.swarms:
+            try:
+                message = await do_spawn_swarm(self.deps, name)
+            except Exception as exc:
+                logger.exception("Could not start solver swarm for %s", name)
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "started": False,
+                        "message": f"풀이 시작 실패: {str(exc)[:500]}",
+                    },
+                    status=500,
+                )
+            task = self.deps.swarm_tasks.get(name)
+            started = (
+                name in self.deps.swarms
+                and task is not None
+                and not task.done()
+            )
+            if started:
                 self._challenge_clocks.setdefault(name, RuntimeClock()).start()
-        return web.json_response({"ok": True, "message": message})
+        return web.json_response({"ok": True, "started": started, "message": message})
 
     async def _stop_swarm(self, request: web.Request) -> web.Response:
         from backend.agents.coordinator_core import do_kill_swarm
@@ -1787,12 +2170,21 @@ class DashboardServer:
             raise web.HTTPConflict(text=str(exc)) from exc
 
         async with self._command_lock:
-            writeup_tasks = list(self._writeup_tasks.values())
-            for task in writeup_tasks:
+            try:
+                save_ctfd_settings(CTFdSettings(), self.deps.challenges_root)
+            except OSError as exc:
+                raise web.HTTPInternalServerError(
+                    text=f"CTFd 연결 설정을 초기화하지 못했습니다: {exc}"
+                ) from exc
+            document_tasks = [
+                *self._writeup_tasks.values(),
+                *self._solution_review_tasks.values(),
+            ]
+            for task in document_tasks:
                 if not task.done():
                     task.cancel()
-            if writeup_tasks:
-                await asyncio.gather(*writeup_tasks, return_exceptions=True)
+            if document_tasks:
+                await asyncio.gather(*document_tasks, return_exceptions=True)
 
             for swarm in list(self.deps.swarms.values()):
                 swarm.kill()
@@ -1816,6 +2208,10 @@ class DashboardServer:
 
             self.deps.swarms.clear()
             self.deps.swarm_tasks.clear()
+            self._solution_review_tasks.clear()
+            self._solution_reviewers.clear()
+            self._solution_review_clocks.clear()
+            self._solution_review_errors.clear()
             self._challenge_clocks.clear()
             self.deps.results.clear()
             self.deps.candidates.clear()

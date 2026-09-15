@@ -19,6 +19,7 @@ import itertools
 import json
 import logging
 import time
+from collections import deque
 from typing import Any, cast
 
 from backend.artifacts import (
@@ -39,6 +40,7 @@ from backend.output_types import assess_solver_output, solver_output_json_schema
 from backend.prompts import (
     ChallengeMeta,
     build_prompt,
+    build_solution_review_prompt,
     build_writeup_prompt,
     build_writeup_review_prompt,
     build_writeup_revision_prompt,
@@ -134,7 +136,10 @@ SANDBOX_TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "submit_flag",
-        "description": "Submit a flag to CTFd. Returns CORRECT, ALREADY SOLVED, or INCORRECT.",
+        "description": (
+            "Submit a flag to CTFd. Only CORRECT verifies this exact value; "
+            "ALREADY SOLVED EXTERNALLY does not verify the candidate."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {"flag": {"type": "string"}},
@@ -245,7 +250,9 @@ DELEGATION_TOOLS: list[dict[str, Any]] = [
         "name": "delegate_task",
         "description": (
             "Launch one adaptively routed worker for a narrow independent subproblem. "
-            "The lead must continue its own critical path while the worker runs."
+            "The lead must continue its own critical path while the worker runs. All referenced "
+            "inputs must already be under /challenge/shared or /challenge/distfiles; a delegate "
+            "cannot see the lead's private /challenge/workspace."
         ),
         "inputSchema": {
             "type": "object",
@@ -419,7 +426,13 @@ class CodexSolver:
         self.delegate_task_fn = delegate_task_fn
         self.delegate_status_fn = delegate_status_fn
         self.task_directive = task_directive.strip()[:6000]
-        if task_mode not in {"solve", "writeup", "writeup_review", "writeup_revision"}:
+        if task_mode not in {
+            "solve",
+            "solution_review",
+            "writeup",
+            "writeup_review",
+            "writeup_revision",
+        }:
             raise ValueError(f"unsupported Codex task mode: {task_mode}")
         self.task_mode = task_mode
         self.verified_flag = verified_flag.strip()[:2000]
@@ -479,6 +492,9 @@ class CodexSolver:
         self._findings = ""
         self._cost_usd = 0.0
         self._bump_insights: str | None = None
+        self._last_bump_message = ""
+        self._last_resume_interrupt_at = 0.0
+        self._cancel_reason = ""
         self._resume_after_checkpoint = False
         self._structured_output: dict | None = None
         self._turn_error: str | None = None
@@ -497,14 +513,22 @@ class CodexSolver:
             if task_mode == "writeup_revision"
             else "생성된 라이트업의 검수 기준을 준비하는 중"
             if task_mode == "writeup_review"
+            else "현재 풀이의 근거와 다음 실험을 독립적으로 점검하는 중"
+            if task_mode == "solution_review"
             else ""
         )
         self._latest_raw_tokens = 0
         self._turn_start_raw_tokens = 0
         self._pending_responses: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
+        self._tool_tasks: set[asyncio.Task] = set()
+        self._tool_call_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
+        self._stderr_tail: deque[str] = deque(maxlen=40)
         self._turn_done: asyncio.Event = asyncio.Event()
         self._compact_done: asyncio.Event = asyncio.Event()
+        self._transport_failed: asyncio.Event = asyncio.Event()
         self._compacting_thread_id: str | None = None
         self._thread_params: dict[str, Any] = {}
         self._reasoning_effort = effort_from_spec(self.model_spec) or LEGACY_REASONING_EFFORT.get(
@@ -512,6 +536,7 @@ class CodexSolver:
         )
 
     async def start(self) -> None:
+        self._transport_failed.clear()
         await self.sandbox.start()
 
         arch_result = await self.sandbox.exec("uname -m", timeout_s=10)
@@ -520,6 +545,8 @@ class CodexSolver:
         distfile_names = list_distfiles(self.challenge_dir)
         if self.task_mode == "writeup":
             system_prompt = build_writeup_prompt(self.meta, self.verified_flag)
+        elif self.task_mode == "solution_review":
+            system_prompt = build_solution_review_prompt(self.meta)
         elif self.task_mode == "writeup_revision":
             system_prompt = build_writeup_revision_prompt(self.meta, self.verified_flag)
         elif self.task_mode == "writeup_review":
@@ -537,7 +564,7 @@ class CodexSolver:
                 ),
             )
         if self.task_directive and self.task_mode == "solve":
-            system_prompt += "\n\n## Live delegated assignment\n" + self.task_directive
+            system_prompt += "\n\n## Current task guidance\n" + self.task_directive
         if self.task_mode == "solve":
             system_prompt += (
                 "\n\n## Evidence-backed decision state\n"
@@ -572,12 +599,17 @@ class CodexSolver:
         self._proc = await asyncio.create_subprocess_exec(
             codex_executable,
             "app-server",
+            "--disable",
+            "shell_tool",
+            "--disable",
+            "unified_exec",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
 
         self._reader_task = asyncio.create_task(self._read_loop())
+        self._stderr_task = asyncio.create_task(self._read_stderr_loop())
 
         # Initialize handshake: send initialize request, then initialized notification
         await self._rpc(
@@ -591,7 +623,12 @@ class CodexSolver:
 
         # thread/start — system prompt is supplied through baseInstructions
         # Prepend sandbox path reminder to prevent models from using host paths
-        if self.task_mode in {"writeup", "writeup_review", "writeup_revision"}:
+        if self.task_mode in {
+            "solution_review",
+            "writeup",
+            "writeup_review",
+            "writeup_revision",
+        }:
             allowed = {"bash", "read_file", "write_file", "list_files", "view_image", "web_fetch"}
             dynamic_tools = [tool for tool in SANDBOX_TOOLS if tool["name"] in allowed]
         else:
@@ -621,6 +658,8 @@ class CodexSolver:
         resp = await self._rpc("thread/start", thread_params)
         # ThreadStartResponse: result.thread.id
         self._thread_id = resp.get("result", {}).get("thread", {}).get("id", "")
+        if not self._thread_id:
+            raise RuntimeError("Codex App Server thread/start returned no thread id")
 
         self.tracer.event(
             "start",
@@ -636,7 +675,24 @@ class CodexSolver:
             f"(thread={self._thread_id}, effort={self._reasoning_effort or 'default'})"
         )
 
-    async def _rpc(self, method: str, params: dict | None = None) -> dict:
+    async def _write_message(self, message: dict[str, Any]) -> None:
+        assert self._proc and self._proc.stdin
+        lock = getattr(self, "_write_lock", None)
+        if lock is None:
+            self._proc.stdin.write((json.dumps(message) + "\n").encode())
+            await self._proc.stdin.drain()
+            return
+        async with lock:
+            self._proc.stdin.write((json.dumps(message) + "\n").encode())
+            await self._proc.stdin.drain()
+
+    async def _rpc(
+        self,
+        method: str,
+        params: dict | None = None,
+        *,
+        timeout: float = 300,
+    ) -> dict:
         assert self._proc and self._proc.stdin
         msg_id = _next_id()
         msg: dict[str, Any] = {"id": msg_id, "method": method}
@@ -646,28 +702,22 @@ class CodexSolver:
         future: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
         self._pending_responses[msg_id] = future
 
-        self._proc.stdin.write((json.dumps(msg) + "\n").encode())
-        await self._proc.stdin.drain()
         try:
-            return await asyncio.wait_for(future, timeout=300)
+            await self._write_message(msg)
+            return await asyncio.wait_for(future, timeout=timeout)
         finally:
             self._pending_responses.pop(msg_id, None)
 
     async def _respond_to_request(self, request_id: int, result: Any) -> None:
         """Send a JSON-RPC response to a server request (e.g. item/tool/call)."""
-        assert self._proc and self._proc.stdin
-        resp = {"id": request_id, "result": result}
-        self._proc.stdin.write((json.dumps(resp) + "\n").encode())
-        await self._proc.stdin.drain()
+        await self._write_message({"id": request_id, "result": result})
 
     async def _send_notification(self, method: str, params: dict | None = None) -> None:
         """Send a JSON-RPC notification (no id, no response expected)."""
-        assert self._proc and self._proc.stdin
         msg: dict[str, Any] = {"method": method}
         if params:
             msg["params"] = params
-        self._proc.stdin.write((json.dumps(msg) + "\n").encode())
-        await self._proc.stdin.drain()
+        await self._write_message(msg)
 
     def _request_budget_interrupt(self, reason: str, turn_id: str | None = None) -> None:
         """Schedule a turn interrupt without blocking the sole JSON-RPC reader."""
@@ -783,7 +833,25 @@ class CodexSolver:
             for wait_number in range(1, max_waits + 1):
                 started_at = time.monotonic()
                 try:
-                    await asyncio.wait_for(self._compact_done.wait(), timeout=timeout)
+                    transport_failed = getattr(self, "_transport_failed", None)
+                    if transport_failed is None:
+                        await asyncio.wait_for(self._compact_done.wait(), timeout=timeout)
+                    else:
+                        compact_wait = asyncio.create_task(self._compact_done.wait())
+                        transport_wait = asyncio.create_task(transport_failed.wait())
+                        done, pending = await asyncio.wait(
+                            {compact_wait, transport_wait},
+                            timeout=timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for pending_task in pending:
+                            pending_task.cancel()
+                        if pending:
+                            await asyncio.gather(*pending, return_exceptions=True)
+                        if not done:
+                            raise TimeoutError
+                        if transport_wait in done and transport_failed.is_set():
+                            raise RuntimeError("Codex App Server transport failed during compaction")
                     self.tracer.event(
                         "compact_wait_complete",
                         wait_number=wait_number,
@@ -816,6 +884,8 @@ class CodexSolver:
                     )
                     self._compacting_thread_id = None
                     return False
+            self._compacting_thread_id = None
+            return False
         except Exception as exc:
             self._compacting_thread_id = None
             logger.warning("[%s] Compaction request failed: %s", self.agent_name, exc)
@@ -855,13 +925,81 @@ class CodexSolver:
         )
         return True
 
+    def _fail_transport(self, exc: Exception) -> None:
+        """Wake every waiter immediately when the App Server transport fails."""
+        detail = str(exc)
+        stderr_tail = getattr(self, "_stderr_tail", None)
+        if stderr_tail:
+            detail = f"{detail}; stderr tail: {' | '.join(stderr_tail)[-1000:]}"
+        error = RuntimeError(detail)
+        self._turn_error = detail
+        for future in list(self._pending_responses.values()):
+            if not future.done():
+                future.set_exception(error)
+        turn_done = getattr(self, "_turn_done", None)
+        if turn_done is not None:
+            turn_done.set()
+        transport_failed = getattr(self, "_transport_failed", None)
+        if transport_failed is not None:
+            transport_failed.set()
+
+    async def _read_stderr_loop(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", errors="replace").strip()
+            if text:
+                self._stderr_tail.append(text[:1000])
+                logger.debug("[%s] Codex App Server stderr: %s", self.agent_name, text[:1000])
+
+    async def _run_tool_call_request(self, request_id: int, params: dict) -> None:
+        """Execute tools outside the sole stdout reader while preserving call order."""
+        lock = getattr(self, "_tool_call_lock", None)
+        try:
+            if lock is None:
+                await self._handle_tool_call(request_id, params)
+            else:
+                async with lock:
+                    await self._handle_tool_call(request_id, params)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[%s] Dynamic tool call failed: %s", self.agent_name, exc)
+            try:
+                await self._respond_to_request(
+                    request_id,
+                    {
+                        "contentItems": [
+                            {"type": "inputText", "text": f"Tool execution failed: {exc}"}
+                        ],
+                        "success": False,
+                    },
+                )
+            except Exception:
+                pass
+
+    def _tool_task_finished(self, task: asyncio.Task) -> None:
+        self._tool_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
     async def _read_loop(self) -> None:
         """Read JSON-RPC messages: responses, notifications, and server requests."""
         assert self._proc and self._proc.stdout
         while True:
-            line = await self._proc.stdout.readline()
+            try:
+                line = await self._proc.stdout.readline()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._fail_transport(RuntimeError(f"Codex App Server read failed: {exc}"))
+                break
             if not line:
-                self._turn_done.set()
+                self._fail_transport(RuntimeError("Codex App Server closed the connection"))
                 break
             try:
                 msg = json.loads(line)
@@ -886,7 +1024,12 @@ class CodexSolver:
 
             # Server request: dynamic tool call
             if method == "item/tool/call" and msg_id is not None:
-                await self._handle_tool_call(msg_id, params)
+                task = asyncio.create_task(
+                    self._run_tool_call_request(msg_id, params),
+                    name=f"codex-tool-{self.agent_name}-{msg_id}",
+                )
+                self._tool_tasks.add(task)
+                task.add_done_callback(self._tool_task_finished)
 
             # Notification: item completed — assistant text arrives here
             elif method == "item/completed":
@@ -920,7 +1063,7 @@ class CodexSolver:
                                 try:
                                     progress = json.loads(text)
                                     summary = str(progress.get("method", ""))
-                                except json.JSONDecodeError, AttributeError, ValueError:
+                                except (json.JSONDecodeError, AttributeError, ValueError):
                                     summary = ""
                             summary = " ".join(summary.split())[:180]
                             if summary:
@@ -930,7 +1073,7 @@ class CodexSolver:
                                 parsed = json.loads(text)
                                 if isinstance(parsed, dict) and "type" in parsed:
                                     self._structured_output = parsed
-                            except json.JSONDecodeError, ValueError:
+                            except (json.JSONDecodeError, ValueError):
                                 pass
 
             # Notification: turn completed — signals the turn is done
@@ -1197,19 +1340,26 @@ class CodexSolver:
         """Map low-level tool calls to a compact operator-facing status."""
         reviewing = self.task_mode == "writeup_review"
         revising = self.task_mode == "writeup_revision"
-        prefix = "검수: " if reviewing else "수정: " if revising else "작성: "
+        auditing = self.task_mode == "solution_review"
+        prefix = (
+            "풀이 검토: "
+            if auditing
+            else "검수: "
+            if reviewing
+            else "수정: "
+            if revising
+            else "작성: "
+        )
         raw_path = str(args.get("path", args.get("filename", ""))).casefold()
         command = str(args.get("command", "")).casefold()
         if tool_name == "view_image":
             detail = "취약점·해결 스크린샷을 확인하는 중"
-        elif tool_name == "write_file" and "review.md" in raw_path:
+        elif tool_name == "write_file" and "review" in raw_path:
             detail = "검수 결과와 승인 여부를 기록하는 중"
         elif tool_name == "write_file" and "writeup.md" in raw_path:
             detail = "최종 Markdown을 보강해 저장하는 중"
         elif tool_name in {"read_file", "list_files"}:
-            detail = (
-                "풀이 기록과 증거 파일을 대조하는 중" if reviewing else "풀이 기록과 증거를 읽는 중"
-            )
+            detail = "풀이 기록과 증거 파일을 대조하는 중" if reviewing or auditing else "풀이 기록과 증거를 읽는 중"
         elif tool_name == "bash" and ("writeup.md" in command or "review.md" in command):
             detail = (
                 "문서 구조와 증거 링크를 검증하는 중"
@@ -1226,11 +1376,11 @@ class CodexSolver:
         if name == "bash":
             try:
                 timeout = int(args.get("timeout_seconds", 60) or 60)
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 timeout = 60
             try:
                 max_output_chars = int(args.get("max_output_chars", 12_000) or 12_000)
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 max_output_chars = 12_000
             return await do_bash(
                 self.sandbox,
@@ -1475,6 +1625,13 @@ class CodexSolver:
                 "screens. Write /challenge/shared/writeup/WRITEUP.md. Do not re-triage, develop a new solve route, "
                 "or submit the challenge."
             )
+        elif self.task_mode == "solution_review":
+            prompt_text = (
+                "Audit the current solve state now. Read the evidence ledger and bounded handoffs, check whether "
+                "the active route is evidence-backed and cost-effective, then atomically write "
+                "/challenge/shared/review/CURRENT_SOLUTION_REVIEW.md. Do not solve, submit, delegate, or edit "
+                "the active solvers' artifacts."
+            )
         elif self.task_mode == "writeup_review":
             prompt_text = (
                 "Review the generated Korean writeup now. Correct unsupported or incomplete content and verify the "
@@ -1599,7 +1756,9 @@ class CodexSolver:
             return self._result(assessment.status)
 
         except asyncio.CancelledError:
-            return self._result(CANCELLED)
+            reason = self._cancel_reason or "solver task cancelled without an attributed reason"
+            self._findings = self._findings or reason
+            return self._result(CANCELLED, reason)
         except Exception as e:
             error_str = str(e)
             logger.error(f"[{self.agent_name}] Error: {e}", exc_info=True)
@@ -1609,8 +1768,14 @@ class CodexSolver:
                 return self._result(QUOTA_ERROR)
             return self._result(ERROR)
 
-    def bump(self, insights: str) -> None:
+    def bump(self, insights: str, *, urgent: bool = False) -> None:
         clean = " ".join(insights.split())[:6000]
+        if not clean:
+            return
+        if clean == getattr(self, "_last_bump_message", ""):
+            self.tracer.event("bump_ignored", reason="duplicate guidance", insights=clean[:500])
+            return
+        self._last_bump_message = clean
         if self._bump_insights:
             clean = f"{self._bump_insights}\n\n{clean}"[-6000:]
         self._bump_insights = clean
@@ -1618,10 +1783,41 @@ class CodexSolver:
         self.loop_detector.reset_transient()
         self.tracer.event("bump", insights=insights[:500])
         if self._turn_active:
-            self.request_resume_interrupt("new coordinator or delegate guidance arrived")
+            now = time.monotonic()
+            minimum = max(
+                0.0,
+                float(
+                    getattr(
+                        getattr(self, "settings", None),
+                        "solver_guidance_interrupt_min_interval_seconds",
+                        120,
+                    )
+                ),
+            )
+            last_interrupt = getattr(self, "_last_resume_interrupt_at", 0.0)
+            if urgent or now - last_interrupt >= minimum:
+                if self.request_resume_interrupt("new coordinator or delegate guidance arrived"):
+                    self._last_resume_interrupt_at = now
+            else:
+                self.tracer.event(
+                    "resume_interrupt_deferred",
+                    reason="guidance queued inside interrupt debounce window",
+                    remaining_seconds=round(minimum - (now - last_interrupt), 3),
+                )
+
+    def set_cancel_reason(self, reason: str) -> None:
+        clean = " ".join(reason.split())[:1000]
+        if clean:
+            self._cancel_reason = clean
 
     def _result(self, status: str, stop_reason: str = "") -> SolverResult:
-        self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed)
+        self.tracer.event(
+            "finish",
+            status=status,
+            flag=self._flag,
+            confirmed=self._confirmed,
+            stop_reason=stop_reason,
+        )
         return SolverResult(
             flag=self._flag,
             status=status,
@@ -1638,12 +1834,23 @@ class CodexSolver:
         if self._interrupt_task and not self._interrupt_task.done():
             self._interrupt_task.cancel()
             await asyncio.gather(self._interrupt_task, return_exceptions=True)
+        tool_tasks = tuple(getattr(self, "_tool_tasks", ()))
+        for task in tool_tasks:
+            if not task.done():
+                task.cancel()
+        if tool_tasks:
+            await asyncio.gather(*tool_tasks, return_exceptions=True)
+        self._tool_tasks.clear()
         if self._reader_task:
             self._reader_task.cancel()
             try:
                 await self._reader_task
-            except asyncio.CancelledError, Exception:
+            except (asyncio.CancelledError, Exception):
                 pass
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            await asyncio.gather(self._stderr_task, return_exceptions=True)
+            self._stderr_task = None
         if self._proc:
             try:
                 self._proc.terminate()

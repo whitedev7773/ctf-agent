@@ -6,6 +6,7 @@ import asyncio
 import itertools
 import json
 import logging
+from collections import deque
 from typing import Any
 
 from backend.agents.coordinator_core import (
@@ -149,78 +150,168 @@ class CodexCoordinator:
         self._thread_id: str | None = None
         self._pending_responses: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
+        self._tool_tasks: set[asyncio.Task] = set()
+        self._tool_call_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
+        self._turn_lock = asyncio.Lock()
+        self._stderr_tail: deque[str] = deque(maxlen=40)
         self._turn_done: asyncio.Event = asyncio.Event()
         self._turn_error: str | None = None
+        self._active_turn_id: str | None = None
 
     async def start(self) -> None:
-        codex_executable = await prepare_codex_cli(
-            getattr(self.deps.settings, "codex_cli_path", ""),
-        )
-        self._proc = await asyncio.create_subprocess_exec(
-            codex_executable, "app-server",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        self._reader_task = asyncio.create_task(self._read_loop())
+        if self._proc is not None:
+            await self._stop_process()
+        self._stderr_tail.clear()
+        try:
+            codex_executable = await prepare_codex_cli(
+                getattr(self.deps.settings, "codex_cli_path", ""),
+            )
+            self._proc = await asyncio.create_subprocess_exec(
+                codex_executable,
+                "app-server",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            self._reader_task = asyncio.create_task(self._read_loop())
+            self._stderr_task = asyncio.create_task(self._read_stderr_loop())
 
-        await self._rpc("initialize", {
-            "clientInfo": {"name": "ctf-coordinator", "version": "2.0.0"},
-            "capabilities": {"experimentalApi": True},
-        })
-        await self._send_notification("initialized", {})
+            await self._rpc(
+                "initialize",
+                {
+                    "clientInfo": {"name": "ctf-coordinator", "version": "2.0.0"},
+                    "capabilities": {"experimentalApi": True},
+                },
+            )
+            await self._send_notification("initialized", {})
 
-        resp = await self._rpc("thread/start", {
-            "model": self.model,
-            "baseInstructions": (
-                COORDINATOR_PROMPT
-                + "\nConfigured solver roster:\n"
-                + format_solver_roster(self.deps.model_specs)
-            ),
-            "cwd": ".",
-            "approvalPolicy": "on-request",
-            "sandbox": "read-only",
-            "dynamicTools": COORDINATOR_TOOLS,
-        })
-        self._thread_id = resp.get("result", {}).get("thread", {}).get("id", "")
-        logger.info(f"Codex coordinator started (thread={self._thread_id}, model={self.model})")
+            resp = await self._rpc(
+                "thread/start",
+                {
+                    "model": self.model,
+                    "baseInstructions": (
+                        COORDINATOR_PROMPT
+                        + "\nConfigured solver roster:\n"
+                        + format_solver_roster(self.deps.model_specs)
+                    ),
+                    "cwd": ".",
+                    "approvalPolicy": "on-request",
+                    "sandbox": "read-only",
+                    "dynamicTools": COORDINATOR_TOOLS,
+                },
+            )
+            self._thread_id = resp.get("result", {}).get("thread", {}).get("id", "")
+            if not self._thread_id:
+                raise RuntimeError("Codex coordinator thread/start returned no thread id")
+            logger.info(
+                "Codex coordinator started (thread=%s, model=%s)",
+                self._thread_id,
+                self.model,
+            )
+        except BaseException:
+            await self._stop_process()
+            raise
 
     async def turn(self, message: str) -> None:
         """Send a message and wait for the model to finish its turn."""
-        if not self._proc or not self._thread_id:
-            await self.start()
+        async with self._turn_lock:
+            if not self._proc or self._proc.returncode is not None or not self._thread_id:
+                if self._proc is not None:
+                    await self._stop_process()
+                await self.start()
 
-        self._turn_done.clear()
-        self._turn_error = None
+            self._turn_done.clear()
+            self._turn_error = None
 
-        await self._rpc("turn/start", {
-            "threadId": self._thread_id,
-            "input": [{"type": "text", "text": message}],
-            "effort": "medium",
-        })
+            response = await self._rpc("turn/start", {
+                "threadId": self._thread_id,
+                "input": [{"type": "text", "text": message}],
+                "effort": "medium",
+            })
+            self._active_turn_id = str(
+                response.get("result", {}).get("turn", {}).get("id", "")
+            ) or None
 
-        try:
-            await asyncio.wait_for(self._turn_done.wait(), timeout=120)
-        except TimeoutError:
-            logger.warning("Codex coordinator turn timed out")
+            try:
+                await asyncio.wait_for(self._turn_done.wait(), timeout=120)
+            except TimeoutError as exc:
+                logger.warning("Codex coordinator turn timed out; interrupting active turn")
+                interrupted = False
+                if self._thread_id and self._active_turn_id:
+                    try:
+                        await self._rpc(
+                            "turn/interrupt",
+                            {
+                                "threadId": self._thread_id,
+                                "turnId": self._active_turn_id,
+                            },
+                            timeout=15,
+                        )
+                        await asyncio.wait_for(self._turn_done.wait(), timeout=15)
+                        interrupted = True
+                    except Exception as interrupt_exc:
+                        logger.warning("Codex coordinator interrupt failed: %s", interrupt_exc)
+                if not interrupted:
+                    await self._stop_process()
+                    raise RuntimeError(
+                        "Codex coordinator turn timed out and could not be interrupted"
+                    ) from exc
+            finally:
+                self._active_turn_id = None
 
-        if self._turn_error:
-            logger.warning(f"Codex coordinator turn error: {self._turn_error}")
+            if self._turn_error:
+                raise RuntimeError(f"Codex coordinator turn failed: {self._turn_error}")
 
     async def stop(self) -> None:
+        await self._stop_process()
+
+    async def _stop_process(self) -> None:
+        tool_tasks = tuple(self._tool_tasks)
+        for task in tool_tasks:
+            if not task.done():
+                task.cancel()
+        if tool_tasks:
+            await asyncio.gather(*tool_tasks, return_exceptions=True)
+        self._tool_tasks.clear()
         if self._reader_task:
             self._reader_task.cancel()
+            await asyncio.gather(self._reader_task, return_exceptions=True)
+            self._reader_task = None
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            await asyncio.gather(self._stderr_task, return_exceptions=True)
+            self._stderr_task = None
         if self._proc:
             try:
                 self._proc.terminate()
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except Exception:
-                self._proc.kill()
+                try:
+                    self._proc.kill()
+                    await asyncio.wait_for(self._proc.wait(), timeout=5)
+                except Exception:
+                    pass
             self._proc = None
+        self._thread_id = None
+        self._active_turn_id = None
 
     # --- JSON-RPC transport ---
 
-    async def _rpc(self, method: str, params: dict | None = None) -> dict:
+    async def _write_message(self, message: dict[str, Any]) -> None:
+        assert self._proc and self._proc.stdin
+        async with self._write_lock:
+            self._proc.stdin.write((json.dumps(message) + "\n").encode())
+            await self._proc.stdin.drain()
+
+    async def _rpc(
+        self,
+        method: str,
+        params: dict | None = None,
+        *,
+        timeout: float = 300,
+    ) -> dict:
         assert self._proc and self._proc.stdin
         msg_id = next(_rpc_counter)
         msg: dict[str, Any] = {"id": msg_id, "method": method}
@@ -230,33 +321,83 @@ class CodexCoordinator:
         future: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
         self._pending_responses[msg_id] = future
 
-        self._proc.stdin.write((json.dumps(msg) + "\n").encode())
-        await self._proc.stdin.drain()
         try:
-            return await asyncio.wait_for(future, timeout=300)
+            await self._write_message(msg)
+            return await asyncio.wait_for(future, timeout=timeout)
         finally:
             self._pending_responses.pop(msg_id, None)
 
     async def _respond_to_request(self, request_id: int, result: Any) -> None:
-        assert self._proc and self._proc.stdin
-        resp = {"id": request_id, "result": result}
-        self._proc.stdin.write((json.dumps(resp) + "\n").encode())
-        await self._proc.stdin.drain()
+        await self._write_message({"id": request_id, "result": result})
 
     async def _send_notification(self, method: str, params: dict | None = None) -> None:
-        assert self._proc and self._proc.stdin
         msg: dict[str, Any] = {"method": method}
         if params:
             msg["params"] = params
-        self._proc.stdin.write((json.dumps(msg) + "\n").encode())
-        await self._proc.stdin.drain()
+        await self._write_message(msg)
+
+    def _fail_transport(self, exc: Exception) -> None:
+        detail = str(exc)
+        if self._stderr_tail:
+            detail = f"{detail}; stderr tail: {' | '.join(self._stderr_tail)[-1000:]}"
+        error = RuntimeError(detail)
+        self._turn_error = detail
+        for future in list(self._pending_responses.values()):
+            if not future.done():
+                future.set_exception(error)
+        self._turn_done.set()
+
+    async def _read_stderr_loop(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", errors="replace").strip()
+            if text:
+                self._stderr_tail.append(text[:1000])
+                logger.debug("Codex coordinator stderr: %s", text[:1000])
+
+    async def _run_tool_call_request(self, request_id: int, params: dict) -> None:
+        try:
+            async with self._tool_call_lock:
+                await self._handle_tool_call(request_id, params)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Coordinator dynamic tool call failed: %s", exc)
+            try:
+                await self._respond_to_request(
+                    request_id,
+                    {
+                        "contentItems": [
+                            {"type": "inputText", "text": f"Tool execution failed: {exc}"}
+                        ],
+                        "success": False,
+                    },
+                )
+            except Exception:
+                pass
+
+    def _tool_task_finished(self, task: asyncio.Task) -> None:
+        self._tool_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
 
     async def _read_loop(self) -> None:
         assert self._proc and self._proc.stdout
         while True:
-            line = await self._proc.stdout.readline()
+            try:
+                line = await self._proc.stdout.readline()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._fail_transport(RuntimeError(f"Codex coordinator read failed: {exc}"))
+                break
             if not line:
-                self._turn_done.set()
+                self._fail_transport(RuntimeError("Codex coordinator closed the connection"))
                 break
             try:
                 msg = json.loads(line)
@@ -280,7 +421,12 @@ class CodexCoordinator:
 
             # Dynamic tool call
             if method == "item/tool/call" and msg_id is not None:
-                await self._handle_tool_call(msg_id, params)
+                task = asyncio.create_task(
+                    self._run_tool_call_request(msg_id, params),
+                    name=f"codex-coordinator-tool-{msg_id}",
+                )
+                self._tool_tasks.add(task)
+                task.add_done_callback(self._tool_task_finished)
 
             # Turn completed
             elif method == "turn/completed":

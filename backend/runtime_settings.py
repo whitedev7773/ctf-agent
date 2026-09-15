@@ -1,4 +1,4 @@
-"""Validated, non-secret runtime settings managed by the local dashboard."""
+"""Validated settings persisted by the local dashboard."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -33,7 +34,9 @@ class RuntimeSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    models: list[str] = Field(default_factory=lambda: list(DEFAULT_MODELS), min_length=1, max_length=4)
+    models: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_MODELS), min_length=1, max_length=4
+    )
     writeup_model_spec: str = "codex/gpt-5.6-terra/medium"
     writeup_review_model_spec: str = "codex/gpt-5.6-luna/medium"
     max_concurrent_challenges: int = Field(default=1, ge=1, le=32)
@@ -41,8 +44,11 @@ class RuntimeSettings(BaseModel):
     container_cpu_limit: float = Field(default=2.0, ge=0.1, le=64.0)
 
     max_attempts_per_challenge: int = Field(default=8, ge=1, le=100)
+    coordinator_max_swarm_runs_per_challenge: int = Field(default=2, ge=1, le=10)
+    coordinator_swarm_retry_delay_seconds: int = Field(default=30, ge=0, le=3600)
     solver_turn_timeout_seconds: int = Field(default=1800, ge=30, le=86_400)
     solver_turn_idle_timeout_seconds: int = Field(default=300, ge=0, le=86_400)
+    solver_guidance_interrupt_min_interval_seconds: int = Field(default=120, ge=0, le=3600)
     solver_max_runtime_seconds: int = Field(default=10_800, ge=60, le=604_800)
     solver_max_steps: int = Field(default=300, ge=1, le=10_000)
     solver_max_tokens: int = Field(default=1_500_000, ge=0, le=100_000_000)
@@ -134,6 +140,30 @@ class RuntimeSettings(BaseModel):
         return self
 
 
+class CTFdSettings(BaseModel):
+    """Locally persisted CTFd connection used to restore dashboard sessions."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    url: str = Field(default="", max_length=2000)
+    token: str = Field(default="", max_length=4000)
+    username: str = Field(default="", max_length=200)
+    password: str = Field(default="", max_length=4000)
+
+    @field_validator("url")
+    @classmethod
+    def _normalize_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            return ""
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("url must be an absolute http(s) URL")
+        if parsed.query or parsed.fragment:
+            raise ValueError("url cannot contain a query string or fragment")
+        return normalized
+
+
 def _validate_model_spec(value: str, *, delegate: bool) -> str:
     spec = str(value).strip()
     parts = spec.split("/")
@@ -151,6 +181,24 @@ def _validate_model_spec(value: str, *, delegate: bool) -> str:
 def runtime_settings_path(challenges_root: str | Path) -> Path:
     """Keep operator preferences beside, but outside, disposable challenge data."""
     return Path(challenges_root).expanduser().resolve().parent / RUNTIME_SETTINGS_FILENAME
+
+
+def _read_settings_document(path: Path) -> dict[str, Any]:
+    try:
+        payload: Any = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError, OSError, json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_settings_document(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def runtime_settings_from(
@@ -177,14 +225,45 @@ def apply_runtime_settings(settings: object, runtime: RuntimeSettings) -> None:
 
 def save_runtime_settings(runtime: RuntimeSettings, challenges_root: str | Path) -> Path:
     path = runtime_settings_path(challenges_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(runtime.model_dump(), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    payload = runtime.model_dump()
+    connection = _read_settings_document(path).get("ctfd")
+    if isinstance(connection, dict):
+        payload["ctfd"] = connection
+    _write_settings_document(path, payload)
     return path
+
+
+def save_ctfd_settings(connection: CTFdSettings, challenges_root: str | Path) -> Path:
+    """Persist a dashboard CTFd connection without disturbing runtime policy."""
+    path = runtime_settings_path(challenges_root)
+    payload = _read_settings_document(path)
+    payload["ctfd"] = connection.model_dump()
+    _write_settings_document(path, payload)
+    return path
+
+
+def load_ctfd_settings(
+    settings: object,
+    challenges_root: str | Path,
+) -> CTFdSettings | None:
+    """Restore a saved CTFd connection, including an explicit disconnected state."""
+    path = runtime_settings_path(challenges_root)
+    raw = _read_settings_document(path).get("ctfd")
+    if raw is None:
+        return None
+    try:
+        connection = CTFdSettings.model_validate(raw)
+    except ValueError as exc:
+        logger.warning("Ignoring invalid dashboard CTFd settings at %s: %s", path, exc)
+        return None
+    for field_name, value in {
+        "ctfd_url": connection.url,
+        "ctfd_token": connection.token,
+        "ctfd_user": connection.username,
+        "ctfd_pass": connection.password,
+    }.items():
+        setattr(settings, field_name, value)
+    return connection
 
 
 def load_runtime_settings(
@@ -201,6 +280,7 @@ def load_runtime_settings(
         raw: Any = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("settings file must contain a JSON object")
+        raw = {key: value for key, value in raw.items() if key != "ctfd"}
         merged = current.model_dump()
         merged.update(raw)
         loaded = RuntimeSettings.model_validate(merged)

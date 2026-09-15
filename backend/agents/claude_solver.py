@@ -117,6 +117,7 @@ class ClaudeSolver:
         self._findings = ""
         self._cost_usd = 0.0
         self._bump_insights: str | None = None
+        self._cancel_reason = ""
 
     async def start(self) -> None:
         await self.sandbox.start()
@@ -393,7 +394,9 @@ class ClaudeSolver:
             return self._result(turn_status, run_steps=run_steps, run_cost=run_cost)
 
         except asyncio.CancelledError:
-            return self._result(CANCELLED)
+            reason = self._cancel_reason or "solver task cancelled without an attributed reason"
+            self._findings = self._findings or reason
+            return self._result(CANCELLED, stop_reason=reason)
         except Exception as e:
             error_str = str(e)
             logger.error(f"[{self.agent_name}] Error: {e}", exc_info=True)
@@ -409,8 +412,19 @@ class ClaudeSolver:
         self.tracer.event("bump", insights=insights[:500])
         logger.info(f"[{self.agent_name}] Bumped with insights (session {self._session_id})")
 
-    def _result(self, status: str, run_steps: int | None = None, run_cost: float | None = None) -> SolverResult:
-        self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed, cost_usd=round(self._cost_usd, 4))
+    def set_cancel_reason(self, reason: str) -> None:
+        clean = " ".join(reason.split())[:1000]
+        if clean:
+            self._cancel_reason = clean
+
+    def _result(
+        self,
+        status: str,
+        run_steps: int | None = None,
+        run_cost: float | None = None,
+        stop_reason: str = "",
+    ) -> SolverResult:
+        self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed, cost_usd=round(self._cost_usd, 4), stop_reason=stop_reason)
         # Use per-run metrics if provided, so broken-solver detection works across bumps
         return SolverResult(
             flag=self._flag, status=status,
@@ -418,6 +432,7 @@ class ClaudeSolver:
             step_count=run_steps if run_steps is not None else self._step_count,
             cost_usd=run_cost if run_cost is not None else self._cost_usd,
             log_path=self.tracer.path,
+            stop_reason=stop_reason,
         )
 
     async def stop(self) -> None:

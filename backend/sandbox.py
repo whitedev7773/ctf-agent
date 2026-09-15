@@ -6,6 +6,7 @@ import asyncio
 import io
 import logging
 import posixpath
+import re
 import secrets
 import shlex
 import tarfile
@@ -25,6 +26,7 @@ CONTAINER_LABEL = "ctf-agent"
 
 # Concurrency control
 _start_semaphore: asyncio.Semaphore | None = None
+_container_semaphore: asyncio.Semaphore | None = None
 _active_count: int = 0
 _count_lock = asyncio.Lock()
 
@@ -32,9 +34,37 @@ _WARN_THRESHOLDS = {100, 200, 500}
 
 
 def configure_semaphore(max_concurrent: int = 50) -> None:
-    """Set the max concurrent container starts. Call once at startup."""
-    global _start_semaphore
-    _start_semaphore = asyncio.Semaphore(max_concurrent)
+    """Set both launch and lifetime limits for solver containers."""
+    global _start_semaphore, _container_semaphore
+    limit = max(1, int(max_concurrent))
+    _start_semaphore = asyncio.Semaphore(limit)
+    _container_semaphore = asyncio.Semaphore(limit)
+
+
+class _ContainerPermit:
+    """Hold one global container slot until DockerSandbox.stop()."""
+
+    def __init__(self, sandbox: DockerSandbox) -> None:
+        self.sandbox = sandbox
+
+    async def __aenter__(self) -> None:
+        global _container_semaphore
+        if _container_semaphore is None:
+            _container_semaphore = asyncio.Semaphore(50)
+        await _container_semaphore.acquire()
+        self.sandbox._permit_semaphore = _container_semaphore
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        if exc_type is not None:
+            try:
+                await self.sandbox.stop()
+            finally:
+                # ``stop`` normally releases this. Keep a final safety release
+                # here in case cleanup itself was cancelled or failed early.
+                permit = self.sandbox._permit_semaphore
+                self.sandbox._permit_semaphore = None
+                if permit is not None:
+                    permit.release()
 
 
 async def _track_start() -> None:
@@ -123,6 +153,8 @@ class DockerSandbox:
     _started_monotonic: float = field(default=0.0, repr=False)
     _sessions: dict[str, InteractiveSession] = field(default_factory=dict, repr=False)
     _session_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _permit_semaphore: asyncio.Semaphore | None = field(default=None, repr=False)
+    _tracked_active: bool = field(default=False, repr=False)
 
     @property
     def container_id(self) -> str:
@@ -134,12 +166,19 @@ class DockerSandbox:
     def _parse_memory_limit(self) -> int:
         s = self.memory_limit.strip().lower()
         try:
-            if s.endswith("g"):
-                return int(s[:-1]) * 1024 * 1024 * 1024
-            if s.endswith("m"):
-                return int(s[:-1]) * 1024 * 1024
-            return int(s)
-        except (ValueError, IndexError):
+            match = re.fullmatch(r"([1-9]\d*(?:\.\d+)?)([kmgt]?)(?:b)?", s)
+            if match is None:
+                raise ValueError(s)
+            value = float(match.group(1))
+            multiplier = {
+                "": 1,
+                "k": 1024,
+                "m": 1024**2,
+                "g": 1024**3,
+                "t": 1024**4,
+            }[match.group(2)]
+            return int(value * multiplier)
+        except (KeyError, ValueError, OverflowError):
             logger.warning("Invalid memory_limit %r, defaulting to 4GB", self.memory_limit)
             return 4 * 1024 * 1024 * 1024
 
@@ -285,8 +324,10 @@ class DockerSandbox:
         )
 
     async def start(self) -> None:
+        if self._container is not None:
+            return
         sem = _start_semaphore or asyncio.Semaphore(50)
-        async with sem:
+        async with _ContainerPermit(self), sem:
             self._docker = aiodocker.Docker()
 
             if self.workspace_dir:
@@ -337,6 +378,7 @@ class DockerSandbox:
             await self._container.start()
             await self._install_terminal_capture_helper()
             await _track_start()
+            self._tracked_active = True
             self._started_monotonic = time.monotonic()
 
             info = await self._container.show()
@@ -612,42 +654,61 @@ class DockerSandbox:
         Path(host_path).write_bytes(data)
 
     async def stop(self) -> None:
-        for session_id in list(self._sessions):
-            await self.session_close(session_id)
-        if self._resource_task:
-            self._resource_task.cancel()
-            await asyncio.gather(self._resource_task, return_exceptions=True)
-            self._resource_task = None
+        permit = self._permit_semaphore
+        self._permit_semaphore = None
+        try:
+            async def close_session(session_id: str) -> None:
+                try:
+                    await asyncio.wait_for(self.session_close(session_id), timeout=10)
+                except TimeoutError:
+                    logger.warning("Timed out closing interactive session %s", session_id)
+                except Exception as exc:
+                    logger.warning("Could not close interactive session %s: %s", session_id, exc)
 
-        if self._container:
-            self._resource_snapshot.update(
-                {
-                    "stale": True,
-                    "status": "stopped",
-                    "sampled_at": datetime.now(UTC).isoformat(),
-                    "history": list(self._resource_history),
-                }
-            )
-            try:
-                await self._container.delete(force=True)
-            except Exception:
-                pass
-            self._container = None
-            await _track_stop()
+            session_ids = list(self._sessions)
+            if session_ids:
+                await asyncio.gather(*(close_session(session_id) for session_id in session_ids))
+            if self._resource_task:
+                self._resource_task.cancel()
+                await asyncio.gather(self._resource_task, return_exceptions=True)
+                self._resource_task = None
 
-        if self._docker:
-            try:
-                await self._docker.close()
-            except Exception:
-                pass
-            self._docker = None
+            if self._container:
+                self._resource_snapshot.update(
+                    {
+                        "stale": True,
+                        "status": "stopped",
+                        "sampled_at": datetime.now(UTC).isoformat(),
+                        "history": list(self._resource_history),
+                    }
+                )
+                try:
+                    await asyncio.wait_for(self._container.delete(force=True), timeout=30)
+                except Exception:
+                    pass
+                self._container = None
+            if self._tracked_active:
+                await _track_stop()
+                self._tracked_active = False
 
-        if self.workspace_dir and not self.keep_workspace:
-            import shutil
-            try:
-                shutil.rmtree(self.workspace_dir, ignore_errors=True)
-            except Exception:
-                pass
-        if not self.keep_workspace:
-            self.workspace_dir = ""
-        logger.info("Sandbox stopped")
+            if self._docker:
+                try:
+                    await asyncio.wait_for(self._docker.close(), timeout=10)
+                except Exception:
+                    pass
+                self._docker = None
+
+            if self.workspace_dir and not self.keep_workspace:
+                import shutil
+
+                try:
+                    shutil.rmtree(self.workspace_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            if not self.keep_workspace:
+                self.workspace_dir = ""
+            logger.info("Sandbox stopped")
+        finally:
+            # Release the lifetime slot even when Docker cleanup is interrupted.
+            if permit is not None:
+                permit.release()

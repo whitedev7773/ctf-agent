@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 # Status constants
 FLAG_FOUND = "flag_found"
@@ -16,8 +16,9 @@ QUOTA_ERROR = "quota_error"
 BUDGET_EXHAUSTED = "budget_exhausted"
 PROGRESS_CHECKPOINT = "progress_checkpoint"
 
-# Flag confirmation markers from CTFd
-CORRECT_MARKERS = ("CORRECT", "ALREADY SOLVED")
+# Only an explicit verifier acceptance proves the submitted value. An
+# ``already_solved`` response describes challenge state, not this candidate.
+CORRECT_MARKERS = ("CORRECT",)
 
 
 def solver_agent_name(challenge_name: str, model_spec: str) -> str:
@@ -43,9 +44,10 @@ class SolverProtocol(Protocol):
 
     model_spec: str
     agent_name: str
-    sandbox: object
+    sandbox: Any
 
     async def start(self) -> None: ...
     async def run_until_done_or_gave_up(self) -> SolverResult: ...
     def bump(self, insights: str) -> None: ...
+    def set_cancel_reason(self, reason: str) -> None: ...
     async def stop(self) -> None: ...

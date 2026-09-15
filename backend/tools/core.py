@@ -3,7 +3,9 @@
 import json
 import re
 import shlex
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
@@ -89,18 +91,51 @@ async def do_list_files(sandbox, path: str = "/challenge/distfiles") -> str:
     return out or f"{path} is empty."
 
 
-async def do_submit_flag(ctfd, challenge_name: str, flag: str) -> tuple[str, bool]:
-    """Submit a flag. Returns (display_message, is_confirmed)."""
+SubmissionStatus = Literal["confirmed", "incorrect", "already_solved", "retryable"]
+
+
+@dataclass(frozen=True)
+class FlagSubmissionOutcome:
+    """Submission result that does not conflate transport failure with rejection."""
+
+    display: str
+    status: SubmissionStatus
+
+    @property
+    def confirmed(self) -> bool:
+        return self.status == "confirmed"
+
+
+async def do_submit_flag_detailed(
+    ctfd,
+    challenge_name: str,
+    flag: str,
+) -> FlagSubmissionOutcome:
+    """Submit a flag while preserving retryable and external-solve states."""
     flag = flag.strip()
     if not flag:
-        return "Empty flag — nothing to submit.", False
+        return FlagSubmissionOutcome("Empty flag - nothing to submit.", "incorrect")
 
     try:
         result = await ctfd.submit_flag(challenge_name, flag)
-        is_confirmed = result.status in ("correct", "already_solved")
-        return result.display, is_confirmed
+        if result.status == "correct":
+            return FlagSubmissionOutcome(result.display, "confirmed")
+        if result.status == "incorrect":
+            return FlagSubmissionOutcome(result.display, "incorrect")
+        if result.status == "already_solved":
+            return FlagSubmissionOutcome(result.display, "already_solved")
+        return FlagSubmissionOutcome(result.display, "retryable")
     except Exception as e:
-        return f"submit_flag error: {e}", False
+        return FlagSubmissionOutcome(
+            f"RETRYABLE SUBMISSION ERROR - candidate was not classified: {e}",
+            "retryable",
+        )
+
+
+async def do_submit_flag(ctfd, challenge_name: str, flag: str) -> tuple[str, bool]:
+    """Compatibility wrapper returning (display_message, is_confirmed)."""
+    outcome = await do_submit_flag_detailed(ctfd, challenge_name, flag)
+    return outcome.display, outcome.confirmed
 
 
 def _is_internal_url(url: str) -> bool:

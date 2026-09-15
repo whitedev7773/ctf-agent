@@ -16,11 +16,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import ClientSession, FormData
 
-from backend.artifacts import challenge_workspace_path
+from backend.artifacts import challenge_shared_path, challenge_workspace_path
 from backend.ctfd import CTFdClient
 from backend.dashboard.server import DashboardServer, _clear_runtime_root
 from backend.prompts import ChallengeMeta, build_prompt
-from backend.runtime_settings import runtime_settings_path
+from backend.runtime_settings import load_ctfd_settings, runtime_settings_path
 from backend.runtime_state import load_dismissed_challenges
 from backend.tracing import SolverTracer
 from backend.writeups import finalize_writeup
@@ -98,6 +98,26 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         await self.deps.ctfd.close()
         self.temp_dir.cleanup()
 
+    async def test_registered_attachment_download(self) -> None:
+        directory = self.challenges_root / "intro"
+        dist = directory / "distfiles"
+        dist.mkdir(parents=True)
+        (dist / "sample.txt").write_text("sample attachment", encoding="utf-8")
+        (directory / "metadata.yaml").write_text("private metadata", encoding="utf-8")
+        self.deps.challenge_dirs["web/intro"] = str(directory)
+        async with self.client.get(f"{self.base_url}/api/attachment", params={
+            "challenge": "web/intro", "path": "sample.txt",
+        }) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.text(), "sample attachment")
+            self.assertTrue(response.headers["Content-Disposition"].startswith("attachment;"))
+            self.assertEqual(response.headers["Content-Type"], "application/octet-stream")
+        for name, filename in [("missing", "sample.txt"), ("web/intro", "missing.txt"), ("web/intro", "../metadata.yaml")]:
+            async with self.client.get(f"{self.base_url}/api/attachment", params={
+                "challenge": name, "path": filename,
+            }) as response:
+                self.assertEqual(response.status, 404)
+
     async def test_status_and_assets_are_served_locally(self) -> None:
         async with self.client.get(f"{self.base_url}/") as response:
             html = await response.text()
@@ -112,7 +132,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["stats"]["total"], 1)
             self.assertEqual(payload["challenges"][0]["name"], "web/intro")
             self.assertEqual(payload["challenges"][0]["status"], "idle")
-            self.assertEqual(payload["runtime_revision"], 20)
+            self.assertEqual(payload["runtime_revision"], 21)
             self.assertTrue(callable(self.deps.request_writeup_generation))
             self.assertFalse(payload["restart_required"])
             self.assertTrue(payload["runtime_policy"]["adaptive_delegation"])
@@ -161,14 +181,11 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('node("button", "challenge-name")', javascript)
             self.assertNotIn("row.tabIndex = 0", javascript)
             self.assertIn("traces: new Map()", javascript)
-            self.assertIn(
-                "state.traces.get(challenge.name)?.get(agent.model_spec)",
-                javascript,
-            )
+            self.assertIn("challengeTraces.get(model)", javascript)
             self.assertIn("state.traces.delete(name)", javascript)
-            self.assertIn("currentOutput.scrollTop = currentOutput.scrollHeight", javascript)
-            self.assertIn('currentOutput.setAttribute("aria-label", "최근 solver trace")', javascript)
-            self.assertIn("currentOutput.focus({ preventScroll: true })", javascript)
+            self.assertIn("openWorkspaceModal", javascript)
+            self.assertIn('output.setAttribute("aria-label", "최근 solver trace")', javascript)
+            self.assertIn("confirmAction", javascript)
             self.assertIn("challengeMatchesFilters", javascript)
             self.assertIn("filtersFromLocation", javascript)
 
@@ -232,6 +249,104 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             clock.stop()
         with patch("backend.runtime_clock.time.monotonic", return_value=900):
             self.assertEqual(self.server._snapshot()["challenges"][0]["elapsed_seconds"], 300)
+
+    async def test_solution_review_agent_is_created_on_demand_and_stopped(self) -> None:
+        shared = Path(challenge_shared_path(self.deps.settings, "web/intro"))
+        started = asyncio.Event()
+        finish = asyncio.Event()
+        stopped = asyncio.Event()
+        active_solver = SimpleNamespace(bump=MagicMock())
+        active_swarm = SimpleNamespace(
+            cancel_event=asyncio.Event(),
+            solution_review_directive="",
+            solvers={"codex/gpt-5.6-sol/high": active_solver},
+        )
+        swarm_gate = asyncio.Event()
+        swarm_task = asyncio.create_task(swarm_gate.wait())
+
+        class FakeSolutionReviewer:
+            model_spec = "codex/gpt-5.6-luna/medium"
+            agent_name = "web/intro/codex/gpt-5.6-luna/medium/solution-review"
+            _step_count = 3
+            activity_summary = "풀이 검토: 근거와 활성 가설을 대조하는 중"
+            sandbox = SimpleNamespace(
+                workspace_dir="review-workspace",
+                resource_snapshot=lambda: {"status": "running"},
+            )
+
+            def activity_idle_seconds(self):
+                return 1.5
+
+            async def run_until_done_or_gave_up(self):
+                started.set()
+                await finish.wait()
+                report = shared / "review" / "CURRENT_SOLUTION_REVIEW.md"
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    "## 판정\nON_TRACK\n\n## 확인된 근거\n- E-001\n\n"
+                    "## 위험 신호\n- 없음\n\n## 다음 권고\n1. 최소 재현을 실행합니다.\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(status="gave_up", findings_summary="reviewed")
+
+            async def stop(self):
+                stopped.set()
+
+        self.server._create_solution_reviewer = MagicMock(
+            return_value=FakeSolutionReviewer()
+        )
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+
+        endpoint = f"{self.base_url}/api/control/review-solution"
+        async with self.client.post(
+            endpoint,
+            json={"challenge": "web/intro"},
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            payload = await response.json()
+        self.assertEqual(response.status, 202)
+        self.assertEqual(payload["review"]["status"], "running")
+        await started.wait()
+
+        async with self.client.get(f"{self.base_url}/api/status") as response:
+            running = await response.json()
+        self.assertTrue(running["challenges"][0]["solution_review"]["active"])
+        self.assertEqual(running["stats"]["active_agents"], 1)
+
+        async with self.client.post(
+            endpoint,
+            json={"challenge": "web/intro"},
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            self.assertEqual(response.status, 409)
+
+        task = self.server._solution_review_tasks["web/intro"]
+        self.deps.swarms["web/intro"] = active_swarm
+        self.deps.swarm_tasks["web/intro"] = swarm_task
+        finish.set()
+        await task
+        await asyncio.sleep(0)
+        self.assertTrue(stopped.is_set())
+        self.assertNotIn("web/intro", self.server._solution_reviewers)
+        self.assertNotIn("web/intro", self.server._solution_review_tasks)
+
+        async with self.client.get(
+            f"{self.base_url}/api/solution-review",
+            params={"challenge": "web/intro"},
+        ) as response:
+            completed = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(completed["review"]["status"], "complete")
+        self.assertFalse(completed["review"]["active"])
+        self.assertIn("ON_TRACK", completed["review"]["report"])
+        delivered = active_solver.bump.call_args.args[0]
+        self.assertIn("CURRENT_SOLUTION_REVIEW.md", delivered)
+        self.assertIn("ON_TRACK", delivered)
+        active_solver.bump.assert_called_once_with(delivered)
+        self.assertEqual(active_swarm.solution_review_directive, delivered)
+        swarm_task.cancel()
+        await asyncio.gather(swarm_task, return_exceptions=True)
 
     async def test_codex_usage_endpoint_supports_cached_and_forced_reads(self) -> None:
         await self.server.codex_usage_monitor.stop()
@@ -863,6 +978,52 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.deps.ctfd.is_configured)
         self.assertTrue(self.deps.no_submit)
         self.poller.reseed.assert_awaited_once()
+        restarted = SimpleNamespace(
+            ctfd_url="https://stale.example.com",
+            ctfd_token="stale",
+            ctfd_user="stale",
+            ctfd_pass="stale",
+        )
+        restored = load_ctfd_settings(restarted, self.deps.challenges_root)
+        self.assertIsNotNone(restored)
+        self.assertEqual(restarted.ctfd_url, "")
+        self.assertEqual(restarted.ctfd_token, "")
+
+    async def test_dashboard_ctfd_connection_survives_restart(self) -> None:
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+
+        with patch.object(
+            CTFdClient,
+            "fetch_challenge_stubs",
+            AsyncMock(return_value=[]),
+        ):
+            async with self.client.post(
+                f"{self.base_url}/api/settings/ctfd",
+                json={
+                    "url": "https://ctf.example.com/",
+                    "token": "saved-token",
+                    "username": "researcher",
+                    "password": "saved-password",
+                },
+                headers={"X-CTF-Dashboard-Token": token},
+            ) as response:
+                payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertNotIn("saved-token", json.dumps(payload))
+        restarted = SimpleNamespace(
+            ctfd_url="",
+            ctfd_token="",
+            ctfd_user="",
+            ctfd_pass="",
+        )
+        restored = load_ctfd_settings(restarted, self.deps.challenges_root)
+        self.assertIsNotNone(restored)
+        self.assertEqual(restarted.ctfd_url, "https://ctf.example.com")
+        self.assertEqual(restarted.ctfd_token, "saved-token")
+        self.assertEqual(restarted.ctfd_user, "researcher")
+        self.assertEqual(restarted.ctfd_pass, "saved-password")
 
     async def test_runtime_settings_are_validated_persisted_and_reset(self) -> None:
         async with self.client.get(f"{self.base_url}/api/session") as response:
@@ -976,6 +1137,43 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["stats"]["solved"], 0)
         self.assertEqual(payload["stats"]["candidates"], 1)
 
+    async def test_alternate_format_candidate_is_labeled_without_being_discarded(self) -> None:
+        self.deps.candidates["web/intro"] = {
+            "flag": "GoN{native}",
+            "flags": ["GoN{native}", "TEAM{transformed}"],
+            "format_hint": "TEAM{...}",
+            "format_mismatches": ["GoN{native}"],
+            "status": "unverified",
+            "review_required": True,
+        }
+
+        async with self.client.get(f"{self.base_url}/api/status") as response:
+            payload = await response.json()
+
+        challenge = payload["challenges"][0]
+        self.assertEqual(challenge["candidates"], ["GoN{native}", "TEAM{transformed}"])
+        self.assertEqual(challenge["format_mismatch_candidates"], ["GoN{native}"])
+        self.assertEqual(challenge["candidate_format_hint"], "TEAM{...}")
+
+    async def test_rejected_candidate_is_visible_without_looking_pending(self) -> None:
+        self.deps.candidates["web/intro"] = {
+            "flag": "",
+            "flags": [],
+            "rejected_flags": ["TEAM{wrong}"],
+            "status": "rejected",
+            "review_required": False,
+        }
+
+        async with self.client.get(f"{self.base_url}/api/status") as response:
+            payload = await response.json()
+
+        challenge = payload["challenges"][0]
+        self.assertEqual(challenge["status"], "idle")
+        self.assertEqual(challenge["candidate"], "")
+        self.assertEqual(challenge["rejected_candidates"], ["TEAM{wrong}"])
+        self.assertFalse(challenge["candidate_review_required"])
+        self.assertEqual(payload["stats"]["candidates"], 0)
+
     async def test_operator_can_confirm_pending_local_candidate(self) -> None:
         self.deps.candidates["web/intro"] = {
             "flag": "TEAM{guess}",
@@ -1001,6 +1199,33 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("LOCAL CONFIRMED", payload["message"])
         self.assertEqual(self.deps.results["web/intro"]["flag"], "TEAM{guess}")
         self.assertNotIn("web/intro", self.deps.candidates)
+
+    async def test_rejecting_one_candidate_keeps_the_next_one_pending(self) -> None:
+        self.deps.candidates["web/intro"] = {
+            "flag": "TEAM{first}",
+            "flags": ["TEAM{first}", "TEAM{second}"],
+            "status": "unverified",
+            "review_required": True,
+        }
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+
+        async with self.client.post(
+            f"{self.base_url}/api/control/review-candidate",
+            json={
+                "challenge": "web/intro",
+                "flag": "TEAM{first}",
+                "accepted": False,
+            },
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            self.assertEqual(response.status, 200)
+
+        record = self.deps.candidates["web/intro"]
+        self.assertEqual(record["flag"], "TEAM{second}")
+        self.assertEqual(record["flags"], ["TEAM{second}"])
+        self.assertTrue(record["review_required"])
+        self.assertEqual(record["status"], "unverified")
 
     async def test_dashboard_registers_local_challenge_with_attachment(self) -> None:
         async with self.client.get(f"{self.base_url}/api/session") as response:
@@ -1036,6 +1261,109 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((Path(challenge_dir) / "distfiles" / "chall").read_bytes(), b"ELF")
         self.assertEqual((Path(challenge_dir) / "distfiles" / "libc.so.6").read_bytes(), b"LIBC")
+
+    async def test_dashboard_registers_local_challenge_without_attachment(self) -> None:
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+
+        async with self.client.post(
+            f"{self.base_url}/api/challenges/local",
+            json={
+                "name": "local-no-files",
+                "category": "crypto",
+                "description": "numbers only",
+                "connection_info": "",
+                "flag_format": "TEAM{...}",
+                "value": 75,
+            },
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["challenge"], "local-no-files")
+        self.assertEqual(payload["file_count"], 0)
+        challenge_dir = Path(self.deps.challenge_dirs["local-no-files"])
+        self.assertTrue((challenge_dir / "metadata.yml").is_file())
+        self.assertFalse((challenge_dir / "distfiles").exists())
+
+    async def test_failed_registration_commit_rolls_back_new_directory(self) -> None:
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+
+        with patch(
+            "backend.dashboard.server.persist_deps_state",
+            side_effect=OSError("state file unavailable"),
+        ):
+            async with self.client.post(
+                f"{self.base_url}/api/challenges/local",
+                json={
+                    "name": "rollback-registration",
+                    "category": "misc",
+                    "flag_format": "TEAM{...}",
+                    "value": 0,
+                },
+                headers={"X-CTF-Dashboard-Token": token},
+            ) as response:
+                self.assertEqual(response.status, 500)
+
+        self.assertNotIn("rollback-registration", self.deps.challenge_dirs)
+        self.assertNotIn("rollback-registration", self.deps.challenge_metas)
+        self.assertFalse((self.challenges_root / "rollback-registration").exists())
+
+    async def test_spawn_response_distinguishes_capacity_from_started_work(self) -> None:
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+        headers = {"X-CTF-Dashboard-Token": token}
+
+        with patch(
+            "backend.agents.coordinator_core.do_spawn_swarm",
+            new=AsyncMock(return_value="At capacity (1/1 challenges running)."),
+        ):
+            async with self.client.post(
+                f"{self.base_url}/api/control/spawn",
+                json={"challenge": "web/intro"},
+                headers=headers,
+            ) as response:
+                payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertFalse(payload["started"])
+        self.assertIn("capacity", payload["message"])
+
+        with patch(
+            "backend.agents.coordinator_core.do_spawn_swarm",
+            new=AsyncMock(side_effect=RuntimeError("docker unavailable")),
+        ):
+            async with self.client.post(
+                f"{self.base_url}/api/control/spawn",
+                json={"challenge": "web/intro"},
+                headers=headers,
+            ) as response:
+                payload = await response.json()
+        self.assertEqual(response.status, 500)
+        self.assertFalse(payload["started"])
+        self.assertIn("docker unavailable", payload["message"])
+
+        gate = asyncio.Event()
+        task = asyncio.create_task(gate.wait())
+        self.deps.swarms["web/intro"] = SimpleNamespace(cancel_event=asyncio.Event())
+        self.deps.swarm_tasks["web/intro"] = task
+        try:
+            with patch(
+                "backend.agents.coordinator_core.do_spawn_swarm",
+                new=AsyncMock(return_value="Swarm still running for web/intro"),
+            ):
+                async with self.client.post(
+                    f"{self.base_url}/api/control/spawn",
+                    json={"challenge": "web/intro"},
+                    headers=headers,
+                ) as response:
+                    payload = await response.json()
+            self.assertTrue(payload["started"])
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_delete_challenge_stops_work_and_removes_only_its_runtime_data(self) -> None:
         challenge_dir = self.challenges_root / "web-intro"

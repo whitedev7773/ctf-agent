@@ -13,6 +13,7 @@ from backend.artifacts import challenge_shared_path, challenge_workspace_path
 from backend.experience import experience_summary, promote_challenge_experience
 from backend.prompts import (
     ChallengeMeta,
+    build_solution_review_prompt,
     build_writeup_prompt,
     build_writeup_review_prompt,
     build_writeup_revision_prompt,
@@ -116,6 +117,11 @@ class KnowledgeArtifactTests(unittest.TestCase):
         self.assertIn("existing verified reproducer", reviewer)
         self.assertIn("REVIEW.md", reviser)
         self.assertIn("Do not edit REVIEW.md", reviser)
+
+        current_review = build_solution_review_prompt(meta)
+        self.assertIn("CURRENT_SOLUTION_REVIEW.md", current_review)
+        self.assertIn("ON_TRACK", current_review)
+        self.assertIn("do not take ownership of solving", current_review)
 
     def test_writeup_review_verdict_requires_a_fresh_review(self) -> None:
         root = Path(challenge_workspace_path(self.settings, "review verdict"))

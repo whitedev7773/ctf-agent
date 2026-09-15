@@ -32,7 +32,7 @@ def _clean_records(value: Any) -> dict[str, dict]:
         if not name:
             continue
         record: dict[str, Any] = {}
-        for key in ("flag", "submit", "source", "status"):
+        for key in ("flag", "submit", "source", "status", "format_hint"):
             item = raw_record.get(key)
             if isinstance(item, str):
                 record[key] = item[:4000]
@@ -47,6 +47,11 @@ def _clean_records(value: Any) -> dict[str, dict]:
             record["rejected_flags"] = [
                 item[:4000] for item in rejected_flags if isinstance(item, str)
             ][:50]
+        format_mismatches = raw_record.get("format_mismatches")
+        if isinstance(format_mismatches, list):
+            record["format_mismatches"] = [
+                item[:4000] for item in format_mismatches if isinstance(item, str)
+            ][:20]
         sources = raw_record.get("sources")
         if isinstance(sources, list):
             record["sources"] = [item[:500] for item in sources if isinstance(item, str)][:20]

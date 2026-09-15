@@ -5,7 +5,8 @@ cd /d "%~dp0"
 
 if not defined CTF_AGENT_PORT set "CTF_AGENT_PORT=9400"
 if not defined CTF_AGENT_HOST set "CTF_AGENT_HOST=0.0.0.0"
-if not defined CTF_AGENT_MAX_CHALLENGES set "CTF_AGENT_MAX_CHALLENGES=3"
+set "CTF_AGENT_MAX_CHALLENGES_ARG="
+if defined CTF_AGENT_MAX_CHALLENGES set "CTF_AGENT_MAX_CHALLENGES_ARG=--max-challenges %CTF_AGENT_MAX_CHALLENGES%"
 
 where uv >nul 2>nul
 if errorlevel 1 (
@@ -58,7 +59,7 @@ echo [Mode] Configure CTFd in the dashboard or use a local challenge.
 echo [Stop] Press Ctrl+C in this window.
 echo.
 
-".venv\Scripts\python.exe" -m backend.cli --dashboard-host %CTF_AGENT_HOST% --dashboard-port %CTF_AGENT_PORT% --max-challenges %CTF_AGENT_MAX_CHALLENGES% %*
+".venv\Scripts\python.exe" -m backend.cli --dashboard-host %CTF_AGENT_HOST% --dashboard-port %CTF_AGENT_PORT% %CTF_AGENT_MAX_CHALLENGES_ARG% %*
 set "CTF_AGENT_EXIT_CODE=%ERRORLEVEL%"
 
 if not "%CTF_AGENT_EXIT_CODE%"=="0" (

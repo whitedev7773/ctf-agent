@@ -9,7 +9,8 @@ from backend.tools.core import do_submit_flag
 async def submit_flag(ctx: RunContext[SolverDeps], flag: str) -> str:
     """Submit a flag to CTFd to verify it. Always call this before reporting a flag.
 
-    Returns CORRECT, ALREADY SOLVED, or INCORRECT.
+    Only CORRECT confirms this exact candidate. ALREADY SOLVED EXTERNALLY does
+    not verify the submitted value; retryable errors leave it unclassified.
     Do NOT submit placeholder flags like CTF{flag} or CTF{placeholder}.
     """
     if ctx.deps.no_submit:

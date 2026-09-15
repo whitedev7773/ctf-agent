@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -20,8 +21,9 @@ from backend.artifacts import (
     solver_workspace_path,
     workspace_resume_manifest,
 )
-from backend.budgets import solver_token_limits, token_metrics
+from backend.budgets import solver_step_limit, solver_token_limits, token_metrics
 from backend.challenge_profiles import external_skill_path, solver_role
+from backend.config import Settings
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.deps import SolverDeps
@@ -40,7 +42,6 @@ from backend.sandbox import DockerSandbox
 from backend.solver_base import (
     BUDGET_EXHAUSTED,
     CANCELLED,
-    CORRECT_MARKERS,
     ERROR,
     FLAG_FOUND,
     SolverResult,
@@ -110,7 +111,7 @@ class TracingToolset(WrapperToolset[SolverDeps]):
             )
 
         # Check for confirmed flag
-        if name == "submit_flag" and any(m in result_str for m in CORRECT_MARKERS):
+        if name == "submit_flag" and re.search(r"(?:^|\n)CORRECT\b", result_str):
             self.tracer.event("flag_confirmed", tool=name, step=step)
 
         return result
@@ -138,12 +139,14 @@ class Solver:
         meta: ChallengeMeta,
         ctfd: CTFdClient,
         cost_tracker: CostTracker,
-        settings: object,
+        settings: Settings,
         cancel_event: asyncio.Event | None = None,
         sandbox: DockerSandbox | None = None,
         owns_sandbox: bool | None = None,
+        lane_model_spec: str | None = None,
     ) -> None:
         self.model_spec = model_spec
+        self.lane_model_spec = lane_model_spec or model_spec
         self.model_id = model_id_from_spec(model_spec)
         self.challenge_dir = challenge_dir
         self.meta = meta
@@ -153,7 +156,7 @@ class Solver:
         self.cancel_event = cancel_event or asyncio.Event()
         self._owns_sandbox = owns_sandbox if owns_sandbox is not None else (sandbox is None)
 
-        workspace_dir = solver_workspace_path(settings, meta.name, model_spec)
+        workspace_dir = solver_workspace_path(settings, meta.name, self.lane_model_spec)
         self.sandbox = sandbox or DockerSandbox(
             image=getattr(settings, "sandbox_image", "ctf-sandbox"),
             challenge_dir=challenge_dir,
@@ -185,16 +188,17 @@ class Solver:
         self.loop_detector = LoopDetector()
         self.tracer = SolverTracer(
             meta.name,
-            self.model_spec,
+            self.lane_model_spec,
             log_dir=getattr(settings, "logs_root", "logs"),
         )
-        self.agent_name = solver_agent_name(meta.name, self.model_spec)
+        self.agent_name = solver_agent_name(meta.name, self.lane_model_spec)
         self._agent: Agent[SolverDeps, SolverTurnOutput] | None = None
         self._messages: list = []
         self._step_count = [0]  # mutable ref shared with TracingToolset
         self._flag: str | None = None
         self._confirmed: bool = False
         self._findings: str = ""
+        self._cancel_reason = ""
 
     async def start(self) -> None:
         """Start the sandbox and build the agent."""
@@ -210,7 +214,7 @@ class Solver:
             self.meta,
             distfile_names,
             container_arch=container_arch,
-            model_spec=self.model_spec,
+            model_spec=self.lane_model_spec,
             resume_manifest=workspace_resume_manifest(
                 self.sandbox.workspace_dir,
                 self.sandbox.shared_workspace_dir,
@@ -240,7 +244,8 @@ class Solver:
             "start",
             challenge=self.meta.name,
             model=self.model_id,
-            role=solver_role(self.model_spec).key,
+            role=solver_role(self.lane_model_spec).key,
+            provider_model_spec=self.model_spec,
             skill=external_skill_path(self.meta.category),
         )
         logger.info(f"[{self.agent_name}] Solver started")
@@ -261,11 +266,11 @@ class Solver:
                 prior_usage.usage.cache_read_tokens if prior_usage else 0,
                 getattr(self.settings, "solver_cached_token_weight", 0.10),
             )
-            limits = solver_token_limits(self.settings, self.model_spec)
+            limits = solver_token_limits(self.settings, self.lane_model_spec)
             remaining_tokens = (
                 limits.raw_tokens - metrics.raw_tokens if limits.raw_tokens else None
             )
-            max_steps = max(1, int(getattr(self.settings, "solver_max_steps", 240)))
+            max_steps = solver_step_limit(self.settings, self.lane_model_spec)
             remaining_steps = max_steps - self._step_count[0]
             if (
                 limits.effective_tokens
@@ -344,7 +349,9 @@ class Solver:
             return self._result(assessment.status)
 
         except asyncio.CancelledError:
-            return self._result(CANCELLED)
+            reason = self._cancel_reason or "solver task cancelled without an attributed reason"
+            self._findings = self._findings or reason
+            return self._result(CANCELLED, stop_reason=reason)
         except UsageLimitExceeded as exc:
             reason = f"provider usage budget exhausted during turn: {exc}"
             self._findings = reason
@@ -376,6 +383,11 @@ class Solver:
         self.tracer.event("bump", insights=insights[:500])
         logger.info(f"[{self.agent_name}] Bumped with sibling insights")
 
+    def set_cancel_reason(self, reason: str) -> None:
+        clean = " ".join(reason.split())[:1000]
+        if clean:
+            self._cancel_reason = clean
+
     def _result(
         self,
         status: str,
@@ -385,7 +397,7 @@ class Solver:
     ) -> SolverResult:
         agent_usage = self.cost_tracker.by_agent.get(self.agent_name)
         cost = agent_usage.cost_usd if agent_usage else 0.0
-        self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed, cost_usd=round(cost, 4))
+        self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed, cost_usd=round(cost, 4), stop_reason=stop_reason)
         return SolverResult(
             flag=self._flag,
             status=status,

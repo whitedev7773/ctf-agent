@@ -181,3 +181,4 @@ async def run_claude_coordinator(
                 logger.warning("Coordinator turn produced no messages!")
 
         return await run_event_loop(deps, ctfd, cost_tracker, turn_fn)
+    raise RuntimeError("Claude coordinator context exited without a result")

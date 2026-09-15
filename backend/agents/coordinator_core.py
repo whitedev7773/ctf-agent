@@ -19,11 +19,127 @@ from backend.writeups import finalize_writeup
 
 logger = logging.getLogger(__name__)
 
+_SOLUTION_REVIEW_CONTAINER_PATH = (
+    "/challenge/shared/review/CURRENT_SOLUTION_REVIEW.md"
+)
+
+
+def _merge_candidate_record(
+    deps: CoordinatorDeps,
+    challenge_name: str,
+    flags: list[str],
+    *,
+    source: str,
+) -> dict:
+    """Merge candidates without losing alternate wrappers or prior review history."""
+    from backend.flag_format import flag_matches_format
+
+    record = dict(deps.candidates.get(challenge_name, {}))
+    rejected = {
+        item
+        for item in record.get("rejected_flags", [])
+        if isinstance(item, str) and item.strip()
+    }
+    merged_flags = [
+        item
+        for item in [record.get("flag"), *record.get("flags", []), *flags]
+        if isinstance(item, str) and item.strip()
+    ]
+    merged_flags = [
+        item
+        for item in dict.fromkeys(item.strip() for item in merged_flags)
+        if item not in rejected
+    ][:20]
+    meta = deps.challenge_metas.get(challenge_name)
+    format_hint = str(getattr(meta, "flag_format", "") or "") if meta else ""
+    mismatches = [
+        item
+        for item in [*record.get("format_mismatches", []), *merged_flags]
+        if isinstance(item, str) and not flag_matches_format(item, format_hint)
+    ]
+    sources = [
+        item
+        for item in [*record.get("sources", []), record.get("source"), source]
+        if isinstance(item, str) and item.strip()
+    ]
+    record.update(
+        {
+            "flag": merged_flags[0] if merged_flags else "",
+            "flags": merged_flags,
+            "sources": list(dict.fromkeys(sources))[:20],
+            "source": source,
+            "status": "unverified" if merged_flags else record.get("status", "unverified"),
+            "review_required": bool(merged_flags),
+            "format_hint": format_hint,
+            "format_mismatches": list(dict.fromkeys(mismatches))[:20],
+        }
+    )
+    deps.candidates[challenge_name] = record
+    return record
+
+
+def solution_review_guidance(settings: object, challenge_name: str) -> str:
+    """Load the latest successful review as bounded solver guidance.
+
+    The report itself is the restart-safe queue: it lives in the challenge's
+    shared workspace, so a new coordinator process can still attach it to the
+    next swarm without adding another runtime-state format.
+    """
+    report_path = (
+        Path(challenge_shared_path(settings, challenge_name))
+        / "review"
+        / "CURRENT_SOLUTION_REVIEW.md"
+    )
+    try:
+        report = report_path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return ""
+    if not report:
+        return ""
+    prefix = (
+        "An independent review of the current solution has completed. Read the full "
+        f"report at `{_SOLUTION_REVIEW_CONTAINER_PATH}` and incorporate its verified "
+        "risks and next recommendations before choosing the next experiment. Treat it "
+        "as review guidance and independently verify decisive claims.\n\n"
+        "## Independent solution review\n\n"
+    )
+    return prefix + report[: max(0, 6000 - len(prefix))]
+
+
+async def deliver_solution_review(deps: CoordinatorDeps, challenge_name: str) -> bool:
+    """Push a completed review into a live swarm, if one is still solving."""
+    guidance = solution_review_guidance(deps.settings, challenge_name)
+    if not guidance:
+        return False
+    swarm = getattr(deps, "swarms", {}).get(challenge_name)
+    task = getattr(deps, "swarm_tasks", {}).get(challenge_name)
+    if (
+        swarm is None
+        or task is None
+        or task.done()
+        or (
+            getattr(swarm, "cancel_event", None) is not None
+            and swarm.cancel_event.is_set()
+        )
+    ):
+        return False
+
+    # Persist it on the live swarm for delayed and dynamically-created workers.
+    # bump() reaches already-instantiated workers; Codex queues every update and
+    # debounces repeated active-turn interrupts.
+    swarm.solution_review_directive = guidance
+    current_solvers = dict(getattr(swarm, "solvers", {}))
+    for solver in tuple(current_solvers.values()):
+        bump = getattr(solver, "bump", None)
+        if callable(bump):
+            bump(guidance)
+    return True
+
 
 def _trace_timestamp(value: object) -> str:
     """Format an epoch trace timestamp in the server's local timezone."""
     try:
-        timestamp = datetime.fromtimestamp(float(value)).astimezone()
+        timestamp = datetime.fromtimestamp(float(str(value))).astimezone()
     except (TypeError, ValueError, OSError, OverflowError):
         return "[time unknown]"
     return f"[{timestamp.isoformat(sep=' ', timespec='milliseconds')}]"
@@ -127,6 +243,10 @@ async def do_spawn_swarm(
         deps.challenge_dirs[challenge_name] = ch_dir
         deps.challenge_metas[challenge_name] = ChallengeMeta.from_yaml(Path(ch_dir) / "metadata.yml")
 
+    # A completed review may have arrived after the previous swarm stopped.
+    # Reattach it to every subsequent solve so it is not stranded in the UI.
+    review_guidance = solution_review_guidance(deps.settings, challenge_name)
+
     from backend.agents.swarm import ChallengeSwarm
 
     # A dashboard policy update applies to future work only. Solvers repeatedly
@@ -146,23 +266,31 @@ async def do_spawn_swarm(
         no_submit=deps.no_submit,
         coordinator_inbox=deps.coordinator_inbox,
         feedback_directive=feedback,
+        solution_review_directive=review_guidance,
     )
     deps.swarms[challenge_name] = swarm
+    run_counts = getattr(deps, "swarm_run_counts", None)
+    if run_counts is None:
+        run_counts = {}
+        deps.swarm_run_counts = run_counts
+    retry_after = getattr(deps, "swarm_retry_after", None)
+    if retry_after is None:
+        retry_after = {}
+        deps.swarm_retry_after = retry_after
+    run_counts[challenge_name] = run_counts.get(challenge_name, 0) + 1
+    retry_after.pop(challenge_name, None)
 
     async def _run_and_cleanup() -> None:
         result = await swarm.run()
-        if swarm.candidates:
-            flags = sorted(
-                {candidate.flag for candidate in swarm.candidates.values() if candidate.flag}
+        flags = swarm.all_candidate_flags()
+        if flags:
+            sources = ", ".join(sorted(swarm.candidate_flags or swarm.candidates))
+            _merge_candidate_record(
+                deps,
+                challenge_name,
+                flags,
+                source=sources or "solver",
             )
-            if flags:
-                deps.candidates[challenge_name] = {
-                    "flag": flags[0],
-                    "flags": flags,
-                    "sources": sorted(swarm.candidates),
-                    "status": "unverified",
-                    "review_required": True,
-                }
         # A solved result must have been confirmed by the live submission path.
         if result and result.status == FLAG_FOUND:
             deps.results[challenge_name] = {
@@ -205,42 +333,53 @@ async def do_check_swarm_status(deps: CoordinatorDeps, challenge_name: str) -> s
 
 async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) -> str:
     from backend.flag_format import flag_matches_format
+    from backend.tools.core import do_submit_flag_detailed
 
     candidate = flag.strip()
     meta = deps.challenge_metas.get(challenge_name)
     format_hint = getattr(meta, "flag_format", "") if meta else ""
-    if not flag_matches_format(candidate, format_hint):
-        return f'REJECTED — candidate does not match flag format "{format_hint}".'
+    if not candidate:
+        return "REJECTED — empty flag candidate."
+    format_mismatch = not flag_matches_format(candidate, format_hint)
+    format_warning = ""
+    if format_mismatch:
+        _merge_candidate_record(
+            deps,
+            challenge_name,
+            [candidate],
+            source="operator/format-mismatch",
+        )
+        swarm = getattr(deps, "swarms", {}).get(challenge_name)
+        if swarm is not None:
+            swarm.record_candidate("operator/coordinator", candidate)
+        persist_deps_state(deps)
+        format_warning = (
+            f'FORMAT-HINT MISMATCH - preserved exact value "{candidate}" even though it does '
+            f'not match "{format_hint}"; the configured verifier remains authoritative.\n'
+        )
 
     if not deps.ctfd.is_configured:
-        deps.candidates[challenge_name] = {
-            "flag": candidate,
-            "flags": [candidate],
-            "source": "operator",
-            "status": "unverified",
-            "review_required": True,
-        }
+        _merge_candidate_record(deps, challenge_name, [candidate], source="operator")
         persist_deps_state(deps)
-        return f'LOCAL CANDIDATE — recorded "{candidate}" for {challenge_name}'
+        return format_warning + f'LOCAL CANDIDATE — recorded "{candidate}" for {challenge_name}'
     if deps.no_submit:
-        deps.candidates[challenge_name] = {
-            "flag": candidate,
-            "flags": [candidate],
-            "source": "operator/dry-run",
-            "status": "unverified",
-            "review_required": True,
-        }
+        _merge_candidate_record(deps, challenge_name, [candidate], source="operator/dry-run")
         persist_deps_state(deps)
-        return f'DRY RUN — recorded unverified candidate "{candidate}" for {challenge_name}'
+        return format_warning + f'DRY RUN — recorded unverified candidate "{candidate}" for {challenge_name}'
     swarm = getattr(deps, "swarms", {}).get(challenge_name)
     if swarm:
         display, _ = await swarm.try_submit_flag(flag, "operator/coordinator")
         return display
-    try:
-        result = await deps.ctfd.submit_flag(challenge_name, flag)
-        return result.display
-    except Exception as e:
-        return f"submit_flag error: {e}"
+    outcome = await do_submit_flag_detailed(deps.ctfd, challenge_name, flag)
+    if outcome.status in {"already_solved", "retryable"}:
+        _merge_candidate_record(
+            deps,
+            challenge_name,
+            [candidate],
+            source=f"operator/{outcome.status}",
+        )
+        persist_deps_state(deps)
+    return format_warning + outcome.display
 
 
 async def do_review_candidate(
@@ -294,6 +433,10 @@ async def do_review_candidate(
         item for item in record.get("flags", [])
         if isinstance(item, str) and item != candidate
     ]
+    remaining_mismatches = [
+        item for item in record.get("format_mismatches", [])
+        if isinstance(item, str) and item != candidate and item in remaining_flags
+    ]
     feedback = (
         "CANDIDATE REJECTED BY OPERATOR. Treat this as hard negative evidence: "
         f"the candidate `{candidate}` is incorrect. Do not reuse it or merely "
@@ -302,13 +445,14 @@ async def do_review_candidate(
     )
     record.update(
         {
-            "flag": "",
+            "flag": remaining_flags[0] if remaining_flags else "",
             "flags": remaining_flags,
             "rejected_flags": rejected_flags,
+            "format_mismatches": remaining_mismatches,
             "feedback": feedback,
             "source": "operator review",
-            "status": "rejected",
-            "review_required": False,
+            "status": "unverified" if remaining_flags else "rejected",
+            "review_required": bool(remaining_flags),
         }
     )
     deps.candidates[challenge_name] = record
@@ -326,6 +470,10 @@ async def do_review_candidate(
 
     swarm = getattr(deps, "swarms", {}).get(challenge_name)
     task = getattr(deps, "swarm_tasks", {}).get(challenge_name)
+    if swarm is not None:
+        discard = getattr(swarm, "discard_candidate", None)
+        if callable(discard):
+            discard(candidate)
     if swarm and task and not task.done():
         await swarm.message_bus.broadcast(feedback, source="operator-review")
         for solver in swarm.solvers.values():
@@ -365,7 +513,10 @@ async def do_bump_agent(deps: CoordinatorDeps, challenge_name: str, model_spec: 
     solver = swarm.solvers.get(model_spec)
     if not solver:
         return f"No solver for {model_spec} in {challenge_name}"
-    solver.bump(insights)
+    try:
+        solver.bump(insights, urgent=True)
+    except TypeError:
+        solver.bump(insights)
     await swarm.message_bus.post("coordinator", insights, target=model_spec)
     return (
         f"Bumped {model_spec} on {challenge_name}; guidance queued for both "

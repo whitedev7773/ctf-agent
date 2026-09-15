@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -70,6 +71,59 @@ _BULK_PATH_PARTS = re.compile(
     r"^(?:volume|section|file)-[0-9a-f-]+$|^(?:rootfs|unpacked|extract(?:ed)?)$",
     re.IGNORECASE,
 )
+_MAX_ARTIFACT_FILES_INSPECTED = 5000
+
+
+def _iter_artifact_files(
+    root: Path,
+    *,
+    max_inspected: int = _MAX_ARTIFACT_FILES_INSPECTED,
+):
+    """Yield a deterministic bounded set without walking an unbounded tree."""
+    inspected = 0
+    for current, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        inspected += 1  # Empty or directory-only extraction trees are bounded too.
+        if inspected >= max_inspected:
+            return
+        dirnames[:] = sorted(
+            (name for name in dirnames if not _BULK_PATH_PARTS.match(name)),
+            key=str.casefold,
+        )
+        filenames.sort(
+            key=lambda name: (
+                not any(name.casefold().startswith(prefix) for prefix in _HIGH_VALUE_PREFIXES),
+                name.casefold(),
+            )
+        )
+        for filename in filenames:
+            if inspected >= max_inspected:
+                return
+            inspected += 1
+            path = Path(current) / filename
+            try:
+                if path.is_file():
+                    yield path
+            except OSError:
+                continue
+
+
+def has_nonempty_artifact(
+    root: str | Path,
+    suffixes: set[str],
+    *,
+    max_inspected: int = 1000,
+) -> bool:
+    """Check a shared artifact tree without allowing extraction volume to stall cleanup."""
+    normalized_suffixes = {suffix.casefold() for suffix in suffixes}
+    for path in _iter_artifact_files(Path(root), max_inspected=max_inspected):
+        if path.suffix.casefold() not in normalized_suffixes:
+            continue
+        try:
+            if path.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _safe_segment(value: str) -> str:
@@ -206,9 +260,9 @@ def workspace_progress_signature(*roots: str) -> str:
         root = Path(raw_root)
         if not root.exists():
             continue
-        for path in sorted(root.rglob("*"), key=lambda item: str(item).casefold()):
-            if entries >= 1000 or not path.is_file():
-                continue
+        for path in _iter_artifact_files(root):
+            if entries >= 1000:
+                break
             if _artifact_score(path, root) is None:
                 continue
             try:
@@ -240,9 +294,7 @@ def workspace_resume_manifest(*roots: str, limit: int = 24) -> str:
         state_summary = _reasoning_summary(root)
         if state_summary:
             reasoning.append(state_summary)
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
+        for path in _iter_artifact_files(root):
             score = _artifact_score(path, root)
             if score is None:
                 continue
@@ -462,8 +514,8 @@ def challenge_approach_notes(
         add("reasoning/state.json", reasoning_summary.removeprefix("- REASONING _shared: "))
 
     candidates: list[tuple[int, int, Path]] = []
-    for path in root.rglob("*.md"):
-        if not path.is_file():
+    for path in _iter_artifact_files(root):
+        if path.suffix.casefold() != ".md":
             continue
         try:
             relative = path.relative_to(root)
