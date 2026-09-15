@@ -123,7 +123,7 @@ ENABLE_API_FALLBACK=false
 
 # 선택 사항
 CONTAINER_MEMORY_LIMIT=4g
-MAX_CONCURRENT_CHALLENGES=1
+MAX_CONCURRENT_CHALLENGES=4
 ```
 
 주요 설정은 다음과 같다.
@@ -138,7 +138,7 @@ MAX_CONCURRENT_CHALLENGES=1
 | `SANDBOX_IMAGE`                       |            `ctf-sandbox` | 사용할 Docker image                                                            |
 | `CONTAINER_MEMORY_LIMIT`              |                     `4g` | solver 컨테이너 하나의 memory limit                                            |
 | `CONTAINER_CPU_LIMIT`                 |                    `2.0` | solver 컨테이너 하나의 CPU limit                                               |
-| `MAX_CONCURRENT_CHALLENGES`           |                      `1` | 동시에 실행할 문제 swarm 수                                                    |
+| `MAX_CONCURRENT_CHALLENGES`           |                      `4` | 동시에 실행할 문제 swarm 수                                                    |
 | `WORKSPACE_ROOT`                      |              `workspace` | 영구 exploit·solver·checkpoint 저장 경로                                       |
 | `EXPERIENCE_ROOT`                     |             `experience` | 검증된 문제에서 승격한 문제 간 공유 풀이 경험 저장 경로                        |
 | `LOGS_ROOT`                           |                   `logs` | Solver JSONL trace 저장 경로                                                   |

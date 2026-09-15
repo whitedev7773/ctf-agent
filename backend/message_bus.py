@@ -20,6 +20,7 @@ class Finding:
     claim: str = ""
     confidence: float = 0.0
     evidence_ids: list[str] = field(default_factory=list)
+    graph_node_ids: list[str] = field(default_factory=list)
     hypothesis_id: str | None = None
     status: str = "active"
     supersedes: str | None = None
@@ -31,6 +32,7 @@ class Finding:
         self.claim = (self.claim or self.content)[:4000]
         self.confidence = max(0.0, min(1.0, float(self.confidence)))
         self.evidence_ids = list(dict.fromkeys(self.evidence_ids))[:50]
+        self.graph_node_ids = list(dict.fromkeys(self.graph_node_ids))[:50]
         self.tags = list(dict.fromkeys(tag.casefold() for tag in self.tags if tag))[:30]
 
 
@@ -81,12 +83,14 @@ class ChallengeMessageBus:
         model: str,
         *,
         hypothesis_id: str | None = None,
+        graph_node_ids: list[str] | None = None,
         blocker: str = "",
         tags: list[str] | None = None,
         limit: int = 6,
     ) -> list[Finding]:
         """Return only unread findings relevant to the current decision state."""
         query_tags = {tag.casefold() for tag in (tags or []) if tag}
+        query_nodes = {node_id for node_id in (graph_node_ids or []) if node_id}
         query_tags.update(token.casefold() for token in blocker.split() if len(token) >= 4)
         async with self._lock:
             already_delivered = self.delivered.setdefault(model, set())
@@ -98,6 +102,7 @@ class ChallengeMessageBus:
             ]
         relevant: list[Finding] = []
         for finding in candidates:
+            same_graph_node = bool(query_nodes & set(finding.graph_node_ids))
             same_hypothesis = bool(hypothesis_id and finding.hypothesis_id == hypothesis_id)
             finding_terms = set(finding.tags)
             finding_terms.update(
@@ -110,10 +115,12 @@ class ChallengeMessageBus:
                 and bool(finding.evidence_ids)
             )
             targeted = finding.target == model
-            if same_hypothesis or tag_overlap or verified_urgent or targeted:
+            if same_graph_node or same_hypothesis or tag_overlap or verified_urgent or targeted:
                 relevant.append(finding)
         relevant.sort(
             key=lambda item: (
+                bool(query_nodes & set(item.graph_node_ids)),
+                bool(hypothesis_id and item.hypothesis_id == hypothesis_id),
                 item.urgency == "urgent",
                 bool(item.evidence_ids),
                 item.confidence,
@@ -136,6 +143,7 @@ class ChallengeMessageBus:
             return ""
         parts = [
             f"[{f.model}] {f.kind.upper()} {f.claim}"
+            + (f" (graph: {', '.join(f.graph_node_ids)})" if f.graph_node_ids else "")
             + (f" (evidence: {', '.join(f.evidence_ids)})" if f.evidence_ids else "")
             for f in findings
         ]

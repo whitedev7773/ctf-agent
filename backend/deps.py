@@ -46,7 +46,7 @@ class CoordinatorDeps:
     # The CLI dry-run flag cannot be disabled from the dashboard. ``no_submit``
     # also becomes true dynamically while no CTFd instance is connected.
     force_no_submit: bool = False
-    max_concurrent_challenges: int = 10
+    max_concurrent_challenges: int = 4
 
     msg_port: int = 9400  # Dashboard and operator-message port; 0 = auto-pick.
     msg_host: str = "127.0.0.1"  # Dashboard and operator-message bind address.

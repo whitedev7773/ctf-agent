@@ -24,6 +24,13 @@ _ALIASES = {
     "apk": "android",
     "smart contract": "blockchain",
     "web3": "blockchain",
+    "ai": "ai",
+    "ml": "ai",
+    "machine learning": "ai",
+    "artificial intelligence": "ai",
+    "malware": "malware",
+    "malware analysis": "malware",
+    "악성코드": "malware",
 }
 
 
@@ -70,6 +77,16 @@ _PLAYBOOKS: dict[str, str] = {
 - Check reentrancy, delegatecall/storage collisions, signature replay/malleability, oracle assumptions, precision, CREATE2 and callback ordering.
 - Build a local Python web3 reproduction and compute calldata/storage slots explicitly. Preserve transaction scripts and state assumptions.
 - Validate that the exploit changes the challenge's win condition, not merely that one suspicious call succeeds.""",
+    "ai": """### AI/ML specialist playbook
+- Inventory the supplied model, tokenizer, prompt templates, system messages, tool schemas and preprocessing code locally before querying a remote endpoint.
+- Reproduce inference or the decisive validation path locally when weights or service source are supplied; distinguish prompt injection, parser confusion, model extraction and ordinary application-layer bugs.
+- Treat stochastic output as an experiment: pin seeds and decoding parameters, save exact prompts and responses, and establish a repeatable success criterion.
+- Build the final adversarial input or extraction payload against the local harness first. Use the live service only for the smallest confirmation set needed to verify transfer.""",
+    "malware": """### Malware analysis specialist playbook
+- Perform static triage first: hashes, format, architecture, imports, strings, sections, packer indicators and embedded configuration. Never execute an unknown sample on the host.
+- Use the isolated sandbox for bounded dynamic analysis and record process, filesystem and network indicators; disable or redirect callbacks unless the authorized challenge explicitly requires them.
+- Combine disassembly/decompilation with behavioral evidence to recover configuration, C2 protocol, keys or the flag path. Preserve unpackers, decoders and IOCs as reproducible artifacts.
+- Prefer local emulation, stubs and protocol harnesses. Contact a challenge endpoint only after the local behavior and exact verification payload are understood.""",
 }
 
 _EXTERNAL_SKILLS_BY_CATEGORY = {
@@ -81,6 +98,8 @@ _EXTERNAL_SKILLS_BY_CATEGORY = {
     "misc": "ctf-misc",
     "android": "ctf-reverse",
     "blockchain": "ctf-misc",
+    "ai": "ctf-ai-ml",
+    "malware": "ctf-malware",
 }
 
 
@@ -115,7 +134,7 @@ def external_skill_path(category: str) -> str:
     raw = (category or "").strip().lower()
     if "osint" in raw:
         skill = "ctf-osint"
-    elif "malware" in raw:
+    elif "malware" in raw or "악성코드" in raw:
         skill = "ctf-malware"
     elif raw in {"ai", "ml", "ai/ml", "machine learning", "artificial intelligence"}:
         skill = "ctf-ai-ml"

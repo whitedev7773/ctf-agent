@@ -30,8 +30,8 @@ class Settings(BaseSettings):
 
     # Infra
     sandbox_image: str = "ctf-sandbox"
-    # Desktop-safe default: one SOL-led challenge at a time.
-    max_concurrent_challenges: int = 1
+    # Contest default: four SOL-led challenges in parallel.
+    max_concurrent_challenges: int = 4
     max_attempts_per_challenge: int = 8
     coordinator_max_swarm_runs_per_challenge: int = 2
     coordinator_swarm_retry_delay_seconds: int = 30

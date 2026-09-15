@@ -87,7 +87,16 @@ def build_prompt(
         "",
     ]
 
-    if conn_info:
+    if conn_info and distfile_names:
+        lines += [
+            "> **LOCAL-FIRST REQUIRED**: Attached files are available, so do not contact the live service yet.",
+            "> Inspect and run the supplied source/binary locally. Reconstruct the validation path, build the",
+            "> Flag-producing payload, and test it against a local harness before any remote request.",
+            "> Use the live service only for the smallest final verification set. If the challenge truly requires",
+            "> a remote oracle, first record why local reproduction is impossible and a bounded query plan.",
+            "",
+        ]
+    elif conn_info:
         lines += [
             "> **FIRST ACTION REQUIRED**: Your very first tool call MUST connect to the service.",
             f"> Run: `{conn_info}` (use a heredoc or pwntools script as shown below).",
@@ -230,10 +239,14 @@ def build_prompt(
         "**Use tools immediately. Do not describe — execute.**",
         "",
         "1. " + (
-            "Resume from the existing work manifest and then connect to the service."
+            "Resume from the existing work manifest, finish local reproduction from the attachments, then use the service only for final verification."
+            if resume_manifest and conn_info and distfile_names
+            else "Resume from the existing work manifest and then connect to the service."
             if resume_manifest and conn_info
             else "Resume from the existing work manifest."
             if resume_manifest
+            else "Inspect the attachments, reproduce the target locally, and defer live-service contact until final verification."
+            if conn_info and distfile_names
             else "Connect to the service now."
             if conn_info
             else "Inspect distfiles now."
@@ -242,6 +255,13 @@ def build_prompt(
         "3. Keep one ranked, falsifiable hypothesis. Run the cheapest experiment that can reject it, "
         "then pivot; do not perform broad inventory after triage.",
         f"4. {image_hint} {web_hint}",
+        "4a. When attachments and a service are both supplied, treat remote traffic as a scarce verification "
+        "budget. Inspect archives and source, launch the service or verifier locally, and make the final payload "
+        "produce or recover the Flag locally whenever possible. Do not use the live endpoint for discovery, "
+        "fuzzing, repeated retries, timing calibration, or payload development that can be performed locally. "
+        "After local success, send only the minimum clean verification request(s). For a genuinely remote-only "
+        "oracle, document the missing local dependency, expected information per query, hard query bound, and "
+        "stopping rule before connecting.",
         "5. Before a long emulator, debugger, symbolic or algebra job, write the expected signal and "
         "the pivot if absent. Do not repeat a failed environment setup with cosmetic argument changes.",
         "5a. Exit 137, timeout, assertion failure, or a model/native mismatch is a failed experiment, "

@@ -172,6 +172,10 @@ def _artifact_score(path: Path, root: Path) -> int | None:
     if relative.as_posix().casefold() in {
         "reasoning/state.json",
         "reasoning/state.json.tmp",
+        "graph/attack-graph.json",
+        "graph/attack-graph.json.tmp",
+        "graph/task-leases.json",
+        "graph/task-leases.json.tmp",
     }:
         return None
     lowered = path.name.casefold()
@@ -246,6 +250,35 @@ def _reasoning_summary(root: Path) -> str:
     return f"- REASONING {root.name}: {details}"
 
 
+def _attack_graph_summary(root: Path) -> str:
+    """Return a compact topology summary without loading graph code into artifact scans."""
+    graph_path = root / "graph" / "attack-graph.json"
+    try:
+        payload = json.loads(graph_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    nodes = [item for item in payload.get("nodes", []) if isinstance(item, dict)]
+    by_id = {str(item.get("id", "")): item for item in nodes}
+    ready = [item for item in nodes if item.get("status") == "ready"]
+    blocked = [item for item in nodes if item.get("status") == "blocked"]
+    satisfied = sum(item.get("status") == "satisfied" for item in nodes)
+    next_node = ready[0] if ready else blocked[0] if blocked else None
+    next_text = ""
+    if next_node:
+        next_text = (
+            f"; next={str(next_node.get('id', ''))[:80]}:"
+            f"{' '.join(str(next_node.get('title', '')).split())[:180]}"
+        )
+    root_id = str(payload.get("root_goal") or "")[:80]
+    root_title = " ".join(str(by_id.get(root_id, {}).get("title", "")).split())[:180]
+    return (
+        f"- ATTACK GRAPH {root.name}: root={root_id}:{root_title}; satisfied={satisfied}; "
+        f"ready={len(ready)}; blocked={len(blocked)}{next_text}"
+    )
+
+
 def workspace_progress_signature(*roots: str) -> str:
     """Return a bounded signature of solver-created artifacts.
 
@@ -282,6 +315,7 @@ def workspace_resume_manifest(*roots: str, limit: int = 24) -> str:
     candidates: list[tuple[int, int, str]] = []
     checkpoints: list[str] = []
     reasoning: list[str] = []
+    attack_graphs: list[str] = []
     for raw_root in roots:
         if not raw_root:
             continue
@@ -294,6 +328,9 @@ def workspace_resume_manifest(*roots: str, limit: int = 24) -> str:
         state_summary = _reasoning_summary(root)
         if state_summary:
             reasoning.append(state_summary)
+        graph_summary = _attack_graph_summary(root)
+        if graph_summary:
+            attack_graphs.append(graph_summary)
         for path in _iter_artifact_files(root):
             score = _artifact_score(path, root)
             if score is None:
@@ -312,7 +349,7 @@ def workspace_resume_manifest(*roots: str, limit: int = 24) -> str:
             )
     selected = sorted(candidates, reverse=True)[: max(1, limit)]
     artifact_lines = [f"- {item[2]}" for item in selected]
-    return "\n".join(checkpoints + reasoning + artifact_lines)
+    return "\n".join(checkpoints + reasoning + attack_graphs + artifact_lines)
 
 
 def handoff_quality_issues(path: str | Path) -> list[str]:

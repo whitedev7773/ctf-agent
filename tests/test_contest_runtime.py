@@ -41,6 +41,7 @@ from backend.budgets import (
 from backend.challenge_profiles import (
     category_playbook,
     external_skill_path,
+    normalized_category,
     solver_lane,
     solver_role,
 )
@@ -259,6 +260,12 @@ class ArtifactAndProfileTests(unittest.TestCase):
         self.assertIn("UNSAT proves only the exact path", prompt)
         self.assertIn("Do not apply the challenge flag format to stdin", prompt)
         self.assertIn("lattice", category_playbook("crypto"))
+        self.assertEqual(normalized_category("AI/ML"), "ai")
+        self.assertEqual(normalized_category("malware analysis"), "malware")
+        self.assertIn("local harness", category_playbook("ai"))
+        self.assertIn("static triage", category_playbook("malware"))
+        self.assertEqual(external_skill_path("AI/ML"), "/challenge/skills/ctf-ai-ml/SKILL.md")
+        self.assertEqual(external_skill_path("악성코드"), "/challenge/skills/ctf-malware/SKILL.md")
         self.assertIn("Primary solve owner", solver_lane("codex/gpt-5.6-sol/xhigh"))
         self.assertEqual(solver_role("codex/gpt-5.6-sol/xhigh").key, "lead")
         self.assertEqual(
@@ -275,9 +282,35 @@ class ArtifactAndProfileTests(unittest.TestCase):
         )
         self.assertIn("do not repeat the scout's full skill read", analyst_prompt)
 
+    def test_prompt_prefers_local_source_before_remote_verification(self) -> None:
+        prompt = build_prompt(
+            ChallengeMeta(
+                name="source-service",
+                category="web",
+                connection_info="https://challenge.example",
+            ),
+            ["source.zip"],
+            model_spec="codex/gpt-5.6-sol/high",
+        )
+        self.assertIn("LOCAL-FIRST REQUIRED", prompt)
+        self.assertIn("do not contact the live service yet", prompt)
+        self.assertIn("send only the minimum clean verification request", prompt)
+        self.assertNotIn("very first tool call MUST connect", prompt)
+
+        remote_only = build_prompt(
+            ChallengeMeta(
+                name="remote-only",
+                category="web",
+                connection_info="https://challenge.example",
+            ),
+            [],
+            model_spec="codex/gpt-5.6-sol/high",
+        )
+        self.assertIn("very first tool call MUST connect", remote_only)
+
     def test_desktop_and_billing_safety_defaults(self) -> None:
         settings = Settings(_env_file=None)
-        self.assertEqual(settings.max_concurrent_challenges, 1)
+        self.assertEqual(settings.max_concurrent_challenges, 4)
         self.assertEqual(settings.container_memory_limit, "4g")
         self.assertFalse(settings.enable_api_fallback)
         self.assertEqual(settings.solver_handoff_wait_seconds, 180)

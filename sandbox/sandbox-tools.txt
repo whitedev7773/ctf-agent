@@ -25,6 +25,10 @@ gdb                GNU debugger. gdb binary, then run, break, info, x/...
 ltrace             Library call tracer. ltrace ./binary
 strace             System call tracer. strace ./binary
 radare2            Reverse engineering. r2 binary, then aaa; pdf @main; afl
+Ghidra headless    analyzeHeadless /tmp/project name -import binary -postScript script.py
+Ghidra GUI         ghidraRun (requires a display-capable host/session).
+jadx               Android DEX/APK decompiler CLI. jadx -d out app.apk
+jadx-gui           Android GUI decompiler (requires a display-capable host/session).
 gdb-multiarch      Debug foreign-architecture targets with QEMU user emulation.
 qemu-*-static      Execute ARM/AArch64/MIPS/etc. Linux binaries under emulation.
 patchelf           Change ELF interpreter/RPATH for supplied loader and libc.

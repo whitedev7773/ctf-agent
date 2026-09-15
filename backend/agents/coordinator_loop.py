@@ -40,13 +40,24 @@ def _challenge_priority(deps: CoordinatorDeps, challenge_name: str) -> float:
     category_key = next(
         (
             key
-            for key in ("web", "misc", "forensics", "crypto", "reversing", "pwn")
+            for key in (
+                "web",
+                "ai",
+                "malware",
+                "misc",
+                "forensics",
+                "crypto",
+                "reversing",
+                "pwn",
+            )
             if key in category
         ),
         "misc",
     )
     base_probability = {
         "web": 0.58,
+        "ai": 0.46,
+        "malware": 0.38,
         "misc": 0.52,
         "forensics": 0.50,
         "crypto": 0.43,
@@ -55,6 +66,8 @@ def _challenge_priority(deps: CoordinatorDeps, challenge_name: str) -> float:
     }[category_key]
     expected_minutes = {
         "web": 22.0,
+        "ai": 32.0,
+        "malware": 40.0,
         "misc": 18.0,
         "forensics": 28.0,
         "crypto": 34.0,

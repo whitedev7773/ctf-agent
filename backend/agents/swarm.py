@@ -20,6 +20,7 @@ from backend.artifacts import (
     workspace_progress_signature,
     write_checkpoint,
 )
+from backend.attack_graph import AttackGraphStore
 from backend.budgets import (
     solver_runtime_limit,
     solver_step_limit,
@@ -32,6 +33,7 @@ from backend.challenge_profiles import external_skill_path, solver_role
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.flag_format import flag_matches_format
+from backend.graph_scheduler import GraphScheduler
 from backend.message_bus import ChallengeMessageBus
 from backend.model_specs import provider_from_spec, quota_fallback_spec
 from backend.models import DEFAULT_MODELS
@@ -105,11 +107,16 @@ class ChallengeSwarm:
     _primary_tasks: set[asyncio.Task] = field(default_factory=set)
     runtime_clock: RuntimeClock = field(default_factory=RuntimeClock)
     agent_clocks: dict[str, RuntimeClock] = field(default_factory=dict)
+    attack_graph_store: AttackGraphStore = field(init=False)
+    graph_scheduler: GraphScheduler = field(init=False)
 
     def __post_init__(self) -> None:
         # A swarm may append live delegate aliases. Never mutate the coordinator's
         # configured primary roster or leak one challenge's workers into another.
         self.model_specs = list(self.model_specs)
+        shared_root = challenge_shared_path(self.settings, self.meta.name)
+        self.attack_graph_store = AttackGraphStore(shared_root)
+        self.graph_scheduler = GraphScheduler(self.attack_graph_store)
 
     def record_candidate(self, source: str, flag: str) -> None:
         """Preserve exact, evidence-backed candidates without normalizing wrappers."""
@@ -304,6 +311,7 @@ class ChallengeSwarm:
         task: str,
         deliverable: str,
         *,
+        graph_node_id: str = "",
         hypothesis_id: str = "",
         dependency_key: str = "",
         task_type: str = "extraction",
@@ -314,6 +322,7 @@ class ChallengeSwarm:
         """Launch one bounded Luna worker without blocking the SOL lead."""
         task = " ".join(task.split())[:3000]
         deliverable = " ".join(deliverable.split())[:1500]
+        graph_node_id = graph_node_id.strip()[:200]
         hypothesis_id = hypothesis_id.strip()[:200]
         dependency_key = dependency_key.strip()[:300]
         task_type = task_type.strip().casefold()[:100] or "extraction"
@@ -331,6 +340,14 @@ class ChallengeSwarm:
             return "DELEGATION DISABLED by runtime policy."
 
         async with self._delegate_lock:
+            if graph_node_id:
+                owner = self.graph_scheduler.lease_owner(graph_node_id)
+                if owner:
+                    return (
+                        f"DELEGATION REJECTED: graph node {graph_node_id} is already leased "
+                        f"to {owner}."
+                    )
+
             def overlaps(request: dict) -> bool:
                 same_dependency = bool(
                     dependency_key and request.get("dependency_key") == dependency_key
@@ -340,9 +357,9 @@ class ChallengeSwarm:
                     and request.get("hypothesis_id") == hypothesis_id
                     and request.get("task_type") == task_type
                 )
-                lexical_fallback = not (dependency_key or hypothesis_id) and self._delegate_tasks_overlap(
-                    request["task"], task
-                )
+                lexical_fallback = not (
+                    graph_node_id or dependency_key or hypothesis_id
+                ) and self._delegate_tasks_overlap(request["task"], task)
                 return same_dependency or same_hypothesis or lexical_fallback
 
             if any(overlaps(request) for request in self.delegate_requests.values()):
@@ -368,9 +385,34 @@ class ChallengeSwarm:
             if len(parts) < 2 or parts[0] != "codex":
                 return "DELEGATION CONFIG ERROR: delegate_model_spec must use the codex provider."
             base_spec = "/".join(parts[:3]) if len(parts) >= 3 else configured + "/low"
-            self._delegate_count += 1
-            delegate_id = f"delegate-{self._delegate_count:02d}"
+            delegate_id = f"delegate-{self._delegate_count + 1:02d}"
             model_spec = f"{base_spec}/{delegate_id}"
+            if graph_node_id:
+                try:
+                    lease = await self.graph_scheduler.acquire_lease(
+                        graph_node_id,
+                        model_spec,
+                        ttl_seconds=expected_seconds + 120,
+                    )
+                except (ValueError, OSError) as exc:
+                    return f"DELEGATION REJECTED: {exc}"
+                if lease is None:
+                    owner = self.graph_scheduler.lease_owner(graph_node_id)
+                    suffix = f" to {owner}" if owner else " or is not READY"
+                    return (
+                        f"DELEGATION REJECTED: graph node {graph_node_id} is already leased"
+                        f"{suffix}."
+                    )
+                try:
+                    await self.attack_graph_store.transition(
+                        graph_node_id,
+                        "active",
+                        owner_agent=model_spec,
+                    )
+                except (ValueError, OSError) as exc:
+                    await self.graph_scheduler.release_lease(graph_node_id, owner=model_spec)
+                    return f"DELEGATION REJECTED: {exc}"
+            self._delegate_count += 1
             handoff = f"/challenge/shared/delegates/{delegate_id}.md"
             host_handoff = str(
                 Path(challenge_shared_path(self.settings, self.meta.name))
@@ -381,6 +423,7 @@ class ChallengeSwarm:
                 f"Delegate ID: {delegate_id}\n"
                 f"Assigned task: {task}\n"
                 f"Required deliverable: {deliverable}\n"
+                f"Assigned graph node: {graph_node_id or 'unassigned'}\n"
                 f"Hypothesis: {hypothesis_id or 'unassigned'}\n"
                 f"Dependency: {dependency_key or 'independent'}\n"
                 f"Task type/difficulty: {task_type}/{difficulty}\n"
@@ -405,6 +448,7 @@ class ChallengeSwarm:
                 "handoff": handoff,
                 "host_handoff": host_handoff,
                 "hypothesis_id": hypothesis_id,
+                "graph_node_id": graph_node_id,
                 "dependency_key": dependency_key,
                 "task_type": task_type,
                 "difficulty": difficulty,
@@ -412,8 +456,18 @@ class ChallengeSwarm:
                 "independent": independent,
             }
             self.model_specs.append(model_spec)
+            async def run_delegated_worker():
+                try:
+                    return await self._run_solver(model_spec, task_directive=directive)
+                finally:
+                    if graph_node_id:
+                        await self.graph_scheduler.release_lease(
+                            graph_node_id,
+                            owner=model_spec,
+                        )
+
             worker = asyncio.create_task(
-                self._run_solver(model_spec, task_directive=directive),
+                run_delegated_worker(),
                 name=f"solver-{self.meta.name}-{delegate_id}",
             )
             self.delegate_tasks[model_spec] = worker
@@ -1039,6 +1093,9 @@ class ChallengeSwarm:
                         evidence_ids=[
                             f"runtime:{model_spec.rsplit('/', 1)[-1]}:reproducer"
                         ],
+                        graph_node_ids=(
+                            [request["graph_node_id"]] if request.get("graph_node_id") else []
+                        ),
                         hypothesis_id=request.get("hypothesis_id") or None,
                         tags=[request.get("task_type", "delegate")],
                         urgency="urgent",
@@ -1220,12 +1277,14 @@ class ChallengeSwarm:
     def _progress_signature(solver) -> str:
         state_store = getattr(solver, "reasoning_state_store", None)
         semantic_signature = state_store.semantic_signature() if state_store is not None else ""
+        graph_store = getattr(solver, "attack_graph_store", None)
+        graph_signature = graph_store.semantic_signature() if graph_store is not None else ""
         sandbox = getattr(solver, "sandbox", None)
         artifact_signature = workspace_progress_signature(
             getattr(sandbox, "workspace_dir", ""),
             getattr(sandbox, "shared_workspace_dir", ""),
         )
-        return f"{semantic_signature}:{artifact_signature}"
+        return f"{semantic_signature}:{graph_signature}:{artifact_signature}"
 
     def _budget_reason(self, solver, model_spec: str, attempt: int, started_at: float) -> str:
         limits = solver_token_limits(self.settings, model_spec)
@@ -1477,6 +1536,7 @@ class ChallengeSwarm:
             },
             "candidate_forms": self.candidate_flags,
             "reasoning": reasoning,
+            "attack_graph": self.attack_graph_store.summary(),
             "agents": {
                 spec: {
                     "role": solver_role(spec).key,

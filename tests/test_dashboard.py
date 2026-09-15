@@ -1083,7 +1083,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             reset = await response.json()
         self.assertEqual(response.status, 200)
         self.assertEqual(reset["settings"]["models"], ["codex/gpt-5.6-sol/high"])
-        self.assertEqual(self.deps.max_concurrent_challenges, 1)
+        self.assertEqual(self.deps.max_concurrent_challenges, 4)
 
     async def test_runtime_settings_do_not_mutate_an_active_swarm_snapshot(self) -> None:
         swarm_settings = SimpleNamespace(solver_max_steps=300)

@@ -39,7 +39,7 @@ class RuntimeSettings(BaseModel):
     )
     writeup_model_spec: str = "codex/gpt-5.6-terra/medium"
     writeup_review_model_spec: str = "codex/gpt-5.6-luna/medium"
-    max_concurrent_challenges: int = Field(default=1, ge=1, le=32)
+    max_concurrent_challenges: int = Field(default=4, ge=1, le=32)
     container_memory_limit: str = "4g"
     container_cpu_limit: float = Field(default=2.0, ge=0.1, le=64.0)
 

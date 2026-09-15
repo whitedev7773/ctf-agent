@@ -155,7 +155,7 @@ ANTHROPIC_API_KEY=
 GEMINI_API_KEY=
 ENABLE_API_FALLBACK=false
 
-MAX_CONCURRENT_CHALLENGES=1
+MAX_CONCURRENT_CHALLENGES=4
 CONTAINER_MEMORY_LIMIT=4g
 CONTAINER_CPU_LIMIT=2.0
 
@@ -194,11 +194,11 @@ uv run ctf-msg --port 9400 "pwn-500의 libc build ID를 먼저 확인"
 
 | 분야 | 주요 도구 |
 |---|---|
-| Binary / Pwn | radare2, GDB/gdb-multiarch, QEMU, pwntools, angr, ROPgadget, ropper, one_gadget, patchelf, LIEF, pyghidra |
+| Binary / Pwn | Ghidra/analyzeHeadless, radare2, GDB/gdb-multiarch, QEMU, pwntools, angr, ROPgadget, ropper, one_gadget, patchelf, LIEF, pyghidra |
 | Crypto | SageMath, RsaCtfTool, z3, gmpy2, pycryptodome, cado-nfs |
 | Forensics / Stego | volatility3, Sleuthkit, tshark, YARA, foremost, exiftool, steghide, stegseek, zsteg, tesseract |
 | Web / Network | Playwright/Chromium, curl, nmap, socat, Scapy, requests, WebSocket tooling |
-| Mobile / Web3 | apktool, androguard, web3.py, eth-abi |
+| Mobile / Web3 | JADX CLI/GUI, apktool, androguard, web3.py, eth-abi |
 | Misc | ffmpeg, sox, ImageMagick, Pillow, PyTorch, podman/buildah |
 
 Sandbox는 분석 편의를 위해 `SYS_ADMIN`, `SYS_PTRACE`, `seccomp=unconfined` 등 강한 권한을 사용합니다. 개인 credential이나 민감 문서가 없는 전용 VM에서 실행하는 것을 권장합니다.

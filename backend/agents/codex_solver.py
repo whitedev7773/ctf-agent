@@ -27,12 +27,14 @@ from backend.artifacts import (
     solver_workspace_path,
     workspace_resume_manifest,
 )
+from backend.attack_graph import AttackGraphStore, EdgeKind, NodeKind, NodeStatus
 from backend.budgets import solver_step_limit, solver_token_limits, token_metrics
 from backend.challenge_profiles import external_skill_path, solver_role
 from backend.codex_cli import prepare_codex_cli
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.experience import experience_root, retrieve_experience
+from backend.graph_scheduler import GraphScheduler
 from backend.loop_detect import LoopDetector
 from backend.model_specs import effort_from_spec
 from backend.models import model_id_from_spec, supports_vision
@@ -267,6 +269,10 @@ DELEGATION_TOOLS: list[dict[str, Any]] = [
                 },
                 "hypothesis_id": {"type": "string"},
                 "dependency_key": {"type": "string"},
+                "graph_node_id": {
+                    "type": "string",
+                    "description": "READY attack-graph node assigned to this worker.",
+                },
                 "task_type": {
                     "type": "string",
                     "description": "Examples: extraction, crypto_analysis, vm_analysis, exploitation, verification.",
@@ -354,6 +360,7 @@ REASONING_TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "hypothesis_id": {"type": "string"},
+                "graph_node_ids": {"type": "array", "items": {"type": "string"}},
                 "blocker": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
             },
@@ -391,6 +398,87 @@ REASONING_TOOLS: list[dict[str, Any]] = [
             },
             "required": ["query"],
         },
+    },
+]
+
+GRAPH_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "get_attack_graph",
+        "description": "Read the persistent attack topology, node states, and critical path.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "register_attack_node",
+        "description": "Add one goal, primitive, prerequisite, hypothesis, experiment, or artifact.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": [
+                        "goal",
+                        "primitive",
+                        "precondition",
+                        "hypothesis",
+                        "experiment",
+                        "artifact",
+                    ],
+                },
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "information_gain": {"type": "number", "minimum": 0, "maximum": 1},
+                "expected_seconds": {"type": "number", "minimum": 0},
+                "expected_tokens": {"type": "integer", "minimum": 0},
+                "execution_risk": {"type": "number", "minimum": 0, "maximum": 1},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "delegateable": {"type": "boolean"},
+                "independent": {"type": "boolean"},
+            },
+            "required": ["kind", "title"],
+        },
+    },
+    {
+        "name": "link_attack_nodes",
+        "description": (
+            "Add a typed edge. For requires, source depends on target; dependency cycles are rejected."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string"},
+                "target": {"type": "string"},
+                "kind": {
+                    "type": "string",
+                    "enum": ["requires", "produces", "tests", "supports", "refutes", "conflicts"],
+                },
+            },
+            "required": ["source", "target", "kind"],
+        },
+    },
+    {
+        "name": "update_attack_node",
+        "description": (
+            "Transition a graph node. Satisfied primitives/experiments and refuted hypotheses "
+            "are evidence-gated; active nodes obtain a task lease."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string"},
+                "status": {
+                    "type": "string",
+                    "enum": ["unknown", "ready", "active", "satisfied", "refuted", "blocked"],
+                },
+                "evidence_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["node_id", "status"],
+        },
+    },
+    {
+        "name": "get_ready_tasks",
+        "description": "Return cost-ranked unleased READY graph nodes recommended by shadow mode.",
+        "inputSchema": {"type": "object", "properties": {}},
     },
 ]
 
@@ -470,6 +558,11 @@ class CodexSolver:
         self.use_vision = supports_vision(model_spec)
         self.loop_detector = LoopDetector()
         self.reasoning_state_store = ReasoningStateStore(self.sandbox.shared_workspace_dir)
+        self.attack_graph_store = AttackGraphStore(
+            self.sandbox.shared_workspace_dir,
+            self.reasoning_state_store,
+        )
+        self.graph_scheduler = GraphScheduler(self.attack_graph_store)
         self._observations = {}
         self.tracer = SolverTracer(
             meta.name,
@@ -580,6 +673,15 @@ class CodexSolver:
                 "hypothesis refuted, and execute its pivot before another expensive call. Never leave "
                 "a contradicted hypothesis active or a failed experiment only in chat/tool logs."
             )
+            system_prompt += (
+                "\n\n## Attack graph (passive shadow mode)\n"
+                "Maintain solve topology with the graph tools without replacing the evidence ledger. "
+                "A `requires` edge means the source depends on the target. Register concrete "
+                "primitives and experiments as they become relevant, link their prerequisites, and "
+                "consult `get_ready_tasks` at decision boundaries. The runtime enforces dependency "
+                "cycles, evidence-gated terminal states, and task leases. Shadow mode recommends "
+                "READY work but does not auto-spawn workers; the SOL lead retains end-to-end ownership."
+            )
         if self.delegate_task_fn and self.task_mode == "solve":
             system_prompt += (
                 "\n\n## Adaptive delegation\n"
@@ -635,6 +737,7 @@ class CodexSolver:
             dynamic_tools = list(SANDBOX_TOOLS)
         if self.task_mode == "solve":
             dynamic_tools.extend(REASONING_TOOLS)
+            dynamic_tools.extend(GRAPH_TOOLS)
         if self.delegate_task_fn and self.task_mode == "solve":
             dynamic_tools.extend(DELEGATION_TOOLS)
         tool_names = [str(t["name"]) for t in dynamic_tools]
@@ -1287,6 +1390,11 @@ class CodexSolver:
             "update_solve_context",
             "sync_findings",
             "search_experience",
+            "get_attack_graph",
+            "register_attack_node",
+            "link_attack_nodes",
+            "update_attack_node",
+            "get_ready_tasks",
         }
         observation = None
         if tool_name not in state_tools:
@@ -1525,7 +1633,9 @@ class CodexSolver:
             )
             return f"HYPOTHESIS UPDATED: {hypothesis.id} status={hypothesis.status}"
         elif name == "get_solve_state":
-            return self.reasoning_state_store.format_state()
+            payload = json.loads(self.reasoning_state_store.format_state())
+            payload["attack_graph_summary"] = self.attack_graph_store.summary()
+            return json.dumps(payload, ensure_ascii=False, indent=2)
         elif name == "update_solve_context":
             try:
                 state = await self.reasoning_state_store.update_context(
@@ -1554,6 +1664,7 @@ class CodexSolver:
             findings = await self.message_bus.sync(
                 self.model_spec,
                 hypothesis_id=str(args.get("hypothesis_id", "")) or None,
+                graph_node_ids=list(args.get("graph_node_ids", []) or []),
                 blocker=str(args.get("blocker", "")),
                 tags=list(args.get("tags", []) or []),
             )
@@ -1578,6 +1689,97 @@ class CodexSolver:
                 "Historical verified experience (treat as leads, re-verify locally):\n"
                 + json.dumps(results, ensure_ascii=False, indent=2)
             )
+        elif name == "get_attack_graph":
+            return self.attack_graph_store.format_graph()
+        elif name == "register_attack_node":
+            try:
+                node = await self.attack_graph_store.add_node(
+                    kind=cast(NodeKind, str(args.get("kind", ""))),
+                    title=str(args.get("title", "")),
+                    description=str(args.get("description", "")),
+                    confidence=float(args.get("confidence", 0.0) or 0.0),
+                    information_gain=float(args.get("information_gain", 0.0) or 0.0),
+                    expected_seconds=float(args.get("expected_seconds", 0.0) or 0.0),
+                    expected_tokens=int(args.get("expected_tokens", 0) or 0),
+                    execution_risk=float(args.get("execution_risk", 0.0) or 0.0),
+                    tags=list(args.get("tags", []) or []),
+                    delegateable=bool(args.get("delegateable", False)),
+                    independent=bool(args.get("independent", False)),
+                )
+            except (TypeError, ValueError, OSError) as exc:
+                return f"GRAPH NODE REJECTED: {exc}"
+            self.tracer.event("graph_event", event="NODE_REGISTERED", node_id=node.id)
+            return f"GRAPH NODE REGISTERED: {node.id} status={node.status}"
+        elif name == "link_attack_nodes":
+            try:
+                edge = await self.attack_graph_store.add_edge(
+                    str(args.get("source", "")),
+                    str(args.get("target", "")),
+                    cast(EdgeKind, str(args.get("kind", ""))),
+                )
+            except (ValueError, OSError) as exc:
+                return f"GRAPH EDGE REJECTED: {exc}"
+            self.tracer.event(
+                "graph_event",
+                event="EDGE_REGISTERED",
+                source=edge.source,
+                target=edge.target,
+                edge_kind=edge.kind,
+            )
+            return f"GRAPH EDGE REGISTERED: {edge.source} -{edge.kind}-> {edge.target}"
+        elif name == "update_attack_node":
+            node_id = str(args.get("node_id", ""))
+            status = cast(NodeStatus, str(args.get("status", "")))
+            acquired = False
+            try:
+                if status == "active":
+                    lease = await self.graph_scheduler.acquire_lease(
+                        node_id,
+                        self.model_spec,
+                        ttl_seconds=float(
+                            getattr(self.settings, "solver_runtime_limit_seconds", 900) or 900
+                        ),
+                    )
+                    if lease is None:
+                        return "GRAPH TRANSITION REJECTED: node is not READY or is already leased."
+                    acquired = True
+                node = await self.attack_graph_store.transition(
+                    node_id,
+                    status,
+                    evidence_ids=list(args.get("evidence_ids", []) or []),
+                    owner_agent=self.model_spec if status == "active" else "",
+                )
+            except (TypeError, ValueError, OSError) as exc:
+                if acquired:
+                    await self.graph_scheduler.release_lease(node_id, owner=self.model_spec)
+                return f"GRAPH TRANSITION REJECTED: {exc}"
+            if status != "active":
+                await self.graph_scheduler.release_lease(node_id, owner=self.model_spec)
+            self.tracer.event(
+                "graph_event",
+                event="NODE_TRANSITIONED",
+                node_id=node.id,
+                status=node.status,
+            )
+            return f"GRAPH NODE UPDATED: {node.id} status={node.status}"
+        elif name == "get_ready_tasks":
+            state = self.attack_graph_store.load()
+            tasks = [
+                {
+                    "id": node.id,
+                    "kind": node.kind,
+                    "title": node.title,
+                    "score": round(self.graph_scheduler.score(node, state), 8),
+                    "delegateable": node.delegateable,
+                    "independent": node.independent,
+                }
+                for node in self.graph_scheduler.ready_tasks(state)
+            ]
+            return json.dumps(
+                {"mode": "passive-shadow", "ready_tasks": tasks},
+                ensure_ascii=False,
+                indent=2,
+            )
         elif name == "delegate_task":
             if self.delegate_task_fn:
                 return await self.delegate_task_fn(
@@ -1585,6 +1787,7 @@ class CodexSolver:
                     str(args.get("deliverable", "")),
                     hypothesis_id=str(args.get("hypothesis_id", "")),
                     dependency_key=str(args.get("dependency_key", "")),
+                    graph_node_id=str(args.get("graph_node_id", "")),
                     task_type=str(args.get("task_type", "extraction")),
                     difficulty=str(args.get("difficulty", "easy")),
                     expected_seconds=int(args.get("expected_seconds", 300) or 300),
