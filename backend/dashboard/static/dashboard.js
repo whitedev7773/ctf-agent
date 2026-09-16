@@ -219,12 +219,8 @@ function initializeModals() {
   const system = document.querySelector(".system-disclosure");
   const monitor = system.querySelector(".dashboard-disclosure-content");
   state.operations.set("monitor", {title: "시스템 모니터", content: monitor});
-  system.replaceWith(modalSection(monitor, "시스템 모니터", "사용 한도 · 실시간 리소스", () => openOperation("monitor")));
   const operator = document.querySelector(".operator-panel");
   state.operations.set("operator", {title: "Coordinator에게 지시", content: operator});
-  const marker = document.createComment("operator");
-  operator.before(marker);
-  marker.replaceWith(modalSection(operator, "Coordinator에게 지시", "공통 우선순위와 운영 메시지 전달", () => openOperation("operator")));
   for (const key of ["monitor", "operator"]) {
     const tab = button(state.operations.get(key).title, "secondary-button", () => openOperation(key));
     tab.dataset.operation = key;
