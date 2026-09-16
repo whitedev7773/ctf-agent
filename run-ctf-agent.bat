@@ -4,7 +4,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 if not defined CTF_AGENT_PORT set "CTF_AGENT_PORT=9400"
-if not defined CTF_AGENT_HOST set "CTF_AGENT_HOST=0.0.0.0"
+if not defined CTF_AGENT_HOST set "CTF_AGENT_HOST=127.0.0.1"
 set "CTF_AGENT_MAX_CHALLENGES_ARG="
 if defined CTF_AGENT_MAX_CHALLENGES set "CTF_AGENT_MAX_CHALLENGES_ARG=--max-challenges %CTF_AGENT_MAX_CHALLENGES%"
 
@@ -52,9 +52,7 @@ if defined CTF_AGENT_EXISTING_PID (
 
 echo.
 echo [CTF Agent] Starting coordinator...
-echo [Dashboard] Listening on %CTF_AGENT_HOST%:%CTF_AGENT_PORT% (LAN access enabled)
-echo [Dashboard] On this PC: http://127.0.0.1:%CTF_AGENT_PORT%
-echo [Dashboard] Other PCs:  http://^<this-PC-LAN-IP^>:%CTF_AGENT_PORT%
+echo [Dashboard] http://127.0.0.1:%CTF_AGENT_PORT%
 echo [Mode] Configure CTFd in the dashboard or use a local challenge.
 echo [Stop] Press Ctrl+C in this window.
 echo.
