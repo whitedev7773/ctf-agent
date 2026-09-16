@@ -249,12 +249,37 @@ class AttackGraphStore:
             unknown = [item for item in merged_evidence if item not in evidence]
             if unknown:
                 raise ValueError(f"unknown evidence id: {unknown[0]}")
+            if status == "satisfied":
+                statuses = {item.id: item.status for item in state.nodes}
+                unmet = [
+                    edge.target
+                    for edge in state.edges
+                    if edge.kind == "requires"
+                    and edge.source == node.id
+                    and statuses.get(edge.target) != "satisfied"
+                ]
+                if unmet:
+                    raise ValueError(
+                        f"cannot satisfy {node.id}; required dependency {unmet[0]} is not satisfied"
+                    )
             if (
                 status == "satisfied"
                 and node.kind in {"primitive", "experiment"}
                 and not merged_evidence
             ):
                 raise ValueError(f"satisfied {node.kind} requires evidence")
+            if status == "satisfied" and node.kind == "goal":
+                decisive = [
+                    evidence[item]
+                    for item in merged_evidence
+                    if evidence[item].scope == "end_to_end"
+                    and evidence[item].environment in {"local", "live"}
+                ]
+                if not decisive:
+                    raise ValueError(
+                        "satisfied goal requires non-mock end_to_end evidence from an "
+                        "unmodified local target or live service"
+                    )
             if (
                 status == "refuted"
                 and node.kind == "hypothesis"
@@ -271,10 +296,35 @@ class AttackGraphStore:
             node.status = status
             node.evidence_ids = merged_evidence
             node.updated_at = time.time()
+            if status == "refuted":
+                self._invalidate_dependents(state, node.id)
             self._refresh_ready(state)
             self._touch(state)
             self._save(state)
             return replace(node)
+
+    @staticmethod
+    def _invalidate_dependents(state: AttackGraphState, node_id: str) -> None:
+        """Invalidate every node whose strict dependency chain includes a refutation."""
+        pending = [node_id]
+        seen = {node_id}
+        while pending:
+            dependency = pending.pop()
+            for edge in state.edges:
+                if edge.kind != "requires" or edge.target != dependency:
+                    continue
+                dependent = next(
+                    (item for item in state.nodes if item.id == edge.source),
+                    None,
+                )
+                if dependent is None or dependent.id in seen:
+                    continue
+                seen.add(dependent.id)
+                if dependent.status != "refuted":
+                    dependent.status = "unknown"
+                    dependent.owner_agent = ""
+                    dependent.updated_at = time.time()
+                pending.append(dependent.id)
 
     def ready_nodes(self, state: AttackGraphState | None = None) -> list[AttackNode]:
         graph = state or self.load()

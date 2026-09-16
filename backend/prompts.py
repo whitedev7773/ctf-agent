@@ -282,6 +282,20 @@ def build_prompt(
         "11. Do not guess or ask. Continue within the measured solve route.",
         "12. Treat generated files and static suspicion as leads, not evidence. A claimed primitive must "
         "cite source/offsets and, when the environment permits, one observed dynamic result.",
+        "12a. Label every recorded result by environment (static/mock/local/live) and scope "
+        "(component/integration/end_to_end). A mock proves only the code path it implements; explicitly "
+        "list omitted trust boundaries, network identity checks, timing, browser policy, and deployment "
+        "behavior. Never use a mock flag or a locally hard-coded success response as solve evidence.",
+        "12b. Model a multi-step exploit as separate required attack-graph nodes. Satisfying a leak, parser "
+        "primitive, or client request does not satisfy token reuse, authorization, code execution, or Flag "
+        "recovery. The root goal may be satisfied only by a non-mock end-to-end run against the unmodified "
+        "local target or live service.",
+        "12c. When stronger or newer evidence contradicts a supported route, immediately record negative "
+        "evidence, refute the exact hypothesis/graph node, update the blocker and next experiment, and treat "
+        "older handoffs as stale. Do this before further payload development or delegation.",
+        "12d. A single failed payload refutes only that exact payload and execution conditions. For browser "
+        "or parser experiments, preserve sanitizer output, final DOM/parsed structure, console/page errors, "
+        "and network events so failure mode can be distinguished from malformed test instrumentation.",
         "13. If two handoffs disagree, record the conflict before using either conclusion and run the "
         "smallest discriminating experiment. Never silently combine incompatible layouts or arithmetic.",
         "13a. Keep observed input length, solver variables, accepted input, and flag output as separate "

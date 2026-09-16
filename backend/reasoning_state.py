@@ -24,6 +24,8 @@ EvidenceKind = Literal[
     "candidate",
     "reproduction",
 ]
+EvidenceEnvironment = Literal["unknown", "static", "mock", "local", "live"]
+EvidenceScope = Literal["component", "integration", "end_to_end"]
 HypothesisStatus = Literal["candidate", "active", "supported", "refuted", "blocked"]
 SolvePhase = Literal["TRIAGE", "HYPOTHESIS_TEST", "EXPLOIT_BUILD", "VERIFY", "RECOVERY"]
 
@@ -71,6 +73,9 @@ class Evidence:
     observed_excerpt: str
     confidence: float
     source_agent: str = ""
+    environment: EvidenceEnvironment = "unknown"
+    scope: EvidenceScope = "component"
+    limitations: str = ""
     timestamp: float = field(default_factory=time.time)
 
 
@@ -137,7 +142,8 @@ class ReasoningStateStore:
     """Atomic JSON store shared by the lead and its delegates."""
 
     def __init__(self, shared_root: str | Path) -> None:
-        self.path = Path(shared_root) / "reasoning" / "state.json"
+        self.shared_root = Path(shared_root)
+        self.path = self.shared_root / "reasoning" / "state.json"
         self._lock = _shared_lock(self.path)
 
     def load(self) -> SolveState:
@@ -172,6 +178,60 @@ class ReasoningStateStore:
             encoding="utf-8",
         )
         temporary.replace(self.path)
+        self._write_lead_summary(state)
+
+    def _write_lead_summary(self, state: SolveState) -> None:
+        """Keep the human checkpoint synchronized with the authoritative ledger."""
+        hypotheses = sorted(state.hypotheses, key=lambda item: item.updated_at, reverse=True)
+        active = next(
+            (item for item in state.hypotheses if item.id == state.active_hypothesis),
+            None,
+        )
+        recent_evidence = state.evidence[-5:]
+        lines = [
+            "# STATE",
+            "",
+            "> Generated from `reasoning/state.json`; do not edit by hand.",
+            "",
+            f"- Phase: `{state.phase}`",
+            f"- Active hypothesis: `{state.active_hypothesis or 'none'}`",
+            f"- Current blocker: {state.current_blocker or 'not recorded'}",
+            f"- Next experiment: {state.next_experiment or 'not recorded'}",
+            "",
+            "## Active hypothesis",
+            "",
+            (
+                f"- {active.id} [{active.status}, confidence={active.confidence:.2f}] "
+                f"{active.statement}"
+                if active
+                else "- None"
+            ),
+            "",
+            "## Recent evidence",
+            "",
+        ]
+        lines.extend(
+            f"- {item.id} [{item.kind}; {item.environment}/{item.scope}] {item.claim}"
+            + (f" Limitation: {item.limitations}" if item.limitations else "")
+            for item in recent_evidence
+        )
+        if not recent_evidence:
+            lines.append("- None")
+        lines.extend(["", "## Recent hypotheses", ""])
+        lines.extend(
+            f"- {item.id} [{item.status}] {item.statement}" for item in hypotheses[:8]
+        )
+        if not hypotheses:
+            lines.append("- None")
+        lines.extend(["", "## Contradictions", ""])
+        lines.extend(f"- {item}" for item in state.contradictions[-8:])
+        if not state.contradictions:
+            lines.append("- None")
+        summary = self.shared_root / "lead" / "STATE.md"
+        summary.parent.mkdir(parents=True, exist_ok=True)
+        temporary = summary.with_suffix(".md.tmp")
+        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        temporary.replace(summary)
 
     @staticmethod
     def _event(state: SolveState, event: str) -> None:
@@ -188,12 +248,26 @@ class ReasoningStateStore:
         confidence: float,
         observation: Observation,
         source_agent: str = "",
+        environment: EvidenceEnvironment = "unknown",
+        scope: EvidenceScope = "component",
+        limitations: str = "",
     ) -> Evidence:
         if kind not in {"static", "dynamic", "network", "negative", "candidate", "reproduction"}:
             raise ValueError(f"unsupported evidence kind: {kind}")
         claim = " ".join(claim.split())[:4000]
         if not claim:
             raise ValueError("evidence claim is required")
+        if environment not in {"unknown", "static", "mock", "local", "live"}:
+            raise ValueError(f"unsupported evidence environment: {environment}")
+        if scope not in {"component", "integration", "end_to_end"}:
+            raise ValueError(f"unsupported evidence scope: {scope}")
+        limitations = " ".join(limitations.split())[:3000]
+        if environment == "mock" and not limitations:
+            raise ValueError("mock evidence requires explicit limitations")
+        if scope == "end_to_end" and environment in {"unknown", "static", "mock"}:
+            raise ValueError(
+                "end_to_end evidence requires an unmodified local target or live service"
+            )
         evidence = Evidence(
             id=f"EV-{uuid.uuid4().hex[:12]}",
             kind=kind,
@@ -205,11 +279,14 @@ class ReasoningStateStore:
             observed_excerpt=observation.observed_excerpt,
             confidence=max(0.0, min(1.0, float(confidence))),
             source_agent=source_agent[:300],
+            environment=environment,
+            scope=scope,
+            limitations=limitations,
         )
         async with self._lock:
             state = self.load()
             state.evidence.append(evidence)
-            if kind == "reproduction":
+            if kind == "reproduction" and scope == "end_to_end":
                 event = "REPRODUCER_PASSED"
                 state.phase = "VERIFY"
             elif kind == "candidate":

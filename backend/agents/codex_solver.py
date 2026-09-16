@@ -49,7 +49,9 @@ from backend.prompts import (
     list_distfiles,
 )
 from backend.reasoning_state import (
+    EvidenceEnvironment,
     EvidenceKind,
+    EvidenceScope,
     HypothesisStatus,
     ReasoningStateStore,
     observation_from_result,
@@ -409,7 +411,9 @@ REASONING_TOOLS: list[dict[str, Any]] = [
     {
         "name": "record_evidence",
         "description": (
-            "Record a verifiable claim backed by a runtime observation receipt returned by a prior tool call."
+            "Record a verifiable claim backed by a runtime observation receipt. Declare the "
+            "execution environment and the exact scope proved; mock evidence must name what it "
+            "does not validate and can never be end-to-end."
         ),
         "inputSchema": {
             "type": "object",
@@ -428,8 +432,24 @@ REASONING_TOOLS: list[dict[str, Any]] = [
                 },
                 "claim": {"type": "string"},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "environment": {
+                    "type": "string",
+                    "enum": ["static", "mock", "local", "live"],
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["component", "integration", "end_to_end"],
+                },
+                "limitations": {"type": "string"},
             },
-            "required": ["observation_id", "kind", "claim", "confidence"],
+            "required": [
+                "observation_id",
+                "kind",
+                "claim",
+                "confidence",
+                "environment",
+                "scope",
+            ],
         },
     },
     {
@@ -1749,6 +1769,11 @@ class CodexSolver:
                     confidence=float(args.get("confidence", 0.0)),
                     observation=observation,
                     source_agent=self.model_spec,
+                    environment=cast(
+                        EvidenceEnvironment, str(args.get("environment", "unknown"))
+                    ),
+                    scope=cast(EvidenceScope, str(args.get("scope", "component"))),
+                    limitations=str(args.get("limitations", "")),
                 )
             except (TypeError, ValueError, OSError) as exc:
                 return f"EVIDENCE REJECTED: {exc}"
@@ -1757,9 +1782,14 @@ class CodexSolver:
                 event="NEW_EVIDENCE",
                 evidence_id=evidence.id,
                 evidence_kind=evidence.kind,
+                evidence_environment=evidence.environment,
+                evidence_scope=evidence.scope,
                 confidence=evidence.confidence,
             )
-            return f"EVIDENCE RECORDED: {evidence.id} ({evidence.kind})"
+            return (
+                f"EVIDENCE RECORDED: {evidence.id} ({evidence.kind}; "
+                f"{evidence.environment}/{evidence.scope})"
+            )
         elif name == "update_hypothesis":
             try:
                 hypothesis = await self.reasoning_state_store.upsert_hypothesis(

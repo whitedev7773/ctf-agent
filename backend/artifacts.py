@@ -176,6 +176,8 @@ def _artifact_score(path: Path, root: Path) -> int | None:
         "graph/attack-graph.json.tmp",
         "graph/task-leases.json",
         "graph/task-leases.json.tmp",
+        "lead/state.md",
+        "lead/state.md.tmp",
     }:
         return None
     lowered = path.name.casefold()
@@ -371,6 +373,10 @@ def handoff_quality_issues(path: str | Path) -> list[str]:
             "## assumptions and conflicts",
             "## assumptions/conflicts",
             "## 가정과 충돌",
+        ),
+        "scope/limitations": (
+            "## scope and limitations",
+            "## scope/limitations",
         ),
     }
     for label, markers in required_sections.items():

@@ -199,11 +199,14 @@ async def test_codex_state_tools_use_runtime_observation_receipt(tmp_path: Path)
             "kind": "dynamic",
             "claim": "The runtime emitted the expected signal.",
             "confidence": 0.95,
+            "environment": "local",
+            "scope": "component",
         },
     )
 
     assert str(result).startswith("EVIDENCE RECORDED: EV-")
     assert solver.reasoning_state_store.load().evidence[0].source_command == "printf signal"
+    assert solver.reasoning_state_store.load().evidence[0].environment == "local"
     assert {tool["name"] for tool in REASONING_TOOLS} == {
         "record_evidence",
         "update_hypothesis",
@@ -212,6 +215,64 @@ async def test_codex_state_tools_use_runtime_observation_receipt(tmp_path: Path)
         "sync_findings",
         "search_experience",
     }
+
+
+@pytest.mark.asyncio
+async def test_mock_evidence_requires_limitations_and_cannot_be_end_to_end(
+    tmp_path: Path,
+) -> None:
+    store = ReasoningStateStore(tmp_path)
+    observation = observation_from_result(
+        "OBS-mock", "bash", {"command": "python3 harness.py"}, "MOCK_FLAG"
+    )
+    with pytest.raises(ValueError, match="explicit limitations"):
+        await store.record_evidence(
+            kind="reproduction",
+            claim="The mock returned a flag.",
+            confidence=0.9,
+            observation=observation,
+            environment="mock",
+            scope="integration",
+        )
+    with pytest.raises(ValueError, match="end_to_end evidence"):
+        await store.record_evidence(
+            kind="reproduction",
+            claim="The mock returned a flag.",
+            confidence=0.9,
+            observation=observation,
+            environment="mock",
+            scope="end_to_end",
+            limitations="The real authorization boundary is omitted.",
+        )
+
+
+@pytest.mark.asyncio
+async def test_generated_lead_state_tracks_authoritative_ledger(tmp_path: Path) -> None:
+    store = ReasoningStateStore(tmp_path)
+    observation = observation_from_result(
+        "OBS-live", "bash", {"command": "curl target"}, "403 no login"
+    )
+    evidence = await store.record_evidence(
+        kind="negative",
+        claim="Remote token reuse was rejected.",
+        confidence=0.99,
+        observation=observation,
+        environment="live",
+        scope="integration",
+        limitations="JWT exfiltration remains valid; only external reuse failed.",
+    )
+    await store.upsert_hypothesis(
+        hypothesis_id="H-reuse",
+        statement="A captured token can be reused externally.",
+        status="refuted",
+        evidence_against=[evidence.id],
+        pivot_if_absent="Execute the purchase inside the bot origin.",
+    )
+
+    summary = (tmp_path / "lead" / "STATE.md").read_text(encoding="utf-8")
+    assert "Generated from `reasoning/state.json`" in summary
+    assert "Remote token reuse was rejected" in summary
+    assert "H-reuse [refuted]" in summary
 
 
 @pytest.mark.asyncio

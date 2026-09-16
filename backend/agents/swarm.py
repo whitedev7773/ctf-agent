@@ -434,7 +434,10 @@ class ChallengeSwarm:
                 f"paths in the handoff. "
                 f"Write the result to `{handoff}` using exactly these sections: "
                 "`## Conclusion` (SUPPORTED/REFUTED/INCONCLUSIVE), `## Evidence`, "
-                "`## Reproduction`, and `## Assumptions and conflicts`. Include commands or scripts "
+                "`## Reproduction`, `## Scope and limitations`, and "
+                "`## Assumptions and conflicts`. Scope must name the environment "
+                "(static/mock/local/live), the exact boundary proved, and every downstream step "
+                "that remains unverified. Include commands or scripts "
                 "and observed output. Under `## Reproduction`, include a fenced YAML block with "
                 "`reproducer.command`, `reproducer.expect.exit_code`, and "
                 "`reproducer.expect.stdout_contains`; the runtime executes it in a clean tool call. "
@@ -544,7 +547,10 @@ class ChallengeSwarm:
                 f"Read `{summary_path}` and `{source_handoff}` when present. Check claims against "
                 "the already shared source/evidence, repair arithmetic contradictions, and write "
                 f"`{handoff}` with `## Conclusion` (SUPPORTED/REFUTED/INCONCLUSIVE), `## Evidence`, "
-                "`## Reproduction`, and `## Assumptions and conflicts`. State the single next action "
+                "`## Reproduction`, `## Scope and limitations`, and "
+                "`## Assumptions and conflicts`. Never promote a component or mock success to a "
+                "complete exploit. If newer evidence contradicts the source handoff, mark the old "
+                "claim REFUTED and make the contradiction the primary conclusion. State the single next action "
                 "for SOL, call `notify_coordinator`, then stop."
             )
             self.delegate_requests[model_spec] = {

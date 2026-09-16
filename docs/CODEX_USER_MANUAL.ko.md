@@ -694,7 +694,7 @@ SOL은 초기 triage를 직접 수행한 뒤 `delegate_task`로 좁고 독립적
 
 실행 중인 Codex turn에 coordinator 지시나 audit를 통과한 Delegate handoff가 도착하면 현재 turn을 즉시 interrupt하고 누적된 지시를 다음 turn에 반영한다. model/tool protocol 활동이 기본 300초 동안 없을 때도 idle watchdog이 같은 방식으로 현재 turn만 회수한다. 실행 중인 sandbox command는 해당 command timeout이 담당하므로 idle watchdog이 중간에 끊지 않는다. 대시보드의 agent card에는 현재 idle 시간과 적용되는 limit이 표시된다.
 
-각 delegate handoff에는 `Conclusion`, `Evidence`, `Reproduction`, `Assumptions and conflicts` 절이 필요하다. `check_delegates`는 이를 검사해 `passed` 또는 `UNSAFE`를 표시한다. SOL은 `UNSAFE` 결과를 그대로 통합하지 않고 상충하는 offset·allocator·수식 등을 가장 작은 판별 실험으로 확인한다. 표현만 바꾼 유사 작업의 중복 위임, 문제 전체 위임, 동시·누적 한도 초과 요청은 거부된다. `--models`를 여러 번 지정하면 해당 모델들은 처음부터 실행되는 고정 primary roster가 되므로 기본 적응형 구성이 더 효율적이다.
+각 delegate handoff에는 `Conclusion`, `Evidence`, `Reproduction`, `Scope and limitations`, `Assumptions and conflicts` 절이 필요하다. 범위 절에는 실행 환경(`static`/`mock`/`local`/`live`), 실제로 검증한 경계, 아직 검증하지 않은 후속 단계를 적는다. `check_delegates`는 이를 검사해 `passed` 또는 `UNSAFE`를 표시한다. SOL은 `UNSAFE` 결과를 그대로 통합하지 않고 상충하는 offset·allocator·수식 등을 가장 작은 판별 실험으로 확인한다. mock의 성공 응답이나 구성요소 단위 재현은 전체 exploit 성공으로 승격할 수 없으며, root goal은 변경하지 않은 로컬 대상 또는 live 서비스에서 얻은 end-to-end 증거가 있어야 완료된다. 표현만 바꾼 유사 작업의 중복 위임, 문제 전체 위임, 동시·누적 한도 초과 요청은 거부된다. `--models`를 여러 번 지정하면 해당 모델들은 처음부터 실행되는 고정 primary roster가 되므로 기본 적응형 구성이 더 효율적이다.
 
 Delegate가 token·step·시간·시도 한도로 중단되면 runtime은 중단 사유, 마지막 findings, 원래 요청과 handoff 감사를 `/challenge/shared/recovery/*-budget-stop.md`에 먼저 저장하고 SOL 전용 메시지로 전달한다. 원래 handoff가 감사를 통과하면 추가 모델을 만들지 않는다. handoff가 없거나 `UNSAFE`일 때만 80K 유효 token·1회 시도의 후처리 Luna를 최대 한 개 생성한다. 후처리 worker는 새로운 풀이를 시작하지 않고 기존 증거의 모순을 정리하며, 다시 중단돼도 다른 후처리 worker를 재귀적으로 만들지 않는다.
 

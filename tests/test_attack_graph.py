@@ -91,6 +91,61 @@ async def test_terminal_transitions_are_evidence_gated(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_goal_requires_non_mock_end_to_end_evidence(tmp_path: Path) -> None:
+    reasoning = ReasoningStateStore(tmp_path)
+    graph = AttackGraphStore(tmp_path, reasoning)
+    goal = await graph.add_node(kind="goal", title="Recover the flag")
+    observation = observation_from_result(
+        "OBS-local", "bash", {"command": "./solve.py"}, "FLAG{real}"
+    )
+    component = await reasoning.record_evidence(
+        kind="reproduction",
+        claim="The leak primitive works.",
+        confidence=0.95,
+        observation=observation,
+        environment="local",
+        scope="component",
+    )
+    with pytest.raises(ValueError, match="end_to_end evidence"):
+        await graph.transition(goal.id, "satisfied", evidence_ids=[component.id])
+
+    decisive = await reasoning.record_evidence(
+        kind="reproduction",
+        claim="The unmodified local target emitted the flag.",
+        confidence=0.99,
+        observation=observation,
+        environment="local",
+        scope="end_to_end",
+    )
+    solved = await graph.transition(goal.id, "satisfied", evidence_ids=[decisive.id])
+    assert solved.status == "satisfied"
+
+
+@pytest.mark.asyncio
+async def test_refuted_dependency_invalidates_satisfied_ancestors(tmp_path: Path) -> None:
+    reasoning = ReasoningStateStore(tmp_path)
+    graph = AttackGraphStore(tmp_path, reasoning)
+    goal = await graph.add_node(kind="goal", title="Recover the flag")
+    primitive = await graph.add_node(kind="primitive", title="Reuse token")
+    hypothesis = await graph.add_node(kind="hypothesis", title="Proxy grants loopback")
+    await graph.add_edge(goal.id, primitive.id, "requires")
+    await graph.add_edge(primitive.id, hypothesis.id, "requires")
+
+    positive = await _evidence(reasoning, marker="local-model")
+    with pytest.raises(ValueError, match="required dependency"):
+        await graph.transition(primitive.id, "satisfied", evidence_ids=[positive])
+    await graph.transition(hypothesis.id, "satisfied", evidence_ids=[positive])
+    await graph.transition(primitive.id, "satisfied", evidence_ids=[positive])
+
+    negative = await _evidence(reasoning, kind="negative", marker="live-rejection")
+    await graph.transition(hypothesis.id, "refuted", evidence_ids=[negative])
+    statuses = {item.id: item.status for item in graph.load().nodes}
+    assert statuses[hypothesis.id] == "refuted"
+    assert statuses[primitive.id] == "unknown"
+    assert statuses[goal.id] == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_active_transition_requires_live_lease(tmp_path: Path) -> None:
     graph = AttackGraphStore(tmp_path)
     scheduler = GraphScheduler(graph)

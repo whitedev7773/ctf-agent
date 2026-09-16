@@ -228,6 +228,7 @@ class ArtifactAndProfileTests(unittest.TestCase):
                 "## Conclusion\nSUPPORTED\n"
                 "## Evidence\nObserved address delta: 0x130.\n"
                 "## Reproduction\n`python3 /challenge/workspace/harness.py`\n"
+                "## Scope and limitations\nLocal component test; deployment behavior unverified.\n"
                 "## Assumptions and conflicts\nConflicts with the old 0x10 claim.\n",
                 encoding="utf-8",
             )
@@ -1814,6 +1815,7 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
                 "## Conclusion\nREFUTED\n## Evidence\nObserved rejection.\n"
                 "## Reproduction\n```yaml\nreproducer:\n  command: python3 repro.py\n"
                 "  expect:\n    exit_code: 0\n    stdout_contains: REPRO_OK\n```\n"
+                "## Scope and limitations\nLocal component rejection only.\n"
                 "## Assumptions and conflicts\nNone.\n",
                 encoding="utf-8",
             )
@@ -2000,6 +2002,7 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
             handoff.write_text(
                 "## Conclusion\nSUPPORTED\n## Evidence\nObserved.\n"
                 "## Reproduction\n`python3 repro.py`\n"
+                "## Scope and limitations\nLocal component test only.\n"
                 "## Assumptions and conflicts\nNone.\n",
                 encoding="utf-8",
             )
