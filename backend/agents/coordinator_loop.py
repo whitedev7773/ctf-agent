@@ -259,6 +259,13 @@ async def run_event_loop(
 
             parts: list[str] = []
             for evt in events:
+                event_fields = []
+                if evt.details.get("category"):
+                    event_fields.append(("카테고리", str(evt.details["category"])))
+                if evt.details.get("value") is not None:
+                    event_fields.append(("점수", str(evt.details["value"])))
+                if evt.details.get("solves") is not None:
+                    event_fields.append(("풀이 수", str(evt.details["solves"])))
                 if evt.kind == "new_challenge":
                     if evt.challenge_name in dismissed:
                         continue
@@ -267,7 +274,7 @@ async def run_event_loop(
                         "challenge_added",
                         evt.challenge_name,
                         description=f"**{evt.challenge_name}** 문제가 CTFd에 추가되었습니다.",
-                        fields=[("출처", "CTFd")],
+                        fields=[("출처", "CTFd"), *event_fields],
                     )
                     parts.append(f"NEW CHALLENGE: '{evt.challenge_name}' appeared. Spawn a swarm.")
                     # Auto-spawn for new challenges
@@ -278,6 +285,7 @@ async def run_event_loop(
                         "solve_completed",
                         evt.challenge_name,
                         description=f"**{evt.challenge_name}** 문제가 해결되었습니다.",
+                        fields=event_fields,
                     )
                     parts.append(f"SOLVED: '{evt.challenge_name}' — swarm auto-killed.")
                     getattr(deps, "swarm_retry_after", {}).pop(evt.challenge_name, None)

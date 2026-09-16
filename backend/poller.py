@@ -104,6 +104,7 @@ class CTFdPoller:
         try:
             stubs = await self.ctfd.fetch_challenge_stubs()
             current_names = {ch["name"] for ch in stubs}
+            stubs_by_name = {ch["name"]: ch for ch in stubs}
             current_solved = await self.ctfd.fetch_solved_names()
 
             # Sanity check: if results look bogus compared to what we know, skip.
@@ -120,7 +121,7 @@ class CTFdPoller:
             for name in new_challenges:
                 logger.info("New challenge detected: %s", name)
                 self._event_queue.put_nowait(
-                    PollEvent("new_challenge", name)
+                    PollEvent("new_challenge", name, details=stubs_by_name.get(name, {}))
                 )
 
             # Detect newly solved
@@ -128,7 +129,7 @@ class CTFdPoller:
             for name in new_solves:
                 logger.info("Challenge solved: %s", name)
                 self._event_queue.put_nowait(
-                    PollEvent("challenge_solved", name)
+                    PollEvent("challenge_solved", name, details=stubs_by_name.get(name, {}))
                 )
 
             self._known_challenges = current_names

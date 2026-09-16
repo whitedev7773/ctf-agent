@@ -260,6 +260,34 @@ def _resource_totals(resources: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _writeup_notification_fields(status: dict[str, Any]) -> list[tuple[str, str]]:
+    """Summarize a persisted writeup state for a compact Discord embed."""
+    fields: list[tuple[str, str]] = []
+    if status.get("targeted_revision"):
+        fields.append(("작업", "부족한 항목 수정 및 재검수"))
+    model_spec = str(status.get("model_spec", "") or "").strip()
+    review_model_spec = str(status.get("review_model_spec", "") or "").strip()
+    if model_spec:
+        fields.append(("작성 모델", model_spec))
+    if review_model_spec:
+        fields.append(("검수 모델", review_model_spec))
+    if "reviewed" in status:
+        fields.append(("검수", "승인" if status.get("reviewed") else "미승인"))
+    writeup_path = str(status.get("writeup_path", "") or "").strip()
+    if writeup_path:
+        fields.append(("문서", writeup_path))
+    screenshots = status.get("screenshots", [])
+    reproducers = status.get("reproducers", [])
+    if isinstance(screenshots, list):
+        fields.append(("스크린샷", f"{len(screenshots)}개"))
+    if isinstance(reproducers, list):
+        fields.append(("재현 자료", f"{len(reproducers)}개"))
+    issues = [str(item).strip() for item in status.get("issues", []) if str(item).strip()]
+    if issues:
+        fields.append(("확인 필요", "\n".join(f"• {issue}" for issue in issues[:5])))
+    return fields
+
+
 class DashboardServer:
     """Serve dashboard assets and same-process coordinator controls."""
 
@@ -1225,6 +1253,20 @@ class DashboardServer:
         targeted_revision: bool = False,
     ) -> None:
         challenge_dir = self.deps.challenge_dirs.get(name, self.deps.challenges_root)
+        initial_status = writeup_status(self.deps.settings, name, solved=True)
+        attempt_id = str(initial_status.get("started_at", "") or "")
+        await notify_discord(
+            self.deps,
+            "writeup_started",
+            name,
+            description=(
+                f"**{name}** 라이트업의 부족한 항목 수정과 재검수를 시작했습니다."
+                if targeted_revision
+                else f"**{name}** 라이트업 작성과 검수를 시작했습니다."
+            ),
+            fields=_writeup_notification_fields(initial_status),
+            dedupe_key=f"writeup-started:{name}:{attempt_id}",
+        )
         try:
             timeout = max(
                 60,
@@ -1324,6 +1366,28 @@ class DashboardServer:
         if name in self.deps.results:
             self.deps.results[name]["writeup"] = status
         persist_deps_state(self.deps)
+        history = status.get("history", [])
+        latest_event = ""
+        if isinstance(history, list) and history and isinstance(history[-1], dict):
+            latest_event = str(history[-1].get("event", ""))
+        if status.get("documented"):
+            notification_event = "writeup_completed"
+            description = f"**{name}** 라이트업 작성과 품질 검수를 완료했습니다."
+        elif latest_event == "failed":
+            notification_event = "writeup_failed"
+            description = f"**{name}** 라이트업 생성이 완료되지 않았습니다. 다시 요청할 수 있습니다."
+        else:
+            notification_event = "writeup_needs_attention"
+            description = f"**{name}** 라이트업 검수에서 보완할 항목이 발견되었습니다."
+        attempt_id = str(status.get("started_at") or status.get("updated_at") or "")
+        await notify_discord(
+            self.deps,
+            notification_event,
+            name,
+            description=description,
+            fields=_writeup_notification_fields(status),
+            dedupe_key=f"{notification_event}:{name}:{attempt_id}",
+        )
 
     async def start_writeup_generation(self, name: str) -> dict[str, Any]:
         """Schedule the same AI pipeline for automatic and manual requests."""

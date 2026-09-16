@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -14,7 +15,54 @@ _COLORS = {
     "challenge_added": 0x3498DB,
     "solve_completed": 0x2ECC71,
     "candidate_review": 0xF1C40F,
+    "writeup_started": 0x3498DB,
+    "writeup_completed": 0x2ECC71,
+    "writeup_needs_attention": 0xF1C40F,
+    "writeup_failed": 0xE74C3C,
 }
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}시간 {minutes}분 {seconds}초"
+    if minutes:
+        return f"{minutes}분 {seconds}초"
+    return f"{seconds}초"
+
+
+def _challenge_context_fields(deps: object, challenge_name: str) -> list[tuple[str, str]]:
+    """Build useful problem and accounting context without coupling the notifier to deps types."""
+    fields: list[tuple[str, str]] = []
+    metas = getattr(deps, "challenge_metas", {})
+    meta = metas.get(challenge_name) if isinstance(metas, dict) else None
+    if meta is not None:
+        category = str(getattr(meta, "category", "") or "").strip()
+        if category:
+            fields.append(("카테고리", category))
+        value = int(getattr(meta, "value", 0) or 0)
+        fields.append(("점수", str(value)))
+        solves = int(getattr(meta, "solves", 0) or 0)
+        if solves:
+            fields.append(("풀이 수", str(solves)))
+
+    tracker = getattr(deps, "cost_tracker", None)
+    usages = getattr(tracker, "by_agent", {})
+    if isinstance(usages, dict):
+        prefix = f"{challenge_name}/"
+        matching = [usage for name, usage in usages.items() if str(name).startswith(prefix)]
+        if matching:
+            models = sorted({str(getattr(usage, "model_name", "") or "") for usage in matching})
+            models = [model for model in models if model]
+            if models:
+                fields.append(("사용 모델", ", ".join(models)))
+            cost = sum(float(getattr(usage, "cost_usd", 0) or 0) for usage in matching)
+            duration = sum(float(getattr(usage, "duration_seconds", 0) or 0) for usage in matching)
+            fields.append(("누적 비용", f"${cost:.4f}"))
+            fields.append(("누적 실행 시간", _format_duration(duration)))
+    return fields
 
 
 class DiscordWebhookNotifier:
@@ -52,6 +100,10 @@ class DiscordWebhookNotifier:
             "challenge_added": "새 문제 추가",
             "solve_completed": "풀이 완료",
             "candidate_review": "Flag 후보 검증 요청",
+            "writeup_started": "라이트업 생성 시작",
+            "writeup_completed": "라이트업 생성 완료",
+            "writeup_needs_attention": "라이트업 보완 필요",
+            "writeup_failed": "라이트업 생성 실패",
         }
         embed: dict[str, Any] = {
             "title": titles.get(event, "CTF Agent 알림"),
@@ -62,6 +114,8 @@ class DiscordWebhookNotifier:
                 for name, value in (fields or [])
                 if name and value
             ][:25],
+            "footer": {"text": f"CTF Agent · {event}"},
+            "timestamp": datetime.now(UTC).isoformat(),
         }
         payload = {
             "username": "CTF Agent",
@@ -100,11 +154,19 @@ async def notify_discord(
     notifier = getattr(deps, "notifier", None)
     if not isinstance(notifier, DiscordWebhookNotifier):
         return False
+    enriched_fields = list(fields or [])
+    existing_names = {name for name, _value in enriched_fields}
+    enriched_fields.extend(
+        (name, value)
+        for name, value in _challenge_context_fields(deps, challenge_name)
+        if name not in existing_names
+        and not (name == "카테고리" and "분류" in existing_names)
+    )
     return await notifier.send(
         event,
         challenge_name,
         description=description,
-        fields=fields,
+        fields=enriched_fields,
         dedupe_key=dedupe_key,
     )
 
