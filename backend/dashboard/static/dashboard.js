@@ -33,6 +33,7 @@ const state = {
   codexUsageRefreshing: false,
   refreshing: false,
   ctfdInitialized: false,
+  discordInitialized: false,
   detailReturnChallenge: null,
   localFiles: [],
   candidateNotices: new Set(),
@@ -196,6 +197,7 @@ function initializeModals() {
   const operations = [
     ["runtime", "실행 설정", document.querySelector(".runtime-settings-section")],
     ["ctfd", "CTFd 연결", byId("ctfd-form").closest("article")],
+    ["discord", "Discord 알림", byId("discord-form").closest("article")],
     ["local", "문제 추가", byId("local-challenge-form").closest("article")],
     ["experience", "공유 경험", document.querySelector(".experience-panel")],
     ["maintenance", "환경 관리", document.querySelector(".maintenance-section")],
@@ -600,6 +602,20 @@ function renderOverview() {
   if (!state.ctfdInitialized) {
     byId("ctfd-url").value = ctfd.url || "";
     state.ctfdInitialized = true;
+  }
+  const discord = snapshot.discord || {};
+  const discordBadge = byId("discord-source-badge");
+  discordBadge.textContent = discord.configured ? "설정됨" : "미설정";
+  discordBadge.className = `source-badge ${discord.configured ? "connected" : "local"}`;
+  byId("discord-status-copy").textContent = discord.configured
+    ? "서버 알림이 활성화되어 있습니다. URL은 보안을 위해 표시하지 않습니다."
+    : "Discord 채널 웹훅을 연결하면 주요 진행 상황을 받을 수 있습니다.";
+  if (!state.discordInitialized) {
+    byId("discord-webhook-url").value = "";
+    byId("discord-webhook-url").placeholder = discord.configured
+      ? "새 URL을 입력하면 기존 설정을 교체합니다"
+      : "https://discord.com/api/webhooks/...";
+    state.discordInitialized = true;
   }
   renderRuntimeSettings(snapshot.runtime_settings || {});
 }
@@ -2453,6 +2469,40 @@ async function initialize() {
     }
   });
 
+  byId("discord-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const input = byId("discord-webhook-url");
+    if (!input.value.trim()) {
+      showToast("Discord 웹훅 URL을 입력하세요.", "error");
+      input.focus();
+      return;
+    }
+    const submit = event.currentTarget.querySelector("button[type=submit]");
+    const success = await runCommand(
+      "/api/settings/discord",
+      { webhook_url: input.value },
+      submit,
+    );
+    if (success) {
+      input.value = "";
+      state.discordInitialized = false;
+    }
+  });
+
+  byId("discord-disconnect").addEventListener("click", async (event) => {
+    const control = event.currentTarget;
+    if (!await confirmAction("Discord 웹훅 알림을 해제할까요?")) return;
+    const success = await runCommand(
+      "/api/settings/discord",
+      { webhook_url: "" },
+      control,
+    );
+    if (success) {
+      byId("discord-webhook-url").value = "";
+      state.discordInitialized = false;
+    }
+  });
+
   const resetDialog = byId("reset-dialog");
   const resetInput = byId("reset-confirmation");
   const resetSubmit = byId("reset-submit");
@@ -2482,10 +2532,12 @@ async function initialize() {
       state.candidateNotices.clear();
       state.detailDrafts.clear();
       state.ctfdInitialized = false;
+      state.discordInitialized = false;
       byId("ctfd-url").value = "";
       byId("ctfd-token").value = "";
       byId("ctfd-username").value = "";
       byId("ctfd-password").value = "";
+      byId("discord-webhook-url").value = "";
       resetDialog.close();
       resetInput.value = "";
       resetSubmit.disabled = true;

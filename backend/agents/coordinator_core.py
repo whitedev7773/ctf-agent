@@ -6,18 +6,24 @@ import asyncio
 import copy
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
 from backend.artifacts import challenge_shared_path
 from backend.deps import CoordinatorDeps
 from backend.experience import promote_challenge_experience
+from backend.notifications import notify_discord, spoiler
 from backend.prompts import ChallengeMeta
 from backend.runtime_state import persist_deps_state
 from backend.solver_base import FLAG_FOUND
 from backend.writeups import finalize_writeup
 
 logger = logging.getLogger(__name__)
+
+_EVIDENCE_FLAG_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])([A-Za-z][A-Za-z0-9_-]{0,63}\{[^{}\r\n]{1,500}\})"
+)
 
 _SOLUTION_REVIEW_CONTAINER_PATH = (
     "/challenge/shared/review/CURRENT_SOLUTION_REVIEW.md"
@@ -76,6 +82,68 @@ def _merge_candidate_record(
     )
     deps.candidates[challenge_name] = record
     return record
+
+
+def _candidate_flags_from_evidence(
+    deps: CoordinatorDeps,
+    challenge_name: str,
+) -> tuple[list[str], list[str]]:
+    """Recover output-backed candidates that were recorded before structured submission.
+
+    A solver can be cancelled after ``record_evidence(kind="candidate")`` but before
+    it calls ``submit_flag`` or returns ``CANDIDATE_FOUND``.  Only candidate evidence
+    with a concrete observed tool excerpt is eligible here; claims and ordinary notes
+    are deliberately ignored so this recovery path cannot promote an unsupported guess.
+    """
+    settings = getattr(deps, "settings", None)
+    if settings is None:
+        return [], []
+    state_path = Path(challenge_shared_path(settings, challenge_name)) / "reasoning" / "state.json"
+    try:
+        if state_path.stat().st_size > 10_000_000:
+            return [], []
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return [], []
+    if not isinstance(payload, dict):
+        return [], []
+
+    flags: list[str] = []
+    evidence_ids: list[str] = []
+    evidence = payload.get("evidence", [])
+    if not isinstance(evidence, list):
+        return [], []
+    for item in evidence[-200:]:
+        if not isinstance(item, dict) or item.get("kind") != "candidate":
+            continue
+        try:
+            confidence = float(item.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            continue
+        excerpt = item.get("observed_excerpt", "")
+        if confidence < 0.8 or not isinstance(excerpt, str) or not excerpt.strip():
+            continue
+        recovered = [match.group(1).strip() for match in _EVIDENCE_FLAG_PATTERN.finditer(excerpt)]
+        if not recovered:
+            continue
+        flags.extend(recovered)
+        evidence_id = str(item.get("id", "")).strip()
+        if evidence_id:
+            evidence_ids.append(evidence_id[:100])
+    return list(dict.fromkeys(flags))[:20], list(dict.fromkeys(evidence_ids))[:20]
+
+
+def preserve_evidence_candidates(deps: CoordinatorDeps, challenge_name: str) -> list[str]:
+    """Persist any output-backed candidate evidence for dashboard review."""
+    flags, evidence_ids = _candidate_flags_from_evidence(deps, challenge_name)
+    if not flags:
+        return []
+    source = "candidate evidence"
+    if evidence_ids:
+        source += ": " + ", ".join(evidence_ids)
+    _merge_candidate_record(deps, challenge_name, flags, source=source)
+    persist_deps_state(deps)
+    return flags
 
 
 def solution_review_guidance(settings: object, challenge_name: str) -> str:
@@ -282,15 +350,28 @@ async def do_spawn_swarm(
 
     async def _run_and_cleanup() -> None:
         result = await swarm.run()
-        flags = swarm.all_candidate_flags()
+        evidence_flags, evidence_ids = _candidate_flags_from_evidence(deps, challenge_name)
+        flags = list(dict.fromkeys([*swarm.all_candidate_flags(), *evidence_flags]))[:20]
         if flags:
-            sources = ", ".join(sorted(swarm.candidate_flags or swarm.candidates))
+            source_items = [*sorted(swarm.candidate_flags or swarm.candidates)]
+            if evidence_ids:
+                source_items.append("candidate evidence: " + ", ".join(evidence_ids))
+            sources = ", ".join(source_items)
             _merge_candidate_record(
                 deps,
                 challenge_name,
                 flags,
                 source=sources or "solver",
             )
+            if not result or result.status != FLAG_FOUND:
+                await notify_discord(
+                    deps,
+                    "candidate_review",
+                    challenge_name,
+                    description=f"**{challenge_name}** 문제의 Flag 후보를 확인해 주세요.",
+                    fields=[("후보", spoiler(flags[0])), ("출처", sources or "solver")],
+                    dedupe_key=f"candidate:{challenge_name}:{flags[0]}",
+                )
         # A solved result must have been confirmed by the live submission path.
         if result and result.status == FLAG_FOUND:
             deps.results[challenge_name] = {
@@ -298,6 +379,13 @@ async def do_spawn_swarm(
                 "submit": "confirmed by solver",
             }
             deps.candidates.pop(challenge_name, None)
+            await notify_discord(
+                deps,
+                "solve_completed",
+                challenge_name,
+                description=f"**{challenge_name}** 문제 풀이가 완료되었습니다.",
+                fields=[("Flag", spoiler(result.flag or ""))],
+            )
             meta = deps.challenge_metas[challenge_name]
             try:
                 deps.results[challenge_name]["writeup"] = await _generate_or_finalize_writeup(
@@ -361,10 +449,26 @@ async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) 
     if not deps.ctfd.is_configured:
         _merge_candidate_record(deps, challenge_name, [candidate], source="operator")
         persist_deps_state(deps)
+        await notify_discord(
+            deps,
+            "candidate_review",
+            challenge_name,
+            description=f"**{challenge_name}** 문제의 Flag 후보를 확인해 주세요.",
+            fields=[("후보", spoiler(candidate)), ("출처", "operator")],
+            dedupe_key=f"candidate:{challenge_name}:{candidate}",
+        )
         return format_warning + f'LOCAL CANDIDATE — recorded "{candidate}" for {challenge_name}'
     if deps.no_submit:
         _merge_candidate_record(deps, challenge_name, [candidate], source="operator/dry-run")
         persist_deps_state(deps)
+        await notify_discord(
+            deps,
+            "candidate_review",
+            challenge_name,
+            description=f"**{challenge_name}** 문제의 Flag 후보를 확인해 주세요.",
+            fields=[("후보", spoiler(candidate)), ("출처", "operator/dry-run")],
+            dedupe_key=f"candidate:{challenge_name}:{candidate}",
+        )
         return format_warning + f'DRY RUN — recorded unverified candidate "{candidate}" for {challenge_name}'
     swarm = getattr(deps, "swarms", {}).get(challenge_name)
     if swarm:
@@ -422,6 +526,13 @@ async def do_review_candidate(
             except Exception as exc:
                 logger.warning("Could not finalize documentation for %s: %s", challenge_name, exc)
         persist_deps_state(deps)
+        await notify_discord(
+            deps,
+            "solve_completed",
+            challenge_name,
+            description=f"**{challenge_name}** 문제를 운영자가 해결로 확정했습니다.",
+            fields=[("Flag", spoiler(candidate))],
+        )
         return f'LOCAL CONFIRMED — recorded "{candidate}" as solved for {challenge_name}'
 
     record = dict(record)
@@ -502,7 +613,13 @@ async def do_kill_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
     swarm = deps.swarms.get(challenge_name)
     if not swarm:
         return f"No swarm running for {challenge_name}"
+    preserved = preserve_evidence_candidates(deps, challenge_name)
     swarm.kill()
+    if preserved:
+        return (
+            f"Swarm for {challenge_name} cancelled; preserved "
+            f"{len(preserved)} unverified candidate(s) from evidence"
+        )
     return f"Swarm for {challenge_name} cancelled"
 
 

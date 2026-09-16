@@ -149,6 +149,7 @@ uv run ctf-solve `
 ```dotenv
 CTFD_URL=
 CTFD_TOKEN=
+DISCORD_WEBHOOK_URL=
 
 OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
@@ -167,7 +168,12 @@ DELEGATE_MAX_AGENTS=4
 DELEGATE_MAX_CONCURRENT=2
 ```
 
-시간, token, step, writeup, postprocess 등 전체 설정과 기본값은 [.env.example](.env.example)을 참고하세요. 기본 `challenges/` 경로를 사용할 때 Dashboard에서 바꾼 runtime 설정과 CTFd 연결 정보는 프로젝트 루트의 git-ignore된 `.ctf-agent-settings.json`에 저장되며 다음 실행에도 적용됩니다. CTFd token과 password도 로컬 파일에 평문으로 저장되므로 이 파일을 외부에 공유하지 마세요.
+`DISCORD_WEBHOOK_URL`을 설정하면 새 문제 등록, 풀이 완료, 운영자 검증이 필요한
+Flag 후보를 Discord 채널로 알립니다. Flag 값은 스포일러로 표시되며 웹훅 전송 실패는
+solver 실행에 영향을 주지 않습니다. 실행 중에는 대시보드의 `Discord 알림` 설정에서
+웹훅을 저장·테스트하거나 해제할 수 있습니다.
+
+시간, token, step, writeup, postprocess 등 전체 설정과 기본값은 [.env.example](.env.example)을 참고하세요. 기본 `challenges/` 경로를 사용할 때 Dashboard에서 바꾼 runtime 설정, CTFd 연결 정보, Discord 웹훅은 프로젝트 루트의 git-ignore된 `.ctf-agent-settings.json`에 저장되며 다음 실행에도 적용됩니다. CTFd token, password, Discord 웹훅은 로컬 파일에 평문으로 저장되므로 이 파일을 외부에 공유하지 마세요.
 
 Windows에서 `codex`가 `PATH`에 없다면 `.env`에 실행 파일을 지정할 수 있습니다.
 

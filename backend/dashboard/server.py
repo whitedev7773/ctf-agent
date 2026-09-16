@@ -36,15 +36,18 @@ from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.experience import experience_root, experience_summary
 from backend.model_specs import provider_from_spec
+from backend.notifications import notify_discord
 from backend.prompts import ChallengeMeta, list_distfiles
 from backend.runtime_clock import RuntimeClock
 from backend.runtime_settings import (
     CTFdSettings,
+    DiscordSettings,
     RuntimeSettings,
     apply_runtime_settings,
     reset_runtime_settings,
     runtime_settings_from,
     save_ctfd_settings,
+    save_discord_settings,
     save_runtime_settings,
 )
 from backend.runtime_state import persist_deps_state
@@ -318,6 +321,7 @@ class DashboardServer:
                 web.get("/api/trace", self._trace),
                 web.get("/api/settings/runtime", self._runtime_settings),
                 web.post("/api/settings/ctfd", self._configure_ctfd),
+                web.post("/api/settings/discord", self._configure_discord),
                 web.post("/api/settings/runtime", self._configure_runtime),
                 web.post("/api/settings/runtime/reset", self._reset_runtime_settings),
                 web.post("/api/challenges/local", self._create_local_challenge),
@@ -748,6 +752,11 @@ class DashboardServer:
                 "url": ctfd.base_url if configured else "",
                 "token_configured": bool(getattr(ctfd, "token", "")) if configured else False,
                 "error": getattr(self.poller, "last_error", ""),
+            },
+            "discord": {
+                "configured": bool(
+                    getattr(getattr(self.deps, "notifier", None), "enabled", False)
+                ),
             },
             "models": self.deps.model_specs,
             "max_concurrent_challenges": self.deps.max_concurrent_challenges,
@@ -1740,6 +1749,55 @@ class DashboardServer:
             }
         )
 
+    async def _configure_discord(self, request: web.Request) -> web.Response:
+        """Validate, test, and persist a Discord webhook without returning its secret."""
+        from backend.notifications import DiscordWebhookNotifier
+
+        self._require_csrf(request)
+        data = await self._json_body(request)
+        try:
+            connection = DiscordSettings(webhook_url=str(data.get("webhook_url", "")))
+        except ValueError as exc:
+            raise web.HTTPBadRequest(
+                text="유효한 HTTPS Discord 웹훅 URL을 입력하세요."
+            ) from exc
+
+        async with self._command_lock:
+            if not connection.webhook_url:
+                try:
+                    save_discord_settings(connection, self.deps.challenges_root)
+                except OSError as exc:
+                    raise web.HTTPInternalServerError(
+                        text=f"Discord 웹훅 설정을 저장하지 못했습니다: {exc}"
+                    ) from exc
+                self.deps.settings.discord_webhook_url = ""
+                self.deps.notifier = DiscordWebhookNotifier()
+                return web.json_response(
+                    {"ok": True, "message": "Discord 웹훅 알림을 해제했습니다."}
+                )
+
+            candidate = DiscordWebhookNotifier(connection.webhook_url)
+            delivered = await candidate.send(
+                "test",
+                "dashboard",
+                description="CTF Agent 대시보드에서 Discord 웹훅 연결을 확인했습니다.",
+                dedupe_key="dashboard:webhook-test",
+            )
+            if not delivered:
+                raise web.HTTPBadGateway(text="Discord 테스트 알림 전송에 실패했습니다.")
+            try:
+                save_discord_settings(connection, self.deps.challenges_root)
+            except OSError as exc:
+                raise web.HTTPInternalServerError(
+                    text=f"Discord 웹훅 설정을 저장하지 못했습니다: {exc}"
+                ) from exc
+            self.deps.settings.discord_webhook_url = connection.webhook_url
+            self.deps.notifier = candidate
+
+        return web.json_response(
+            {"ok": True, "message": "Discord 테스트 알림을 전송하고 웹훅을 저장했습니다."}
+        )
+
     async def _create_local_challenge(self, request: web.Request) -> web.Response:
         """Create one standalone challenge and save optional attachments locally."""
         self._require_csrf(request)
@@ -1846,6 +1904,17 @@ class DashboardServer:
                 shutil.rmtree(destination_dir, ignore_errors=True)
             raise
         attachment_copy = f" 첨부 파일 {file_count}개를 저장했습니다." if file_count else ""
+        await notify_discord(
+            self.deps,
+            "challenge_added",
+            name,
+            description=f"**{name}** 로컬 문제가 추가되었습니다.",
+            fields=[
+                ("분류", meta.category or "미분류"),
+                ("점수", str(meta.value or 0)),
+                ("첨부", f"{file_count}개"),
+            ],
+        )
         return web.json_response(
             {
                 "ok": True,
@@ -2172,6 +2241,7 @@ class DashboardServer:
         async with self._command_lock:
             try:
                 save_ctfd_settings(CTFdSettings(), self.deps.challenges_root)
+                save_discord_settings(DiscordSettings(), self.deps.challenges_root)
             except OSError as exc:
                 raise web.HTTPInternalServerError(
                     text=f"CTFd 연결 설정을 초기화하지 못했습니다: {exc}"
@@ -2200,6 +2270,10 @@ class DashboardServer:
             self.deps.settings.ctfd_token = ""
             self.deps.settings.ctfd_user = ""
             self.deps.settings.ctfd_pass = ""
+            self.deps.settings.discord_webhook_url = ""
+            from backend.notifications import DiscordWebhookNotifier
+
+            self.deps.notifier = DiscordWebhookNotifier()
             self.deps.no_submit = True
             await self.poller.reseed()
             drain_events = getattr(self.poller, "drain_events", None)

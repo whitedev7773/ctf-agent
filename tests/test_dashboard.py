@@ -19,8 +19,13 @@ from aiohttp import ClientSession, FormData
 from backend.artifacts import challenge_shared_path, challenge_workspace_path
 from backend.ctfd import CTFdClient
 from backend.dashboard.server import DashboardServer, _clear_runtime_root
+from backend.notifications import DiscordWebhookNotifier
 from backend.prompts import ChallengeMeta, build_prompt
-from backend.runtime_settings import load_ctfd_settings, runtime_settings_path
+from backend.runtime_settings import (
+    load_ctfd_settings,
+    load_discord_settings,
+    runtime_settings_path,
+)
 from backend.runtime_state import load_dismissed_challenges
 from backend.tracing import SolverTracer
 from backend.writeups import finalize_writeup
@@ -46,6 +51,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             ctfd_token="",
             ctfd_user="",
             ctfd_pass="",
+            discord_webhook_url="",
             workspace_root=str(self.workspace_root),
             experience_root=str(self.experience_root),
             logs_root=str(self.logs_root),
@@ -65,6 +71,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             max_concurrent_challenges=3,
             no_submit=True,
             force_no_submit=False,
+            notifier=DiscordWebhookNotifier(),
             challenges_root=str(self.challenges_root),
             challenge_dirs={},
             coordinator_inbox=asyncio.Queue(),
@@ -1024,6 +1031,66 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restarted.ctfd_token, "saved-token")
         self.assertEqual(restarted.ctfd_user, "researcher")
         self.assertEqual(restarted.ctfd_pass, "saved-password")
+
+    async def test_dashboard_discord_webhook_is_tested_persisted_and_hidden(self) -> None:
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+        webhook_url = "https://discord.com/api/webhooks/123/secret-token"
+
+        with patch.object(DiscordWebhookNotifier, "send", AsyncMock(return_value=True)) as send:
+            async with self.client.post(
+                f"{self.base_url}/api/settings/discord",
+                json={"webhook_url": webhook_url},
+                headers={"X-CTF-Dashboard-Token": token},
+            ) as response:
+                payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertNotIn(webhook_url, json.dumps(payload))
+        send.assert_awaited_once()
+        self.assertEqual(self.deps.settings.discord_webhook_url, webhook_url)
+        self.assertTrue(self.deps.notifier.enabled)
+
+        async with self.client.get(f"{self.base_url}/api/status") as response:
+            status = await response.json()
+        self.assertEqual(status["discord"], {"configured": True})
+        self.assertNotIn("secret-token", json.dumps(status))
+
+        restarted = SimpleNamespace(discord_webhook_url="")
+        restored = load_discord_settings(restarted, self.deps.challenges_root)
+        self.assertIsNotNone(restored)
+        self.assertEqual(restarted.discord_webhook_url, webhook_url)
+
+    async def test_dashboard_discord_webhook_rejects_non_discord_url(self) -> None:
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+        async with self.client.post(
+            f"{self.base_url}/api/settings/discord",
+            json={"webhook_url": "https://example.com/hook"},
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            self.assertEqual(response.status, 400)
+
+    async def test_dashboard_discord_webhook_can_be_disconnected(self) -> None:
+        self.deps.settings.discord_webhook_url = (
+            "https://discord.com/api/webhooks/123/secret-token"
+        )
+        self.deps.notifier = DiscordWebhookNotifier(
+            self.deps.settings.discord_webhook_url
+        )
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+        async with self.client.post(
+            f"{self.base_url}/api/settings/discord",
+            json={"webhook_url": ""},
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            self.assertEqual(response.status, 200)
+
+        self.assertFalse(self.deps.notifier.enabled)
+        restarted = SimpleNamespace(discord_webhook_url="stale")
+        load_discord_settings(restarted, self.deps.challenges_root)
+        self.assertEqual(restarted.discord_webhook_url, "")
 
     async def test_runtime_settings_are_validated_persisted_and_reset(self) -> None:
         async with self.client.get(f"{self.base_url}/api/session") as response:

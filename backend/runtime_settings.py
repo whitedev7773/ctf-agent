@@ -164,6 +164,36 @@ class CTFdSettings(BaseModel):
         return normalized
 
 
+class DiscordSettings(BaseModel):
+    """Persisted Discord webhook connection without exposing it in status APIs."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    webhook_url: str = Field(default="", max_length=2000)
+
+    @field_validator("webhook_url")
+    @classmethod
+    def _validate_webhook_url(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        parsed = urlsplit(normalized)
+        allowed_hosts = {
+            "discord.com",
+            "canary.discord.com",
+            "ptb.discord.com",
+            "discordapp.com",
+        }
+        if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
+            raise ValueError("webhook_url must be an HTTPS Discord webhook URL")
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) < 4 or parts[:2] != ["api", "webhooks"]:
+            raise ValueError("webhook_url must use the Discord /api/webhooks/... path")
+        if parsed.query or parsed.fragment or parsed.username or parsed.password:
+            raise ValueError("webhook_url cannot contain credentials, query, or fragment")
+        return normalized
+
+
 def _validate_model_spec(value: str, *, delegate: bool) -> str:
     spec = str(value).strip()
     parts = spec.split("/")
@@ -226,9 +256,11 @@ def apply_runtime_settings(settings: object, runtime: RuntimeSettings) -> None:
 def save_runtime_settings(runtime: RuntimeSettings, challenges_root: str | Path) -> Path:
     path = runtime_settings_path(challenges_root)
     payload = runtime.model_dump()
-    connection = _read_settings_document(path).get("ctfd")
-    if isinstance(connection, dict):
-        payload["ctfd"] = connection
+    existing = _read_settings_document(path)
+    for integration in ("ctfd", "discord"):
+        connection = existing.get(integration)
+        if isinstance(connection, dict):
+            payload[integration] = connection
     _write_settings_document(path, payload)
     return path
 
@@ -240,6 +272,33 @@ def save_ctfd_settings(connection: CTFdSettings, challenges_root: str | Path) ->
     payload["ctfd"] = connection.model_dump()
     _write_settings_document(path, payload)
     return path
+
+
+def save_discord_settings(connection: DiscordSettings, challenges_root: str | Path) -> Path:
+    """Persist a dashboard Discord webhook without disturbing runtime policy."""
+    path = runtime_settings_path(challenges_root)
+    payload = _read_settings_document(path)
+    payload["discord"] = connection.model_dump()
+    _write_settings_document(path, payload)
+    return path
+
+
+def load_discord_settings(
+    settings: object,
+    challenges_root: str | Path,
+) -> DiscordSettings | None:
+    """Restore a saved Discord webhook, including an explicit disconnected state."""
+    path = runtime_settings_path(challenges_root)
+    raw = _read_settings_document(path).get("discord")
+    if raw is None:
+        return None
+    try:
+        connection = DiscordSettings.model_validate(raw)
+    except ValueError as exc:
+        logger.warning("Ignoring invalid dashboard Discord settings at %s: %s", path, exc)
+        return None
+    settings.discord_webhook_url = connection.webhook_url
+    return connection
 
 
 def load_ctfd_settings(
@@ -280,7 +339,7 @@ def load_runtime_settings(
         raw: Any = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("settings file must contain a JSON object")
-        raw = {key: value for key, value in raw.items() if key != "ctfd"}
+        raw = {key: value for key, value in raw.items() if key not in {"ctfd", "discord"}}
         merged = current.model_dump()
         merged.update(raw)
         loaded = RuntimeSettings.model_validate(merged)

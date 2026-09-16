@@ -6,6 +6,9 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    # Server notifications (optional)
+    discord_webhook_url: str = ""
+
     # CTFd
     # Empty means standalone mode. A CTFd instance can be connected later from
     # the local dashboard or supplied through CTFD_URL/--ctfd-url.

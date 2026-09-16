@@ -13,6 +13,7 @@ from backend.sandbox import DockerSandbox
 
 if TYPE_CHECKING:
     from backend.message_bus import ChallengeMessageBus
+    from backend.notifications import DiscordWebhookNotifier
 
 # Type for the deduped submit callback: (flag) -> (display, is_confirmed)
 SubmitFn = Callable[[str], Coroutine[Any, Any, tuple[str, bool]]]
@@ -47,6 +48,7 @@ class CoordinatorDeps:
     # also becomes true dynamically while no CTFd instance is connected.
     force_no_submit: bool = False
     max_concurrent_challenges: int = 4
+    notifier: DiscordWebhookNotifier | None = None
 
     msg_port: int = 9400  # Dashboard and operator-message port; 0 = auto-pick.
     msg_host: str = "127.0.0.1"  # Dashboard and operator-message bind address.

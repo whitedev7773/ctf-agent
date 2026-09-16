@@ -116,6 +116,7 @@ Sandbox image는 radare2, GDB, pwntools, angr, SageMath, RsaCtfTool, Volatility,
 # 선택 사항: 비워두고 대시보드에서 연결할 수 있다
 CTFD_URL=
 CTFD_TOKEN=
+DISCORD_WEBHOOK_URL=
 
 # Codex quota 소진 시 direct OpenAI API fallback을 사용할 때만 입력
 OPENAI_API_KEY=
@@ -132,6 +133,7 @@ MAX_CONCURRENT_CHALLENGES=4
 | ------------------------------------- | -----------------------: | ------------------------------------------------------------------------------ |
 | `CTFD_URL`                            |                    빈 값 | 선택적인 CTFd base URL; 빈 값이면 독립 모드                                    |
 | `CTFD_TOKEN`                          |                    빈 값 | CTFd API token                                                                 |
+| `DISCORD_WEBHOOK_URL`                 |                    빈 값 | 신규 문제, 풀이 완료, Flag 후보 검증 요청을 받을 Discord 채널 웹훅 URL          |
 | `CTFD_USER`                           |                  `admin` | token이 없을 때 로그인 사용자                                                  |
 | `CTFD_PASS`                           |                  `admin` | token이 없을 때 로그인 비밀번호                                                |
 | `OPENAI_API_KEY`                      |                    빈 값 | Codex quota fallback용 API key                                                 |

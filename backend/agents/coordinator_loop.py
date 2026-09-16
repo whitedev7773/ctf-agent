@@ -14,6 +14,7 @@ from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.deps import CoordinatorDeps
 from backend.models import DEFAULT_MODELS
+from backend.notifications import DiscordWebhookNotifier, notify_discord
 from backend.poller import CTFdPoller
 from backend.prompts import ChallengeMeta
 from backend.runtime_state import load_dismissed_challenges, load_runtime_state
@@ -25,10 +26,14 @@ TurnFn = Callable[[str], Coroutine[Any, Any, None]]
 
 
 def _unsolved_names(deps: CoordinatorDeps, poller: CTFdPoller) -> set[str]:
-    """Treat locally persisted confirmations as solved across restarts."""
+    """Exclude solved and operator-review candidates from automatic execution."""
     known = poller.known_challenges | set(deps.challenge_metas)
-    solved = poller.known_solved | set(deps.results)
-    return known - solved - getattr(deps, "dismissed_challenges", set())
+    terminal = (
+        poller.known_solved
+        | set(deps.results)
+        | set(getattr(deps, "candidates", {}))
+    )
+    return known - terminal - getattr(deps, "dismissed_challenges", set())
 
 
 def _challenge_priority(deps: CoordinatorDeps, challenge_name: str) -> float:
@@ -128,6 +133,7 @@ def build_deps(
         no_submit=no_submit or not ctfd.is_configured,
         force_no_submit=no_submit,
         max_concurrent_challenges=getattr(settings, "max_concurrent_challenges", 10),
+        notifier=DiscordWebhookNotifier(getattr(settings, "discord_webhook_url", "")),
         challenge_dirs=challenge_dirs or {},
         challenge_metas=challenge_metas or {},
     )
@@ -148,6 +154,15 @@ def build_deps(
             if meta.name not in deps.challenge_dirs:
                 deps.challenge_dirs[meta.name] = str(d)
                 deps.challenge_metas[meta.name] = meta
+
+    # A prior process may have been stopped after recording candidate evidence
+    # but before returning CANDIDATE_FOUND. Backfill those candidates at startup
+    # so the dashboard can review them without spending another solver run.
+    from backend.agents.coordinator_core import preserve_evidence_candidates
+
+    for challenge_name in deps.challenge_metas:
+        if challenge_name not in deps.results:
+            preserve_evidence_candidates(deps, challenge_name)
 
     return ctfd, cost_tracker, deps
 
@@ -247,10 +262,23 @@ async def run_event_loop(
                 if evt.kind == "new_challenge":
                     if evt.challenge_name in dismissed:
                         continue
+                    await notify_discord(
+                        deps,
+                        "challenge_added",
+                        evt.challenge_name,
+                        description=f"**{evt.challenge_name}** 문제가 CTFd에 추가되었습니다.",
+                        fields=[("출처", "CTFd")],
+                    )
                     parts.append(f"NEW CHALLENGE: '{evt.challenge_name}' appeared. Spawn a swarm.")
                     # Auto-spawn for new challenges
                     await _auto_spawn_one(deps, evt.challenge_name)
                 elif evt.kind == "challenge_solved":
+                    await notify_discord(
+                        deps,
+                        "solve_completed",
+                        evt.challenge_name,
+                        description=f"**{evt.challenge_name}** 문제가 해결되었습니다.",
+                    )
                     parts.append(f"SOLVED: '{evt.challenge_name}' — swarm auto-killed.")
                     getattr(deps, "swarm_retry_after", {}).pop(evt.challenge_name, None)
 

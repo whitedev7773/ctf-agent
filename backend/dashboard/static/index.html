@@ -417,6 +417,26 @@
         <article class="setup-card">
         <div class="setup-heading">
           <div>
+            <p class="eyebrow">SERVER NOTIFICATIONS</p>
+            <h2>Discord 웹훅</h2>
+            <p id="discord-status-copy">알림 설정을 확인하고 있습니다.</p>
+          </div>
+          <span class="source-badge" id="discord-source-badge">확인 중</span>
+        </div>
+        <form id="discord-form" class="setup-form">
+          <label class="wide-field">
+            <span>웹훅 URL</span>
+            <input id="discord-webhook-url" name="webhook_url" type="password" maxlength="2000" placeholder="https://discord.com/api/webhooks/..." autocomplete="off">
+            <small>새 문제, 풀이 완료, Flag 후보 검증 요청을 알립니다. 저장된 URL은 다시 표시하지 않습니다.</small>
+          </label>
+          <button class="primary-button setup-submit" type="submit">저장 및 테스트</button>
+          <button class="secondary-button setup-submit" id="discord-disconnect" type="button">알림 해제</button>
+        </form>
+        </article>
+
+        <article class="setup-card local-challenge-card">
+        <div class="setup-heading">
+          <div>
             <p class="eyebrow">STANDALONE CHALLENGE</p>
             <h2>로컬 문제 추가</h2>
             <p>CTFd 없이 문제 정보와 첨부 파일을 등록해 바로 풀이합니다.</p>

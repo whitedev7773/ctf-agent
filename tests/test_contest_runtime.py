@@ -14,11 +14,12 @@ from backend.agents.codex_coordinator import CodexCoordinator
 from backend.agents.codex_solver import CodexSolver
 from backend.agents.coordinator_core import (
     _generate_or_finalize_writeup,
+    do_kill_swarm,
     do_review_candidate,
     do_spawn_swarm,
 )
 from backend.agents.coordinator_core import do_submit_flag as coordinator_submit_flag
-from backend.agents.coordinator_loop import _auto_spawn_one, _unsolved_names
+from backend.agents.coordinator_loop import _auto_spawn_one, _unsolved_names, build_deps
 from backend.agents.solver import Solver
 from backend.agents.swarm import ChallengeSwarm
 from backend.artifacts import (
@@ -1075,6 +1076,126 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(swarm.cancel_event.is_set())
         self.assertTrue(task.cancelled())
+
+    async def test_kill_preserves_output_backed_candidate_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_root:
+            settings = Settings(_env_file=None, workspace_root=workspace_root)
+            shared = Path(challenge_shared_path(settings, "candidate-before-submit"))
+            state_path = shared / "reasoning" / "state.json"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "evidence": [
+                            {
+                                "id": "EV-output-backed",
+                                "kind": "candidate",
+                                "claim": "formatted candidate recovered",
+                                "observed_excerpt": "model_accepts=True flag = TEAM{recovered}",
+                                "confidence": 0.99,
+                            },
+                            {
+                                "id": "EV-note-only",
+                                "kind": "static",
+                                "claim": "TEAM{must_not_be_promoted}",
+                                "observed_excerpt": "TEAM{must_not_be_promoted}",
+                                "confidence": 1.0,
+                            },
+                            {
+                                "id": "EV-unsupported",
+                                "kind": "candidate",
+                                "claim": "TEAM{claim_only}",
+                                "observed_excerpt": "",
+                                "confidence": 0.99,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            swarm = SimpleNamespace(kill=unittest.mock.Mock())
+            deps = SimpleNamespace(
+                settings=settings,
+                swarms={"candidate-before-submit": swarm},
+                candidates={},
+                results={},
+                challenge_metas={
+                    "candidate-before-submit": ChallengeMeta(
+                        name="candidate-before-submit",
+                        category="reversing",
+                        flag_format="TEAM{...}",
+                    )
+                },
+            )
+
+            with patch("backend.agents.coordinator_core.persist_deps_state") as persist:
+                message = await do_kill_swarm(deps, "candidate-before-submit")
+
+            swarm.kill.assert_called_once_with()
+            persist.assert_called_once_with(deps)
+            self.assertIn("preserved 1 unverified candidate", message)
+            self.assertEqual(
+                deps.candidates["candidate-before-submit"]["flags"],
+                ["TEAM{recovered}"],
+            )
+            self.assertEqual(
+                deps.candidates["candidate-before-submit"]["sources"],
+                ["candidate evidence: EV-output-backed"],
+            )
+
+    async def test_startup_recovers_stopped_candidate_without_respawn(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            workspace_root = Path(root) / "workspace"
+            challenges_root = Path(root) / "challenges"
+            challenges_root.mkdir()
+            settings = Settings(
+                _env_file=None,
+                workspace_root=str(workspace_root),
+                logs_root=str(Path(root) / "logs"),
+                experience_root=str(Path(root) / "experience"),
+            )
+            state_path = (
+                Path(challenge_shared_path(settings, "stopped-candidate"))
+                / "reasoning"
+                / "state.json"
+            )
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "evidence": [
+                            {
+                                "id": "EV-before-crash",
+                                "kind": "candidate",
+                                "observed_excerpt": "verified model output: TEAM{resume_me}",
+                                "confidence": 0.95,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            meta = ChallengeMeta(
+                name="stopped-candidate",
+                category="reversing",
+                flag_format="TEAM{...}",
+            )
+
+            _ctfd, _cost, deps = build_deps(
+                settings,
+                challenges_root=str(challenges_root),
+                challenge_dirs={"stopped-candidate": str(Path(root) / "challenge")},
+                challenge_metas={"stopped-candidate": meta},
+            )
+            poller = SimpleNamespace(known_challenges={"stopped-candidate"}, known_solved=set())
+
+            self.assertEqual(
+                deps.candidates["stopped-candidate"]["flags"],
+                ["TEAM{resume_me}"],
+            )
+            self.assertNotIn("stopped-candidate", _unsolved_names(deps, poller))
 
     async def test_cached_long_context_gets_checkpoint_not_global_budget_stop(self) -> None:
         class FakeStdout:

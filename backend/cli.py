@@ -13,7 +13,11 @@ from rich.console import Console
 from backend.codex_cli import CodexCLIError, prepare_codex_cli
 from backend.config import Settings
 from backend.models import DEFAULT_MODELS
-from backend.runtime_settings import load_ctfd_settings, load_runtime_settings
+from backend.runtime_settings import (
+    load_ctfd_settings,
+    load_discord_settings,
+    load_runtime_settings,
+)
 
 console = Console()
 
@@ -86,6 +90,7 @@ def main(
     settings = Settings(sandbox_image=image)
     saved_runtime = load_runtime_settings(settings, list(DEFAULT_MODELS), challenges_dir)
     load_ctfd_settings(settings, challenges_dir)
+    load_discord_settings(settings, challenges_dir)
     if ctfd_url:
         settings.ctfd_url = ctfd_url
     if ctfd_token:
