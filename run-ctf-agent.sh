@@ -5,7 +5,7 @@ project_root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$project_root"
 
 port="${CTF_AGENT_PORT:-9400}"
-host="${CTF_AGENT_HOST:-127.0.0.1}"
+host="${CTF_AGENT_HOST:-0.0.0.0}"
 
 if ! command -v uv >/dev/null 2>&1; then
   echo "[ERROR] uv was not found in PATH." >&2

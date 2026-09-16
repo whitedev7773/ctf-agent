@@ -4,7 +4,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 if not defined CTF_AGENT_PORT set "CTF_AGENT_PORT=9400"
-if not defined CTF_AGENT_HOST set "CTF_AGENT_HOST=127.0.0.1"
+if not defined CTF_AGENT_HOST set "CTF_AGENT_HOST=0.0.0.0"
 set "CTF_AGENT_MAX_CHALLENGES_ARG="
 if defined CTF_AGENT_MAX_CHALLENGES set "CTF_AGENT_MAX_CHALLENGES_ARG=--max-challenges %CTF_AGENT_MAX_CHALLENGES%"
 

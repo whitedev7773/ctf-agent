@@ -61,9 +61,9 @@ def _setup_logging(verbose: bool = False) -> None:
 )
 @click.option(
     "--dashboard-host",
-    default="127.0.0.1",
+    default="0.0.0.0",
     show_default=True,
-    help="Dashboard and operator-message bind address (use 0.0.0.0 for LAN access)",
+    help="Dashboard and operator-message bind address (use 127.0.0.1 for local-only access)",
 )
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def main(
@@ -214,7 +214,7 @@ async def _run_coordinator(
     coordinator_backend: str,
     max_challenges: int,
     msg_port: int = 0,
-    dashboard_host: str = "127.0.0.1",
+    dashboard_host: str = "0.0.0.0",
 ) -> None:
     """Run the full coordinator (continuous until Ctrl+C)."""
     from backend.sandbox import cleanup_orphan_containers, configure_semaphore
