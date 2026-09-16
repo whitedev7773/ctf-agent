@@ -43,13 +43,18 @@ uv sync
 
 echo "[SETUP] Checking Docker..."
 docker info >/dev/null
+sandbox_image="$(.venv/bin/python -c 'from backend.config import Settings; print(Settings().sandbox_image)')"
+if [[ -z "$sandbox_image" ]]; then
+  echo "[ERROR] Could not determine SANDBOX_IMAGE from the project settings." >&2
+  exit 1
+fi
 
 if [[ "$skip_docker_build" == false ]]; then
-  if [[ "$rebuild_sandbox" == true ]] || ! docker image inspect ctf-sandbox >/dev/null 2>&1; then
-    echo "[SETUP] Building the ctf-sandbox image..."
-    docker build -f sandbox/Dockerfile.sandbox -t ctf-sandbox .
+  if [[ "$rebuild_sandbox" == true ]] || ! docker image inspect "$sandbox_image" >/dev/null 2>&1; then
+    echo "[SETUP] Building the $sandbox_image image..."
+    docker build -f sandbox/Dockerfile.sandbox -t "$sandbox_image" .
   else
-    echo "[SETUP] Reusing the existing ctf-sandbox image."
+    echo "[SETUP] Reusing the existing $sandbox_image image."
   fi
 fi
 

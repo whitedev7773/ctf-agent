@@ -26,6 +26,48 @@ if not exist ".venv\Scripts\python.exe" (
     )
 )
 
+if not exist ".env" (
+    copy /Y ".env.example" ".env" >nul
+    if errorlevel 1 (
+        echo [ERROR] Could not create .env from .env.example.
+        pause
+        exit /b 1
+    )
+    echo [SETUP] Created .env from .env.example.
+)
+
+where docker >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Docker was not found in PATH.
+    echo Install Docker Desktop, start it in Linux container mode, and run this file again.
+    pause
+    exit /b 1
+)
+
+docker info >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Docker is installed, but the Docker daemon is not available.
+    echo Start Docker Desktop in Linux container mode and run this file again.
+    pause
+    exit /b 1
+)
+
+set "CTF_AGENT_SANDBOX_IMAGE=ctf-sandbox"
+for /f "usebackq tokens=1,* delims==" %%A in (`findstr /B /C:"SANDBOX_IMAGE=" ".env" 2^>nul`) do if not "%%B"=="" set "CTF_AGENT_SANDBOX_IMAGE=%%B"
+if defined SANDBOX_IMAGE set "CTF_AGENT_SANDBOX_IMAGE=%SANDBOX_IMAGE%"
+
+docker image inspect "%CTF_AGENT_SANDBOX_IMAGE%" >nul 2>nul
+if errorlevel 1 (
+    echo [SETUP] Docker image "%CTF_AGENT_SANDBOX_IMAGE%" was not found. Building it now...
+    docker build -f "sandbox/Dockerfile.sandbox" -t "%CTF_AGENT_SANDBOX_IMAGE%" .
+    if errorlevel 1 (
+        echo [ERROR] Failed to build Docker image "%CTF_AGENT_SANDBOX_IMAGE%".
+        pause
+        exit /b 1
+    )
+    echo [SETUP] Docker image "%CTF_AGENT_SANDBOX_IMAGE%" is ready.
+)
+
 call :find_dashboard_listener
 if defined CTF_AGENT_EXISTING_PID (
     set "CTF_AGENT_EXISTING_NAME=unknown"

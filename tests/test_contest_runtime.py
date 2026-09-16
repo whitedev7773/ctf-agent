@@ -400,6 +400,17 @@ class ArtifactAndProfileTests(unittest.TestCase):
             source,
         )
 
+    def test_launchers_build_missing_sandbox_image(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        windows_source = (project_root / "run-ctf-agent.bat").read_text(encoding="utf-8")
+        unix_source = (project_root / "run-ctf-agent.sh").read_text(encoding="utf-8")
+
+        for source in (windows_source, unix_source):
+            self.assertIn("docker info", source)
+            self.assertIn("docker image inspect", source)
+            self.assertIn("sandbox/Dockerfile.sandbox", source)
+            self.assertIn("docker build", source)
+
     def test_postprocessor_has_small_non_recursive_budget(self) -> None:
         settings = Settings(_env_file=None)
         spec = "codex/gpt-5.6-luna/low/delegate-03-postprocess"

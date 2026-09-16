@@ -123,7 +123,7 @@ bash scripts/setup.sh --skip-docker-build --skip-codex-check
 1. CTFd URL과 API token을 연결해 대회 전체를 운영합니다.
 2. standalone mode에서 설명, 접속 정보, flag 형식과 첨부 파일을 직접 등록합니다.
 
-Windows의 `run-ctf-agent.bat`과 Unix 계열의 `run-ctf-agent.sh`는 가상환경이 없으면 `uv sync`를 실행한 뒤 9400 포트에서 대시보드를 시작합니다.
+Windows의 `run-ctf-agent.bat`과 Unix 계열의 `run-ctf-agent.sh`는 `.env`와 가상환경을 준비하고 Docker daemon을 확인합니다. `SANDBOX_IMAGE`로 지정한 image가 없으면 `sandbox/Dockerfile.sandbox`로 자동 build한 뒤 9400 포트에서 대시보드를 시작합니다. 따라서 새로 clone한 PC에서 setup script를 먼저 실행하지 않아도 launcher가 누락된 sandbox image를 준비합니다.
 
 ### 수동 설치와 실행
 

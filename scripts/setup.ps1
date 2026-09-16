@@ -51,14 +51,18 @@ if (-not (Test-Path -LiteralPath ".env")) {
 
 Invoke-Checked "Syncing the Python environment and packages" "uv" "sync"
 Invoke-Checked "Checking Docker" "docker" "info" "--format" "{{.ServerVersion}}"
+$SandboxImage = (& ".venv\Scripts\python.exe" -c "from backend.config import Settings; print(Settings().sandbox_image)").Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($SandboxImage)) {
+    throw "Could not determine SANDBOX_IMAGE from the project settings."
+}
 
 if (-not $SkipDockerBuild) {
-    & docker image inspect ctf-sandbox *> $null
+    & docker image inspect $SandboxImage *> $null
     $ImageExists = $LASTEXITCODE -eq 0
     if ($RebuildSandbox -or -not $ImageExists) {
-        Invoke-Checked "Building the ctf-sandbox image" "docker" "build" "-f" "sandbox/Dockerfile.sandbox" "-t" "ctf-sandbox" "."
+        Invoke-Checked "Building the $SandboxImage image" "docker" "build" "-f" "sandbox/Dockerfile.sandbox" "-t" $SandboxImage "."
     } else {
-        Write-Host "[SETUP] Reusing the existing ctf-sandbox image."
+        Write-Host "[SETUP] Reusing the existing $SandboxImage image."
     }
 }
 
