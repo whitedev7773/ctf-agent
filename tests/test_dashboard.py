@@ -1267,6 +1267,28 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.deps.results["web/intro"]["flag"], "TEAM{guess}")
         self.assertNotIn("web/intro", self.deps.candidates)
 
+    async def test_solved_challenge_hides_confirmed_candidate_and_flags_conflicts(self) -> None:
+        self.deps.results["web/intro"] = {
+            "flag": "TEAM{confirmed}",
+            "accepted_flags": ["TEAM{confirmed}"],
+            "submit": "operator confirmed local candidate",
+        }
+        self.deps.candidates["web/intro"] = {
+            "flag": "TEAM{confirmed}",
+            "flags": ["TEAM{confirmed}", "TEAM{different}"],
+            "status": "unverified",
+            "review_required": True,
+        }
+
+        async with self.client.get(f"{self.base_url}/api/status") as response:
+            payload = await response.json()
+
+        challenge = payload["challenges"][0]
+        self.assertEqual(challenge["status"], "solved")
+        self.assertEqual(challenge["candidates"], ["TEAM{different}"])
+        self.assertTrue(challenge["candidate_review_required"])
+        self.assertTrue(challenge["candidate_conflicts_with_solved"])
+
     async def test_rejecting_one_candidate_keeps_the_next_one_pending(self) -> None:
         self.deps.candidates["web/intro"] = {
             "flag": "TEAM{first}",

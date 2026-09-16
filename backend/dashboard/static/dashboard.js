@@ -536,7 +536,9 @@ function notifyCandidateReviews(snapshot) {
     const key = `${challenge.name}:${challenge.candidate}`;
     if (state.candidateNotices.has(key)) continue;
     state.candidateNotices.add(key);
-    const message = `${challenge.name}: Flag 후보 검토가 필요합니다 — ${challenge.candidate}`;
+    const message = challenge.candidate_conflicts_with_solved
+      ? `${challenge.name}: 확정 Flag와 다른 후보가 발견되었습니다 — ${challenge.candidate}`
+      : `${challenge.name}: Flag 후보 검토가 필요합니다 — ${challenge.candidate}`;
     toast(message);
     if ("Notification" in window && Notification.permission === "granted") {
       new Notification("CTF Agent 후보 검토 필요", { body: message });
@@ -1828,10 +1830,18 @@ function renderDetailPage({ preserveScroll = false } = {}) {
   )];
   const formatMismatchCandidates = new Set(challenge.format_mismatch_candidates || []);
   if (pendingCandidates.length) {
+    const conflictsWithSolved = Boolean(challenge.candidate_conflicts_with_solved);
     const candidateSection = detailSection(
-      "검증되지 않은 Flag 후보",
-      `${pendingCandidates.length} PENDING`,
+      conflictsWithSolved ? "확정 Flag와 다른 후보" : "검증되지 않은 Flag 후보",
+      `${pendingCandidates.length} ${conflictsWithSolved ? "CONFLICT" : "PENDING"}`,
     );
+    if (conflictsWithSolved) {
+      candidateSection.append(node(
+        "p",
+        "candidate-conflict-warning",
+        "이 문제는 이미 해결 처리되었습니다. 확정 Flag와 값이 다른 후보만 별도로 보존했으므로 추가 정답인지 오답인지 검토해 주세요.",
+      ));
+    }
     for (const candidateFlag of pendingCandidates) {
       const candidateEntry = node("div", "candidate-entry");
       candidateEntry.append(node("div", "flag-value", candidateFlag));
@@ -1845,8 +1855,11 @@ function renderDetailPage({ preserveScroll = false } = {}) {
       candidateEntry.append(copyControl(candidateFlag, "후보 복사"));
       if (challenge.candidate_review_required) {
       const reviewControls = node("div", "control-row");
-      const accept = button("정답으로 확인", "primary-button", async () => {
-        if (!await confirmAction(`${candidateFlag}를 로컬 정답으로 확정할까요?`)) return;
+      const accept = button(conflictsWithSolved ? "추가 정답으로 인정" : "정답으로 확인", "primary-button", async () => {
+        const prompt = conflictsWithSolved
+          ? `${candidateFlag}를 이 문제의 추가 정답으로 인정할까요?`
+          : `${candidateFlag}를 로컬 정답으로 확정할까요?`;
+        if (!await confirmAction(prompt)) return;
         await runCommand(
           "/api/control/review-candidate",
           { challenge: challenge.name, flag: candidateFlag, accepted: true },

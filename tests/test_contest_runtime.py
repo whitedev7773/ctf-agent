@@ -14,6 +14,7 @@ from backend.agents.codex_coordinator import CodexCoordinator
 from backend.agents.codex_solver import CodexSolver
 from backend.agents.coordinator_core import (
     _generate_or_finalize_writeup,
+    _merge_candidate_record,
     do_kill_swarm,
     do_review_candidate,
     do_spawn_swarm,
@@ -2132,7 +2133,23 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         confirmed = await do_review_candidate(deps, "local", "TEAM{guess}", True)
         self.assertIn("LOCAL CONFIRMED", confirmed)
         self.assertEqual(deps.results["local"]["flag"], "TEAM{guess}")
-        self.assertNotIn("local", deps.candidates)
+        self.assertEqual(deps.results["local"]["accepted_flags"], ["TEAM{guess}"])
+        self.assertEqual(deps.candidates["local"]["flags"], ["GoN{native}"])
+        self.assertEqual(deps.candidates["local"]["status"], "conflicts_with_solved")
+
+        # A late swarm cleanup may report its old candidate set again. The
+        # confirmed value stays suppressed while genuinely different values
+        # remain available for explicit operator review.
+        _merge_candidate_record(
+            deps,
+            "local",
+            ["TEAM{guess}", "GoN{native}", "TEAM{alternate}"],
+            source="late swarm cleanup",
+        )
+        self.assertEqual(
+            deps.candidates["local"]["flags"],
+            ["GoN{native}", "TEAM{alternate}"],
+        )
 
         deps.challenge_metas["local-retry"] = SimpleNamespace(flag_format="TEAM{...}")
         with tempfile.TemporaryDirectory() as workspace:

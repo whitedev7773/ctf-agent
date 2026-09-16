@@ -350,6 +350,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 .candidate-entry + .candidate-entry { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--hairline); }
 .candidate-entry.is-rejected .flag-value { color: var(--muted); text-decoration: line-through; }
 .candidate-format-warning { margin: 8px 0; color: var(--warning, #9a5b00); font: 600 11px/1.4 var(--mono); letter-spacing: .04em; }
+.candidate-conflict-warning { margin: 0 0 14px; padding: 12px 14px; border: 1px solid rgba(62,207,142,.45); border-radius: var(--radius-md); color: var(--ink-secondary); background: rgba(62,207,142,.07); font-size: 13px; line-height: 1.55; }
 .approach-notes { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; counter-reset: approach-note; }
 .approach-note { position: relative; padding: 14px 14px 14px 44px; border: 1px solid var(--hairline); border-radius: var(--radius-md); background: var(--canvas-soft); counter-increment: approach-note; }
 .approach-note::before { position: absolute; top: 14px; left: 14px; display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; color: var(--primary-deep); background: rgba(62,207,142,.12); content: counter(approach-note); font: 500 12px/1 var(--mono); }

@@ -495,11 +495,18 @@ class DashboardServer:
             swarm = self.deps.swarms.get(name)
             result = self.deps.results.get(name, {})
             candidate = candidates.get(name, {})
+            accepted_candidate_flags = {
+                item.strip()
+                for item in [result.get("flag"), *result.get("accepted_flags", [])]
+                if isinstance(item, str) and item.strip()
+            }
             pending_candidate_flags = list(
                 dict.fromkeys(
                     item
                     for item in [candidate.get("flag"), *candidate.get("flags", [])]
-                    if isinstance(item, str) and item.strip()
+                    if isinstance(item, str)
+                    and item.strip()
+                    and item.strip() not in accepted_candidate_flags
                 )
             )
             rejected_candidate_flags = list(
@@ -719,6 +726,9 @@ class DashboardServer:
                     "format_mismatch_candidates": format_mismatch_candidates,
                     "candidate_format_hint": candidate.get("format_hint", ""),
                     "candidate_review_required": bool(pending_candidate_flags),
+                    "candidate_conflicts_with_solved": bool(
+                        is_solved and pending_candidate_flags
+                    ),
                     "approach_notes": approach_notes,
                     "solution_review": solution_review,
                     "writeup": writeup,
@@ -881,7 +891,8 @@ class DashboardServer:
                 "total": len(known),
                 "solved": len(solved),
                 "candidates": sum(
-                    challenge["status"] == "candidate" for challenge in challenges
+                    bool(challenge["candidate_review_required"])
+                    for challenge in challenges
                 ),
                 "active_swarms": len(active_names),
                 "active_agents": active_agents,

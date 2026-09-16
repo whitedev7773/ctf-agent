@@ -30,6 +30,18 @@ _SOLUTION_REVIEW_CONTAINER_PATH = (
 )
 
 
+def _accepted_candidate_flags(deps: CoordinatorDeps, challenge_name: str) -> set[str]:
+    """Return every operator- or verifier-confirmed flag that must not re-enter review."""
+    result = getattr(deps, "results", {}).get(challenge_name, {})
+    if not isinstance(result, dict):
+        return set()
+    return {
+        item.strip()
+        for item in [result.get("flag"), *result.get("accepted_flags", [])]
+        if isinstance(item, str) and item.strip()
+    }
+
+
 def _merge_candidate_record(
     deps: CoordinatorDeps,
     challenge_name: str,
@@ -46,6 +58,7 @@ def _merge_candidate_record(
         for item in record.get("rejected_flags", [])
         if isinstance(item, str) and item.strip()
     }
+    accepted = _accepted_candidate_flags(deps, challenge_name)
     merged_flags = [
         item
         for item in [record.get("flag"), *record.get("flags", []), *flags]
@@ -54,14 +67,16 @@ def _merge_candidate_record(
     merged_flags = [
         item
         for item in dict.fromkeys(item.strip() for item in merged_flags)
-        if item not in rejected
+        if item not in rejected and item not in accepted
     ][:20]
     meta = deps.challenge_metas.get(challenge_name)
     format_hint = str(getattr(meta, "flag_format", "") or "") if meta else ""
     mismatches = [
         item
         for item in [*record.get("format_mismatches", []), *merged_flags]
-        if isinstance(item, str) and not flag_matches_format(item, format_hint)
+        if isinstance(item, str)
+        and item in merged_flags
+        and not flag_matches_format(item, format_hint)
     ]
     sources = [
         item
@@ -80,7 +95,10 @@ def _merge_candidate_record(
             "format_mismatches": list(dict.fromkeys(mismatches))[:20],
         }
     )
-    deps.candidates[challenge_name] = record
+    if merged_flags:
+        deps.candidates[challenge_name] = record
+    else:
+        deps.candidates.pop(challenge_name, None)
     return record
 
 
@@ -357,25 +375,31 @@ async def do_spawn_swarm(
             if evidence_ids:
                 source_items.append("candidate evidence: " + ", ".join(evidence_ids))
             sources = ", ".join(source_items)
-            _merge_candidate_record(
+            candidate_record = _merge_candidate_record(
                 deps,
                 challenge_name,
                 flags,
                 source=sources or "solver",
             )
-            if not result or result.status != FLAG_FOUND:
+            pending_flags = list(candidate_record.get("flags", []))
+            if pending_flags and (not result or result.status != FLAG_FOUND):
                 await notify_discord(
                     deps,
                     "candidate_review",
                     challenge_name,
-                    description=f"**{challenge_name}** 문제의 Flag 후보를 확인해 주세요.",
-                    fields=[("후보", spoiler(flags[0])), ("출처", sources or "solver")],
-                    dedupe_key=f"candidate:{challenge_name}:{flags[0]}",
+                    description=(
+                        f"**{challenge_name}** 문제의 확정 Flag와 다른 후보를 확인해 주세요."
+                        if challenge_name in deps.results
+                        else f"**{challenge_name}** 문제의 Flag 후보를 확인해 주세요."
+                    ),
+                    fields=[("후보", spoiler(pending_flags[0])), ("출처", sources or "solver")],
+                    dedupe_key=f"candidate:{challenge_name}:{pending_flags[0]}",
                 )
         # A solved result must have been confirmed by the live submission path.
         if result and result.status == FLAG_FOUND:
             deps.results[challenge_name] = {
                 "flag": result.flag,
+                "accepted_flags": [result.flag] if result.flag else [],
                 "submit": "confirmed by solver",
             }
             deps.candidates.pop(challenge_name, None)
@@ -502,11 +526,52 @@ async def do_review_candidate(
         return f'NO PENDING CANDIDATE — "{candidate}" is not awaiting review.'
 
     if accepted:
+        prior_result = dict(deps.results.get(challenge_name, {}))
+        accepted_flags = list(
+            dict.fromkeys(
+                item.strip()
+                for item in [
+                    prior_result.get("flag"),
+                    *prior_result.get("accepted_flags", []),
+                    candidate,
+                ]
+                if isinstance(item, str) and item.strip()
+            )
+        )
         deps.results[challenge_name] = {
-            "flag": candidate,
+            **prior_result,
+            "flag": str(prior_result.get("flag", "") or candidate),
+            "accepted_flags": accepted_flags,
             "submit": "operator confirmed local candidate",
         }
-        deps.candidates.pop(challenge_name, None)
+        remaining_flags = [
+            item
+            for item in record.get("flags", [])
+            if isinstance(item, str)
+            and item.strip()
+            and item.strip() not in accepted_flags
+        ]
+        if remaining_flags:
+            record = dict(record)
+            record.update(
+                {
+                    "flag": remaining_flags[0],
+                    "flags": remaining_flags,
+                    "format_mismatches": [
+                        item for item in record.get("format_mismatches", [])
+                        if item in remaining_flags
+                    ],
+                    "status": "conflicts_with_solved",
+                    "review_required": True,
+                }
+            )
+            deps.candidates[challenge_name] = record
+        else:
+            deps.candidates.pop(challenge_name, None)
+        swarm = getattr(deps, "swarms", {}).get(challenge_name)
+        discard = getattr(swarm, "discard_candidate", None)
+        if callable(discard):
+            discard(candidate)
         meta = deps.challenge_metas.get(challenge_name)
         settings = getattr(deps, "settings", None)
         if meta and settings:
