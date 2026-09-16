@@ -30,6 +30,9 @@ class ChallengeMeta:
     flag_format: str = ""
     hints: list[dict[str, Any]] = field(default_factory=list)
     solves: int = 0
+    # Optional per-challenge override. An empty value keeps the runtime lead
+    # model, while local challenge registration may pin a Sol effort here.
+    lead_model_spec: str = ""
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> ChallengeMeta:
@@ -46,6 +49,7 @@ class ChallengeMeta:
             flag_format=data.get("flag_format", ""),
             hints=data.get("hints", []),
             solves=data.get("solves", 0),
+            lead_model_spec=data.get("lead_model_spec", ""),
         )
 
 

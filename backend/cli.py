@@ -126,6 +126,7 @@ async def _run_single(
 ) -> None:
     """Run a single challenge with a swarm."""
     from backend.agents.swarm import ChallengeSwarm
+    from backend.challenge_profiles import apply_lead_model_override
     from backend.cost_tracker import CostTracker
     from backend.ctfd import CTFdClient
     from backend.prompts import ChallengeMeta
@@ -150,6 +151,7 @@ async def _run_single(
         sys.exit(1)
 
     meta = ChallengeMeta.from_yaml(meta_path)
+    model_specs = apply_lead_model_override(model_specs, meta.lead_model_spec)
     console.print(f"[bold]Challenge:[/bold] {meta.name} ({meta.category}, {meta.value} pts)")
 
     ctfd = CTFdClient(

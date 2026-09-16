@@ -75,6 +75,17 @@ from backend.tools.core import (
     do_webhook_get_requests,
     do_write_file,
 )
+from backend.tools.specialized import (
+    WebSessionStore,
+    do_binary_triage,
+    do_forensic_triage,
+    do_record_forensic_provenance,
+    do_web_parallel_requests,
+    do_web_session_diff,
+    do_web_session_export,
+    do_web_session_open,
+    do_web_session_request,
+)
 from backend.tracing import SolverTracer
 
 logger = logging.getLogger(__name__)
@@ -159,6 +170,109 @@ SANDBOX_TOOLS: list[dict[str, Any]] = [
                 "body": {"type": "string", "default": ""},
             },
             "required": ["url"],
+        },
+    },
+    {
+        "name": "web_session_open",
+        "description": "Open a stateful HTTP session, perform an initial GET, and retain cookies internally.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "base_url": {"type": "string"},
+                "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+            },
+            "required": ["base_url"],
+        },
+    },
+    {
+        "name": "web_session_request",
+        "description": "Send a request in a retained HTTP session; cookies and redirects persist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "url": {"type": "string"},
+                "method": {"type": "string", "default": "GET"},
+                "body": {"type": "string", "default": ""},
+                "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+            },
+            "required": ["session_id", "url"],
+        },
+    },
+    {
+        "name": "web_parallel_requests",
+        "description": "Send a bounded concurrent batch for authorized race-condition testing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "url": {"type": "string"},
+                "count": {"type": "integer", "minimum": 1, "maximum": 32, "default": 2},
+                "method": {"type": "string", "default": "GET"},
+                "body": {"type": "string", "default": ""},
+                "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+            },
+            "required": ["session_id", "url"],
+        },
+    },
+    {
+        "name": "web_session_diff",
+        "description": "Compare two recorded responses without repeating their requests.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "response_a": {"type": "string"},
+                "response_b": {"type": "string"},
+            },
+            "required": ["session_id", "response_a", "response_b"],
+        },
+    },
+    {
+        "name": "web_session_export",
+        "description": "Export redacted HTTP response metadata to the shared challenge workspace.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"session_id": {"type": "string"}},
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "binary_triage",
+        "description": "Create a compact binary fingerprint and shared reversing analysis manifest.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "forensic_triage",
+        "description": "Create a bounded structured triage record for a disk, PCAP, memory dump, archive, or file.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "mode": {"type": "string", "enum": ["auto", "disk", "pcap", "memory", "archive"], "default": "auto"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "record_forensic_provenance",
+        "description": "Append a reproducible source-to-artifact extraction record to the shared forensic ledger.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_path": {"type": "string"},
+                "artifact_path": {"type": "string"},
+                "tool": {"type": "string"},
+                "command": {"type": "string"},
+                "offset": {"type": "string", "default": ""},
+                "sha256": {"type": "string", "default": ""},
+                "notes": {"type": "string", "default": ""},
+            },
+            "required": ["source_path", "artifact_path", "tool", "command"],
         },
     },
     {
@@ -530,6 +644,7 @@ class CodexSolver:
         self.cancel_event = cancel_event or asyncio.Event()
         self.no_submit = no_submit
         self.submit_fn = submit_fn
+        self.web_sessions = WebSessionStore()
 
         self.sandbox = DockerSandbox(
             image=getattr(settings, "sandbox_image", "ctf-sandbox"),
@@ -1520,6 +1635,63 @@ class CodexSolver:
             return await do_web_fetch(
                 args.get("url", ""), args.get("method", "GET"), args.get("body", "")
             )
+        elif name == "web_session_open":
+            return await do_web_session_open(
+                self.web_sessions,
+                str(args.get("base_url", "")),
+                args.get("headers") if isinstance(args.get("headers"), dict) else None,
+            )
+        elif name == "web_session_request":
+            return await do_web_session_request(
+                self.web_sessions,
+                str(args.get("session_id", "")),
+                str(args.get("url", "")),
+                str(args.get("method", "GET")),
+                str(args.get("body", "")),
+                args.get("headers") if isinstance(args.get("headers"), dict) else None,
+            )
+        elif name == "web_parallel_requests":
+            return await do_web_parallel_requests(
+                self.web_sessions,
+                str(args.get("session_id", "")),
+                str(args.get("url", "")),
+                int(args.get("count", 2) or 2),
+                str(args.get("method", "GET")),
+                str(args.get("body", "")),
+                args.get("headers") if isinstance(args.get("headers"), dict) else None,
+            )
+        elif name == "web_session_diff":
+            return await do_web_session_diff(
+                self.web_sessions,
+                str(args.get("session_id", "")),
+                str(args.get("response_a", "")),
+                str(args.get("response_b", "")),
+            )
+        elif name == "web_session_export":
+            return await do_web_session_export(
+                self.web_sessions,
+                self.sandbox,
+                str(args.get("session_id", "")),
+            )
+        elif name == "binary_triage":
+            return await do_binary_triage(self.sandbox, str(args.get("path", "")))
+        elif name == "forensic_triage":
+            return await do_forensic_triage(
+                self.sandbox,
+                str(args.get("path", "")),
+                str(args.get("mode", "auto")),
+            )
+        elif name == "record_forensic_provenance":
+            return await do_record_forensic_provenance(
+                self.sandbox,
+                str(args.get("source_path", "")),
+                str(args.get("artifact_path", "")),
+                str(args.get("tool", "")),
+                str(args.get("command", "")),
+                str(args.get("offset", "")),
+                str(args.get("sha256", "")),
+                str(args.get("notes", "")),
+            )
         elif name == "webhook_create":
             return await do_webhook_create()
         elif name == "webhook_get_requests":
@@ -2064,5 +2236,6 @@ class CodexSolver:
                 except Exception:
                     pass
             self._proc = None
+        await self.web_sessions.close_all()
         if self.sandbox:
             await self.sandbox.stop()

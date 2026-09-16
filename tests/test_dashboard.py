@@ -1326,6 +1326,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         form.add_field("description", "플래그를 찾으세요")
         form.add_field("connection_info", "nc example.com 31337")
         form.add_field("flag_format", "TEAM{...}")
+        form.add_field("lead_model_spec", "codex/gpt-5.6-sol/xhigh")
         form.add_field("value", "150")
         form.add_field("files", b"ELF", filename="chall", content_type="application/octet-stream")
         form.add_field("files", b"LIBC", filename="libc.so.6", content_type="application/octet-stream")
@@ -1338,10 +1339,15 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 200)
             self.assertEqual(payload["challenge"], "local-pwn")
             self.assertEqual(payload["file_count"], 2)
+            self.assertEqual(payload["lead_model_spec"], "codex/gpt-5.6-sol/xhigh")
 
         challenge_dir = self.deps.challenge_dirs["local-pwn"]
         self.assertEqual(self.deps.challenge_metas["local-pwn"].value, 150)
         self.assertEqual(self.deps.challenge_metas["local-pwn"].flag_format, "TEAM{...}")
+        self.assertEqual(
+            self.deps.challenge_metas["local-pwn"].lead_model_spec,
+            "codex/gpt-5.6-sol/xhigh",
+        )
         reloaded = ChallengeMeta.from_yaml(Path(challenge_dir) / "metadata.yml")
         self.assertEqual(reloaded.description, "플래그를 찾으세요")
         self.assertIn(

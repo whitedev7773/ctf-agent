@@ -43,9 +43,11 @@ _PLAYBOOKS: dict[str, str] = {
 - For foreign architectures use `qemu-*-static` plus `gdb-multiarch`; for kernel material inspect configs, symbols and intended device surface before fuzzing.""",
     "reversing": """### Reversing specialist playbook
 - Identify format, ISA, packing, managed runtime and anti-debugging before decompilation.
+- Start with `binary_triage` and preserve `/challenge/shared/reversing/binary-analysis.json`; later agents must reuse it instead of repeating broad fingerprinting. If the backend does not expose that helper, reproduce the same bounded `file`/`readelf`/`strings` probe through `bash`.
 - Combine static (`r2`, `objdump`, `pyghidra`, `jadx`/`apktool`) and dynamic (`gdb`, `strace`, `ltrace`, QEMU) evidence.
 - Once static analysis identifies a concrete layout, boundary or state transition, build the smallest harness that measures it before another broad extraction/decompilation pass.
 - Lift verification logic into a small Python/Z3/angr solver; avoid manually transcribing large constants when scripts can extract them.
+- Treat `angr` as bounded path analysis, not a default whole-program search; use Triton/Qiling only when the challenge requires taint, instrumentation, firmware, or cross-OS emulation.
 - Search for custom VM bytecode, opaque predicates, self-modification and crypto misuse. Preserve every extractor and patch in `/challenge/workspace/`.""",
     "cryptography": """### Cryptography specialist playbook
 - Parse parameters exactly and build a reproducible Sage/Python solver before attempting guesses.
@@ -54,11 +56,15 @@ _PLAYBOOKS: dict[str, str] = {
 - Use Sage, fpylll/flatter, RsaCtfTool, CADO-NFS and Z3 selectively. Save scripts and intermediate factors/bases in `/challenge/workspace/`.""",
     "web": """### Web specialist playbook
 - Map routes, methods, cookies, JavaScript bundles, API schemas and trust boundaries before fuzzing blindly.
-- Maintain a stateful Python requests/httpx client in `/challenge/workspace/`; record raw requests that prove each primitive.
+- Use `web_session_open` and `web_session_request` for stateful cookies, redirects and CSRF flows; export redacted request metadata with `web_session_export`. If those helpers are unavailable, keep an equivalent `httpx`/`curl` cookie jar in `/challenge/workspace/`.
+- Use `web_session_diff` for parser/auth/encoding comparisons and `web_parallel_requests` only for a bounded, authorized race experiment.
+- Preserve the surface map and request evidence under `/challenge/shared/web/`; record the exact state transition that proves each primitive.
 - Check auth/session confusion, parser differentials, request smuggling, cache behavior, deserialization, template/query injection, SSRF and race conditions.
 - For browser-only behavior inspect bundles and CSP, then use Playwright/Chromium when available; use OOB callbacks only within contest scope.""",
     "forensics": """### Forensics specialist playbook
 - Hash and identify every input, preserve originals, and work only on copies in `/challenge/workspace/`.
+- Start with `forensic_triage` and preserve `/challenge/shared/forensics/triage.json`; do not spend tokens dumping an entire image, PCAP, or memory profile before classification. If the helper is unavailable, perform the same bounded `file`/hash/magic probe through `bash`.
+- After every extraction, call `record_forensic_provenance` with the source, artifact, tool, command, offset and hash; otherwise append the same JSONL schema to `/challenge/shared/forensics/provenance.jsonl` yourself.
 - Build a timeline across filesystem, packet, memory and metadata evidence instead of relying on one carving tool.
 - Use Sleuth Kit, Volatility, tshark, binwalk, YARA, exiftool and media transforms; verify offsets and recovered encodings with scripts.
 - Treat nested archives, polyglots, alternate streams, deleted records and timestamp manipulation as first-class hypotheses.""",
@@ -270,6 +276,27 @@ def solver_role(model_spec: str) -> SolverRole:
     if "opus" in model_id:
         return VERIFIER_ROLE
     return SPECIALIST_ROLE
+
+
+def apply_lead_model_override(model_specs: list[str], lead_model_spec: str) -> list[str]:
+    """Return a roster with one challenge-specific lead effort applied."""
+    override = str(lead_model_spec or "").strip()
+    resolved = list(model_specs)
+    if not override:
+        return resolved
+    lead_index = next(
+        (
+            index
+            for index, spec in enumerate(resolved)
+            if solver_role(spec).key == "lead"
+        ),
+        None,
+    )
+    if lead_index is None:
+        resolved.insert(0, override)
+    else:
+        resolved[lead_index] = override
+    return resolved
 
 
 def solver_lane(model_spec: str) -> str:

@@ -41,6 +41,7 @@ from backend.budgets import (
     token_metrics,
 )
 from backend.challenge_profiles import (
+    apply_lead_model_override,
     category_playbook,
     external_skill_path,
     normalized_category,
@@ -275,6 +276,20 @@ class ArtifactAndProfileTests(unittest.TestCase):
             "delegate",
         )
         self.assertEqual(solver_role("codex/gpt-5.6-terra/high").key, "analyst")
+
+    def test_lead_model_override_preserves_other_roster_lanes(self) -> None:
+        roster = [
+            "codex/gpt-5.6-sol/high",
+            "codex/gpt-5.6-luna/low",
+        ]
+        self.assertEqual(
+            apply_lead_model_override(roster, "codex/gpt-5.6-sol/xhigh"),
+            [
+                "codex/gpt-5.6-sol/xhigh",
+                "codex/gpt-5.6-luna/low",
+            ],
+        )
+        self.assertEqual(roster[0], "codex/gpt-5.6-sol/high")
         self.assertEqual(external_skill_path("OSINT"), "/challenge/skills/ctf-osint/SKILL.md")
         self.assertEqual(external_skill_path("blockchain"), "/challenge/skills/ctf-misc/SKILL.md")
         analyst_prompt = build_prompt(
@@ -1012,6 +1027,45 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(swarm.settings, settings)
         self.assertEqual(swarm.settings.solver_max_steps, 300)
         self.assertEqual(swarm.model_specs, ["codex/gpt-5.6-sol/high"])
+
+    async def test_new_swarm_uses_per_challenge_lead_model_override(self) -> None:
+        settings = Settings(_env_file=None)
+        gate = asyncio.Event()
+
+        async def fake_run(_swarm: ChallengeSwarm) -> None:
+            await gate.wait()
+
+        deps = SimpleNamespace(
+            swarms={},
+            swarm_tasks={},
+            results={},
+            candidates={},
+            dismissed_challenges=set(),
+            max_concurrent_challenges=1,
+            ctfd=SimpleNamespace(is_configured=False),
+            challenges_root="challenges",
+            challenge_dirs={"xhigh challenge": "."},
+            challenge_metas={
+                "xhigh challenge": ChallengeMeta(
+                    name="xhigh challenge",
+                    category="reversing",
+                    lead_model_spec="codex/gpt-5.6-sol/xhigh",
+                )
+            },
+            cost_tracker=CostTracker(),
+            settings=settings,
+            model_specs=["codex/gpt-5.6-sol/high"],
+            no_submit=True,
+            coordinator_inbox=asyncio.Queue(),
+        )
+
+        with patch("backend.agents.swarm.ChallengeSwarm.run", new=fake_run):
+            await do_spawn_swarm(deps, "xhigh challenge")
+            swarm = deps.swarms["xhigh challenge"]
+            self.assertEqual(swarm.model_specs, ["codex/gpt-5.6-sol/xhigh"])
+            task = deps.swarm_tasks["xhigh challenge"]
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_restarted_swarm_receives_persisted_solution_review(self) -> None:
         with tempfile.TemporaryDirectory() as workspace_root:

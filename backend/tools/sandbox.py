@@ -13,6 +13,16 @@ from backend.tools.core import (
     do_webhook_get_requests,
     do_write_file,
 )
+from backend.tools.specialized import (
+    do_binary_triage,
+    do_forensic_triage,
+    do_record_forensic_provenance,
+    do_web_parallel_requests,
+    do_web_session_diff,
+    do_web_session_export,
+    do_web_session_open,
+    do_web_session_request,
+)
 
 
 async def bash(
@@ -113,6 +123,107 @@ async def web_fetch(ctx: RunContext[SolverDeps], url: str, method: str = "GET", 
     Prefer bash+curl inside the sandbox for cookies/sessions.
     """
     return await do_web_fetch(url, method, body)
+
+
+async def web_session_open(
+    ctx: RunContext[SolverDeps],
+    base_url: str,
+    headers: dict[str, str] | None = None,
+) -> str:
+    """Open a stateful HTTP session and perform one initial GET."""
+    return await do_web_session_open(ctx.deps.web_sessions, base_url, headers)
+
+
+async def web_session_request(
+    ctx: RunContext[SolverDeps],
+    session_id: str,
+    url: str,
+    method: str = "GET",
+    body: str = "",
+    headers: dict[str, str] | None = None,
+) -> str:
+    """Send a request while retaining cookies and session state."""
+    return await do_web_session_request(
+        ctx.deps.web_sessions,
+        session_id,
+        url,
+        method,
+        body,
+        headers,
+    )
+
+
+async def web_parallel_requests(
+    ctx: RunContext[SolverDeps],
+    session_id: str,
+    url: str,
+    count: int = 2,
+    method: str = "GET",
+    body: str = "",
+    headers: dict[str, str] | None = None,
+) -> str:
+    """Send a bounded batch of concurrent requests for authorized race testing."""
+    return await do_web_parallel_requests(
+        ctx.deps.web_sessions,
+        session_id,
+        url,
+        count,
+        method,
+        body,
+        headers,
+    )
+
+
+async def web_session_diff(
+    ctx: RunContext[SolverDeps],
+    session_id: str,
+    response_a: str,
+    response_b: str,
+) -> str:
+    """Compare two recorded responses without repeating the requests."""
+    return await do_web_session_diff(ctx.deps.web_sessions, session_id, response_a, response_b)
+
+
+async def web_session_export(ctx: RunContext[SolverDeps], session_id: str) -> str:
+    """Export redacted request/response metadata to the shared challenge workspace."""
+    return await do_web_session_export(ctx.deps.web_sessions, ctx.deps.sandbox, session_id)
+
+
+async def binary_triage(ctx: RunContext[SolverDeps], path: str) -> str:
+    """Create a compact binary fingerprint and shared reversing manifest."""
+    return await do_binary_triage(ctx.deps.sandbox, path)
+
+
+async def forensic_triage(
+    ctx: RunContext[SolverDeps],
+    path: str,
+    mode: str = "auto",
+) -> str:
+    """Create a structured forensic triage record and bounded next actions."""
+    return await do_forensic_triage(ctx.deps.sandbox, path, mode)
+
+
+async def record_forensic_provenance(
+    ctx: RunContext[SolverDeps],
+    source_path: str,
+    artifact_path: str,
+    tool: str,
+    command: str,
+    offset: str = "",
+    sha256: str = "",
+    notes: str = "",
+) -> str:
+    """Append a reproducible source-to-artifact record to the shared ledger."""
+    return await do_record_forensic_provenance(
+        ctx.deps.sandbox,
+        source_path,
+        artifact_path,
+        tool,
+        command,
+        offset,
+        sha256,
+        notes,
+    )
 
 
 async def webhook_create(ctx: RunContext[SolverDeps]) -> str:

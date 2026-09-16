@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.sandbox import DockerSandbox
+from backend.tools.specialized import WebSessionStore
 
 if TYPE_CHECKING:
     from backend.message_bus import ChallengeMessageBus
@@ -34,6 +35,8 @@ class SolverDeps:
     submit_fn: SubmitFn | None = None  # Deduped flag submission via swarm
     no_submit: bool = False
     notify_coordinator: Callable[[str], Coroutine[Any, Any, None]] | None = None
+    # Stateful HTTP is scoped to one solver and is never shared across challenges.
+    web_sessions: WebSessionStore = field(default_factory=WebSessionStore)
 
 
 @dataclass

@@ -30,6 +30,16 @@ DEFAULT_MODELS: list[str] = [
     "codex/gpt-5.6-sol/high",
 ]
 
+# Per-challenge selection is intentionally limited to Sol efforts so the
+# selected model remains the end-to-end LEAD lane rather than changing the
+# roster's role assignment to scout/analyst.
+LEAD_MODEL_SPECS: tuple[str, ...] = (
+    "codex/gpt-5.6-sol/medium",
+    "codex/gpt-5.6-sol/high",
+    "codex/gpt-5.6-sol/xhigh",
+    "codex/gpt-5.6-sol/max",
+)
+
 # Context window sizes (tokens)
 CONTEXT_WINDOWS: dict[str, int] = {
     "us.anthropic.claude-opus-4-6-v1": 1_000_000,

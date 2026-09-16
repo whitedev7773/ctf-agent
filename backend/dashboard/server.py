@@ -36,6 +36,7 @@ from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.experience import experience_root, experience_summary
 from backend.model_specs import provider_from_spec
+from backend.models import LEAD_MODEL_SPECS
 from backend.notifications import notify_discord
 from backend.prompts import ChallengeMeta, list_distfiles
 from backend.runtime_clock import RuntimeClock
@@ -746,6 +747,7 @@ class DashboardServer:
                         "description": getattr(meta, "description", "") or "",
                         "connection_info": getattr(meta, "connection_info", "") or "",
                         "flag_format": getattr(meta, "flag_format", "") or "",
+                        "lead_model_spec": getattr(meta, "lead_model_spec", "") or "",
                         "tags": list(getattr(meta, "tags", []) or []),
                         "hint_count": len(getattr(meta, "hints", []) or []),
                         "attachments": list_distfiles(challenge_dir) if challenge_dir else [],
@@ -1929,6 +1931,9 @@ class DashboardServer:
             flag_format = fields.get("flag_format", "")[:500]
             if not flag_format:
                 raise web.HTTPBadRequest(text="flag format required")
+            lead_model_spec = fields.get("lead_model_spec", "")[:100]
+            if lead_model_spec and lead_model_spec not in LEAD_MODEL_SPECS:
+                raise web.HTTPBadRequest(text="unsupported lead model")
             if name in self.deps.challenge_dirs or name in self.deps.challenge_metas:
                 raise web.HTTPConflict(text=f"challenge already exists: {name}")
 
@@ -1953,6 +1958,7 @@ class DashboardServer:
                 "value": value,
                 "connection_info": fields.get("connection_info", "")[:2000],
                 "flag_format": flag_format,
+                "lead_model_spec": lead_model_spec,
                 "tags": [],
                 "solves": 0,
             }
@@ -1996,6 +2002,7 @@ class DashboardServer:
                 "message": f"로컬 문제 '{name}'을 등록했습니다.{attachment_copy}",
                 "challenge": name,
                 "file_count": file_count,
+                "lead_model_spec": meta.lead_model_spec,
             }
         )
 

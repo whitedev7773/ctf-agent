@@ -269,6 +269,7 @@ value: 500
 description: Find the flag in the remote service.
 connection_info: nc challenge.example.com 31337
 flag_format: TEAM{...}
+lead_model_spec: codex/gpt-5.6-sol/xhigh  # optional per-challenge lead override
 tags:
   - x86_64
   - heap
@@ -382,7 +383,7 @@ http://127.0.0.1:9400
 대시보드에서는 다음 작업을 할 수 있다.
 
 - 실행 중 CTFd URL/token 또는 아이디/비밀번호를 입력해 연결하거나 연결 해제
-- CTFd 없이 문제명, 설명, 접속 정보, 첨부 파일을 등록하고 즉시 단일 문제 풀이 시작
+- CTFd 없이 문제명, 설명, 접속 정보, 첨부 파일과 문제별 Lead 모델을 등록하고 즉시 단일 문제 풀이 시작
 - 전체 문제, 해결 수, 활성 swarm과 agent, token 및 추정 비용 확인
 - 문제명·카테고리 검색과 상태 필터링
 - 문제 상세에서 지금까지의 핵심 접근, 확인된 사실, 현재 blocker와 다음 실험 노트 확인

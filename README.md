@@ -342,6 +342,16 @@ Sandbox에는 주요 CTF 분야의 분석 도구가 포함되어 있습니다.
 
 전체 목록은 [sandbox/sandbox-tools.txt](sandbox/sandbox-tools.txt)에서 확인할 수 있습니다.
 
+### Category-focused solver helpers
+
+The solver now exposes bounded, evidence-preserving helpers for the three highest-impact analysis lanes:
+
+- Reversing: `binary_triage` creates `/challenge/shared/reversing/binary-analysis.json` with file identity, hash, architecture, entrypoint, protections, symbols and bounded strings.
+- Web: `web_session_open`, `web_session_request`, `web_session_diff`, `web_parallel_requests` and `web_session_export` preserve cookies, compare responses and export redacted records. Private-network targets remain blocked.
+- Forensics: `forensic_triage` performs a cheap file/stat/hash/magic probe before running only the inferred specialist probe. `record_forensic_provenance` appends source-to-artifact extraction records to JSONL.
+
+These helpers are scoped to `/challenge/{distfiles,workspace,shared}` and are available to the Codex and Pydantic solver lanes. Other backends can reproduce the same workflow with the documented `bash` fallbacks in the category playbooks.
+
 분석 편의를 위해 container는 `SYS_ADMIN`, `SYS_PTRACE`, `seccomp=unconfined` 권한을 사용합니다.
 
 ## 결과와 데이터

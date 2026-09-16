@@ -1022,6 +1022,17 @@
                       autocomplete="off"
                   /></label>
                   <label class="wide-field"
+                    ><span>Lead 모델</span
+                    ><select name="lead_model_spec">
+                      <option value="">기본값 (runtime 설정 사용)</option>
+                      <option value="codex/gpt-5.6-sol/medium">Sol · Medium</option>
+                      <option value="codex/gpt-5.6-sol/high">Sol · High</option>
+                      <option value="codex/gpt-5.6-sol/xhigh">Sol · Extra High</option>
+                      <option value="codex/gpt-5.6-sol/max">Sol · Max</option>
+                    </select>
+                    <small>이 문제의 풀이 swarm에만 적용됩니다.</small>
+                  </label>
+                  <label class="wide-field"
                     ><span>설명</span
                     ><textarea
                       name="description"

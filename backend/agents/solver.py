@@ -50,16 +50,24 @@ from backend.solver_base import (
 from backend.tools.flag import submit_flag
 from backend.tools.sandbox import (
     bash,
+    binary_triage,
     check_findings,
+    forensic_triage,
     list_files,
     notify_coordinator,
     read_file,
+    record_forensic_provenance,
     session_close,
     session_interrupt,
     session_open,
     session_read,
     session_send,
     web_fetch,
+    web_parallel_requests,
+    web_session_diff,
+    web_session_export,
+    web_session_open,
+    web_session_request,
     webhook_create,
     webhook_get_requests,
     write_file,
@@ -123,6 +131,9 @@ def _build_toolset(deps: SolverDeps) -> FunctionToolset[SolverDeps]:
         bash, read_file, write_file, list_files, submit_flag, web_fetch,
         webhook_create, webhook_get_requests, check_findings, notify_coordinator,
         session_open, session_send, session_read, session_interrupt, session_close,
+        binary_triage, forensic_triage, record_forensic_provenance,
+        web_session_open, web_session_request, web_parallel_requests,
+        web_session_diff, web_session_export,
     ]
     if deps.use_vision:
         tools.append(view_image)
@@ -411,5 +422,6 @@ class Solver:
     async def stop(self) -> None:
         self.tracer.event("stop", step_count=self._step_count[0])
         self.tracer.close()
+        await self.deps.web_sessions.close_all()
         if self._owns_sandbox and self.sandbox:
             await self.sandbox.stop()

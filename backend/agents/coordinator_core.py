@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from backend.artifacts import challenge_shared_path
+from backend.challenge_profiles import apply_lead_model_override
 from backend.deps import CoordinatorDeps
 from backend.experience import promote_challenge_experience
 from backend.notifications import notify_discord, spoiler
@@ -342,13 +343,19 @@ async def do_spawn_swarm(
         if hasattr(deps.settings, "model_copy")
         else copy.deepcopy(deps.settings)
     )
+    challenge_meta = deps.challenge_metas[challenge_name]
+    model_specs = apply_lead_model_override(
+        deps.model_specs,
+        getattr(challenge_meta, "lead_model_spec", ""),
+    )
+
     swarm = ChallengeSwarm(
         challenge_dir=deps.challenge_dirs[challenge_name],
-        meta=deps.challenge_metas[challenge_name],
+        meta=challenge_meta,
         ctfd=deps.ctfd,
         cost_tracker=deps.cost_tracker,
         settings=swarm_settings,
-        model_specs=list(deps.model_specs),
+        model_specs=model_specs,
         no_submit=deps.no_submit,
         coordinator_inbox=deps.coordinator_inbox,
         feedback_directive=feedback,
@@ -431,7 +438,7 @@ async def do_spawn_swarm(
     task = asyncio.create_task(_run_and_cleanup(), name=f"swarm-{challenge_name}")
     deps.swarm_tasks[challenge_name] = task
     return (
-        f"SOL-led swarm spawned for {challenge_name} with {len(deps.model_specs)} primary model(s); "
+        f"SOL-led swarm spawned for {challenge_name} with {len(model_specs)} primary model(s); "
         "bounded delegates are created on demand"
     )
 
