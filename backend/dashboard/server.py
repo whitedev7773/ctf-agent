@@ -34,7 +34,13 @@ from backend.challenge_profiles import external_skill_path, solver_role, split_c
 from backend.codex_usage import CodexUsageMonitor
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
-from backend.experience import experience_root, experience_summary
+from backend.experience import (
+    MAX_EXPERIENCE_ARCHIVE_BYTES,
+    experience_root,
+    experience_summary,
+    export_experience_archive,
+    import_experience_archive,
+)
 from backend.model_specs import provider_from_spec
 from backend.models import LEAD_MODEL_SPECS
 from backend.notifications import notify_discord
@@ -342,6 +348,7 @@ class DashboardServer:
                 web.get("/api/status", self._status),
                 web.get("/api/codex/usage", self._codex_usage),
                 web.get("/api/resources", self._resources),
+                web.get("/api/experience/export", self._export_experience),
                 web.get("/api/writeup", self._writeup),
                 web.get("/api/solution-review", self._solution_review),
                 web.get("/api/writeup/archive", self._writeup_archive),
@@ -366,6 +373,7 @@ class DashboardServer:
                 web.post("/api/control/review-solution", self._request_solution_review),
                 web.post("/api/control/reset-runtime", self._reset_runtime),
                 web.post("/api/control/reset-experience", self._reset_experience),
+                web.post("/api/experience/import", self._import_experience),
                 # Backward-compatible endpoint used by the ctf-msg command.
                 web.post("/msg", self._legacy_message),
             ]
@@ -434,6 +442,7 @@ class DashboardServer:
                 "capabilities": {
                     "reset_runtime": True,
                     "reset_experience": True,
+                    "experience_transfer": True,
                     "request_writeup": True,
                     "solution_review": True,
                     "delete_challenge": True,
@@ -2396,6 +2405,84 @@ class DashboardServer:
                 ),
             }
         )
+
+    async def _export_experience(self, _request: web.Request) -> web.Response:
+        """Download all curated experience records as a portable ZIP archive."""
+        async with self._command_lock:
+            payload, manifest = await asyncio.to_thread(
+                export_experience_archive,
+                self.deps.settings,
+            )
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%SZ")
+        return web.Response(
+            body=payload,
+            content_type="application/zip",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="ctf-agent-experience-{timestamp}.zip"'
+                ),
+                "X-Experience-Records": str(manifest["record_count"]),
+            },
+        )
+
+    async def _import_experience(self, request: web.Request) -> web.Response:
+        """Validate and merge a portable experience ZIP into the current store."""
+        self._require_csrf(request)
+        payload = bytearray()
+
+        async def append_chunks(part: Any) -> None:
+            while chunk := await part.read_chunk():
+                if len(payload) + len(chunk) > MAX_EXPERIENCE_ARCHIVE_BYTES:
+                    raise web.HTTPRequestEntityTooLarge(
+                        max_size=MAX_EXPERIENCE_ARCHIVE_BYTES,
+                        actual_size=len(payload) + len(chunk),
+                    )
+                payload.extend(chunk)
+
+        if request.content_type.startswith("multipart/"):
+            reader = await request.multipart()
+            found = False
+            async for part in reader:
+                if not isinstance(part, BodyPartReader):
+                    raise web.HTTPBadRequest(text="nested multipart sections are not supported")
+                if part.name == "archive" and part.filename:
+                    if found:
+                        raise web.HTTPBadRequest(text="only one experience archive is allowed")
+                    found = True
+                    await append_chunks(part)
+                else:
+                    await part.release()
+            if not found:
+                raise web.HTTPBadRequest(text="experience archive file is required")
+        elif request.content_type in {"application/zip", "application/octet-stream"}:
+            async for chunk in request.content.iter_chunked(64 * 1024):
+                if len(payload) + len(chunk) > MAX_EXPERIENCE_ARCHIVE_BYTES:
+                    raise web.HTTPRequestEntityTooLarge(
+                        max_size=MAX_EXPERIENCE_ARCHIVE_BYTES,
+                        actual_size=len(payload) + len(chunk),
+                    )
+                payload.extend(chunk)
+        else:
+            raise web.HTTPUnsupportedMediaType(
+                text="multipart/form-data or application/zip required"
+            )
+
+        try:
+            async with self._command_lock:
+                result = await asyncio.to_thread(
+                    import_experience_archive,
+                    self.deps.settings,
+                    bytes(payload),
+                )
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+        message = (
+            f"공유 경험 {result['imported']}건을 불러왔습니다. "
+            f"중복 {result['skipped']}건은 건너뛰었습니다."
+        )
+        if result["renamed"]:
+            message += f" 경로 충돌 {result['renamed']}건은 새 이름으로 보존했습니다."
+        return web.json_response({"ok": True, "message": message, **result})
 
     async def _reset_experience(self, request: web.Request) -> web.Response:
         """Clear only the curated cross-challenge experience repository."""

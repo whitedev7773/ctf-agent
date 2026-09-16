@@ -406,6 +406,8 @@ Flag 확인 뒤 Codex 문서화 pipeline이 자동으로 시작된다. 먼저 Te
 
 검증된 풀이의 `lead/EXPERIENCE.md` 또는 solution은 flag와 명백한 credential을 제거한 뒤 `EXPERIENCE_ROOT`로 승격된다. 이 저장소는 모든 solver container의 `/challenge/experience`에 읽기 전용으로 mount된다. 일반 런타임 초기화로는 삭제되지 않으며, 별도 `경험 초기화` 버튼에서 같은 문구를 정확히 입력해야만 삭제된다.
 
+공유 경험 패널의 `내보내기` 버튼은 전체 기록과 크기·SHA-256 manifest를 ZIP으로 저장한다. `불러오기`는 이 ZIP의 형식, 경로, 크기와 checksum을 검증한 후 현재 저장소에 병합한다. 동일한 기록은 건너뛰고, 같은 경로에 내용이 다른 기록이 있으면 기존 파일을 덮어쓰지 않고 `-imported-<hash>` 이름으로 함께 보존한다. 임의로 만든 ZIP이 아니라 신뢰할 수 있는 CTF Agent 내보내기 파일만 불러오는 것을 권장한다.
+
 `지금까지의 접근 노트`는 별도 LLM 호출 없이 실행 중 findings와 `STATE.md`, `SOLUTION.md`, `TRIAGE.md`, delegate/recovery handoff에서 생성된다. 최대 6개 문장만 표시하고 코드 블록·명령·표는 제외하므로 token 비용이 없으며 workspace가 보존되는 한 재시작 뒤에도 유지된다.
 
 `풀이 기록 및 환경 초기화`는 실행 중인 모든 solver를 먼저 중단한 뒤 `challenges/`, `WORKSPACE_ROOT`, `LOGS_ROOT`, 문제 결과·후보·비용 상태와 현재 CTFd 연결을 비운다. 버튼을 누른 것만으로는 실행되지 않으며 확인 창에 `초기화`를 정확히 입력해야 한다. 삭제된 런타임 기록은 복구할 수 없지만 소스 코드, `.env`, 가상환경과 Docker 이미지는 보존된다. 안전하지 않거나 프로젝트 소스와 겹치는 경로가 설정되어 있으면 서버가 초기화를 거부한다.

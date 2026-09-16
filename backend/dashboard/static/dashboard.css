@@ -135,6 +135,7 @@ a:focus-visible, .icon-button:focus-visible, button:focus-visible, input:focus-v
 .experience-stats { display: grid; grid-template-columns: auto auto; gap: 2px 8px; align-items: baseline; min-width: 150px; }
 .experience-stats strong { font: 500 16px/1.4 var(--mono); text-align: right; }
 .experience-stats span { color: var(--muted); font-size: 12px; text-transform: uppercase; }
+.experience-actions { display: flex; flex: 0 0 auto; gap: 8px; align-items: center; }
 .source-heading { margin-bottom: 24px; }
 .source-heading p:not(.eyebrow) { margin: 8px 0 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
 .setup-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: stretch; }
@@ -480,6 +481,8 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
   .live-resource-metric:last-child { grid-column: 1 / -1; border-bottom: 0; }
   .experience-panel { align-items: stretch; flex-direction: column; }
   .experience-stats { align-self: flex-start; }
+  .experience-actions { flex-wrap: wrap; }
+  .experience-actions > button { flex: 1 1 auto; }
   .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .stat-card { min-height: 112px; padding: 18px; }
   .codex-usage-heading { align-items: flex-start; padding: 18px; }

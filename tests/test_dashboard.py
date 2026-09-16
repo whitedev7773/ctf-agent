@@ -195,6 +195,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("confirmAction", javascript)
             self.assertIn("challengeMatchesFilters", javascript)
             self.assertIn("filtersFromLocation", javascript)
+            self.assertIn('if (count) filterToggle.append(count)', javascript)
 
         async with self.client.get(f"{self.base_url}/assets/dashboard.css") as response:
             stylesheet = await response.text()
@@ -220,6 +221,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('id="codex-usage-refresh"', html)
             self.assertIn('id="uptime-value"', html)
             self.assertIn('id="advanced-filter-panel"', html)
+            self.assertIn('id="filter-count"', html)
             self.assertIn('id="filter-result-count"', html)
             self.assertIn('aria-controls="advanced-filter-panel"', html)
             self.assertIn('aria-labelledby="dashboard-title"', html)
@@ -1648,6 +1650,47 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["ok"])
         self.assertFalse(record.exists())
         self.assertEqual(runtime_marker.read_text(encoding="utf-8"), "active workspace")
+
+    async def test_experience_export_and_import_round_trip(self) -> None:
+        record = self.experience_root / "web" / "portable.md"
+        record.parent.mkdir()
+        record.write_text("# Portable experience\n\nVerified browser tactic.\n", encoding="utf-8")
+
+        async with self.client.get(f"{self.base_url}/api/experience/export") as response:
+            archive_bytes = await response.read()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.content_type, "application/zip")
+            self.assertEqual(response.headers["X-Experience-Records"], "1")
+            self.assertIn("attachment;", response.headers["Content-Disposition"])
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            self.assertIn("manifest.json", archive.namelist())
+            self.assertIn("records/web/portable.md", archive.namelist())
+
+        record.unlink()
+        async with self.client.get(f"{self.base_url}/api/session") as response:
+            token = (await response.json())["csrf_token"]
+        form = FormData()
+        form.add_field(
+            "archive",
+            archive_bytes,
+            filename="experience.zip",
+            content_type="application/zip",
+        )
+        async with self.client.post(
+            f"{self.base_url}/api/experience/import",
+            data=form,
+            headers={"X-CTF-Dashboard-Token": token},
+        ) as response:
+            payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["imported"], 1)
+        self.assertEqual(payload["skipped"], 0)
+        self.assertEqual(
+            record.read_text(encoding="utf-8"),
+            "# Portable experience\n\nVerified browser tactic.\n",
+        )
 
     def test_runtime_clear_retains_locked_file_and_continues(self) -> None:
         removable = self.logs_root / "old.log"

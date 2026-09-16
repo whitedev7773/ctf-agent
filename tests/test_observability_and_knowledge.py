@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from backend.artifacts import challenge_shared_path, challenge_workspace_path
-from backend.experience import experience_summary, promote_challenge_experience
+from backend.experience import (
+    experience_summary,
+    export_experience_archive,
+    import_experience_archive,
+    promote_challenge_experience,
+)
 from backend.prompts import (
     ChallengeMeta,
     build_solution_review_prompt,
@@ -215,6 +224,68 @@ class KnowledgeArtifactTests(unittest.TestCase):
         self.assertIn("[REDACTED_FLAG]", stored.read_text(encoding="utf-8"))
         self.assertNotIn("TEAM{secret-value}", stored.read_text(encoding="utf-8"))
         self.assertEqual(experience_summary(self.settings)["record_count"], 1)
+
+    def test_experience_archive_round_trip_and_duplicate_skip(self) -> None:
+        source = Path(self.settings.experience_root) / "web" / "stored-xss.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("# Stored XSS\n\nReuse same-origin durable state.\n", encoding="utf-8")
+        archive, manifest = export_experience_archive(self.settings)
+        imported_settings = SimpleNamespace(
+            workspace_root=self.settings.workspace_root,
+            experience_root=str(Path(self.temp_dir.name) / "imported-experience"),
+        )
+
+        first = import_experience_archive(imported_settings, archive)
+        second = import_experience_archive(imported_settings, archive)
+
+        self.assertEqual(manifest["record_count"], 1)
+        self.assertEqual(first["imported"], 1)
+        self.assertEqual(first["skipped"], 0)
+        self.assertEqual(second["imported"], 0)
+        self.assertEqual(second["skipped"], 1)
+        restored = Path(imported_settings.experience_root) / "web" / "stored-xss.md"
+        self.assertEqual(restored.read_bytes(), source.read_bytes())
+
+    def test_experience_import_preserves_conflicting_record(self) -> None:
+        source = Path(self.settings.experience_root) / "pwn" / "heap.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("# New heap notes\n", encoding="utf-8")
+        archive, _manifest = export_experience_archive(self.settings)
+        source.write_text("# Existing local notes\n", encoding="utf-8")
+
+        result = import_experience_archive(self.settings, archive)
+
+        self.assertEqual(result["imported"], 1)
+        self.assertEqual(result["renamed"], 1)
+        self.assertEqual(source.read_text(encoding="utf-8"), "# Existing local notes\n")
+        imported = list(source.parent.glob("heap-imported-*.md"))
+        self.assertEqual(len(imported), 1)
+        self.assertEqual(imported[0].read_text(encoding="utf-8"), "# New heap notes\n")
+
+    def test_experience_import_rejects_invalid_zip(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid experience ZIP"):
+            import_experience_archive(self.settings, b"not a zip")
+
+    def test_experience_import_rejects_path_traversal(self) -> None:
+        data = b"# Escaping record\n"
+        record_path = "../escape.md"
+        manifest = {
+            "format": "ctf-agent-experience",
+            "version": 1,
+            "record_count": 1,
+            "records": [{
+                "path": record_path,
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }],
+        }
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("manifest.json", json.dumps(manifest))
+            archive.writestr(f"records/{record_path}", data)
+
+        with self.assertRaisesRegex(ValueError, "category/name.md"):
+            import_experience_archive(self.settings, buffer.getvalue())
 
     def test_writeup_collects_reproducer_and_real_screenshot(self) -> None:
         root = Path(challenge_workspace_path(self.settings, "web warmup"))

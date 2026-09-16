@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import re
+import zipfile
 from collections import Counter
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from backend.artifacts import challenge_workspace_path
@@ -18,6 +20,21 @@ _SECRET_PATTERN = re.compile(
     r"(?i)\b(authorization|api[_-]?key|access[_-]?token|password|cookie)"
     r"(\s*[:=]\s*)([^\s`]+)"
 )
+_ARCHIVE_FORMAT = "ctf-agent-experience"
+_ARCHIVE_VERSION = 1
+MAX_EXPERIENCE_ARCHIVE_BYTES = 64 * 1024 * 1024
+_MAX_ARCHIVE_RECORDS = 500
+_MAX_ARCHIVE_RECORD_BYTES = 1024 * 1024
+_MAX_ARCHIVE_MANIFEST_BYTES = 1024 * 1024
+_ARCHIVE_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 
 def _safe_segment(value: str) -> str:
@@ -184,6 +201,168 @@ def experience_summary(settings: object) -> dict[str, Any]:
         "category_count": len(categories),
         "total_bytes": total_bytes,
         "updated_at": datetime.fromtimestamp(latest, UTC).isoformat() if latest else "",
+    }
+
+
+def export_experience_archive(settings: object) -> tuple[bytes, dict[str, Any]]:
+    """Build a portable, checksummed ZIP containing curated experience records."""
+    root = experience_root(settings)
+    records: list[tuple[str, bytes]] = []
+    for path in sorted(root.glob("*/*.md"), key=lambda item: item.as_posix().casefold()):
+        if not path.is_file() or path.name == "INDEX.md":
+            continue
+        data = path.read_bytes()
+        records.append((path.relative_to(root).as_posix(), data))
+
+    exported_at = datetime.now(UTC).isoformat()
+    manifest = {
+        "format": _ARCHIVE_FORMAT,
+        "version": _ARCHIVE_VERSION,
+        "exported_at": exported_at,
+        "record_count": len(records),
+        "records": [
+            {
+                "path": path,
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+            for path, data in records
+        ],
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+        for path, data in records:
+            archive.writestr(f"records/{path}", data)
+    return buffer.getvalue(), manifest
+
+
+def _archive_record_path(value: object) -> PurePosixPath:
+    if not isinstance(value, str) or "\\" in value:
+        raise ValueError("experience archive contains an invalid record path")
+    path = PurePosixPath(value)
+    if (
+        len(path.parts) != 2
+        or path.is_absolute()
+        or any(not _ARCHIVE_SEGMENT_PATTERN.fullmatch(part) for part in path.parts)
+        or any(part.rstrip(". ").split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES for part in path.parts)
+        or path.suffix.casefold() != ".md"
+    ):
+        raise ValueError("experience archive record paths must be category/name.md")
+    return path
+
+
+def import_experience_archive(settings: object, payload: bytes) -> dict[str, Any]:
+    """Validate and merge a portable archive without overwriting existing records."""
+    if not payload:
+        raise ValueError("experience archive is empty")
+    if len(payload) > MAX_EXPERIENCE_ARCHIVE_BYTES:
+        raise ValueError("experience archive exceeds the 64 MiB limit")
+
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(payload))
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ValueError("invalid experience ZIP archive") from exc
+
+    prepared: list[tuple[PurePosixPath, bytes, str]] = []
+    with archive:
+        infos = archive.infolist()
+        names = [info.filename for info in infos]
+        if len(names) != len(set(names)):
+            raise ValueError("experience archive contains duplicate ZIP entries")
+        if any(info.flag_bits & 0x1 for info in infos):
+            raise ValueError("encrypted experience archives are not supported")
+        manifest_info = next((info for info in infos if info.filename == "manifest.json"), None)
+        if manifest_info is None or manifest_info.file_size > _MAX_ARCHIVE_MANIFEST_BYTES:
+            raise ValueError("experience archive manifest is missing or too large")
+        try:
+            manifest = json.loads(archive.read(manifest_info).decode("utf-8"))
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("experience archive manifest is invalid") from exc
+        if not isinstance(manifest, dict) or manifest.get("format") != _ARCHIVE_FORMAT:
+            raise ValueError("unsupported experience archive format")
+        if manifest.get("version") != _ARCHIVE_VERSION:
+            raise ValueError("unsupported experience archive version")
+        records = manifest.get("records")
+        if not isinstance(records, list) or len(records) > _MAX_ARCHIVE_RECORDS:
+            raise ValueError("experience archive contains too many records")
+        if manifest.get("record_count") != len(records):
+            raise ValueError("experience archive record count does not match its manifest")
+
+        expected_names = {"manifest.json"}
+        total_size = 0
+        seen_paths: set[str] = set()
+        for entry in records:
+            if not isinstance(entry, dict):
+                raise ValueError("experience archive contains an invalid record entry")
+            path = _archive_record_path(entry.get("path"))
+            relative = path.as_posix()
+            if relative in seen_paths:
+                raise ValueError("experience archive manifest contains duplicate records")
+            seen_paths.add(relative)
+            archive_name = f"records/{relative}"
+            expected_names.add(archive_name)
+            info = next((item for item in infos if item.filename == archive_name), None)
+            if info is None or info.is_dir():
+                raise ValueError(f"experience archive record is missing: {relative}")
+            if info.file_size > _MAX_ARCHIVE_RECORD_BYTES:
+                raise ValueError(f"experience record exceeds the 1 MiB limit: {relative}")
+            total_size += info.file_size
+            if total_size > MAX_EXPERIENCE_ARCHIVE_BYTES:
+                raise ValueError("expanded experience archive exceeds the 64 MiB limit")
+            data = archive.read(info)
+            digest = hashlib.sha256(data).hexdigest()
+            if entry.get("size_bytes") != len(data) or entry.get("sha256") != digest:
+                raise ValueError(f"experience record checksum mismatch: {relative}")
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"experience record is not UTF-8: {relative}") from exc
+            if "\x00" in text:
+                raise ValueError(f"experience record contains NUL bytes: {relative}")
+            prepared.append((path, data, digest))
+
+        actual_names = {info.filename for info in infos if not info.is_dir()}
+        if actual_names != expected_names:
+            raise ValueError("experience archive contains undeclared files")
+
+    root = experience_root(settings).resolve()
+    imported = 0
+    skipped = 0
+    renamed = 0
+    for relative, data, digest in prepared:
+        category = (root / relative.parts[0]).resolve()
+        if not category.is_relative_to(root):
+            raise ValueError("experience archive destination escapes the configured root")
+        category.mkdir(parents=True, exist_ok=True)
+        destination = (category / relative.name).resolve()
+        if not destination.is_relative_to(root):
+            raise ValueError("experience archive destination escapes the configured root")
+        if destination.exists():
+            if destination.is_file() and hashlib.sha256(destination.read_bytes()).hexdigest() == digest:
+                skipped += 1
+                continue
+            destination = category / f"{relative.stem}-imported-{digest[:8]}.md"
+            if destination.exists():
+                if destination.is_file() and hashlib.sha256(destination.read_bytes()).hexdigest() == digest:
+                    skipped += 1
+                    continue
+                raise ValueError(f"experience import collision could not be resolved: {relative}")
+            renamed += 1
+        temp = destination.with_name(f".{destination.name}.tmp")
+        temp.write_bytes(data)
+        temp.replace(destination)
+        imported += 1
+
+    _write_index(root)
+    return {
+        "imported": imported,
+        "skipped": skipped,
+        "renamed": renamed,
+        "record_count": experience_summary(settings)["record_count"],
     }
 
 

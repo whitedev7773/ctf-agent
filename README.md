@@ -324,6 +324,7 @@ uv run ctf-benchmark --help
 - Discord webhook 저장, 테스트 및 해제
 - 풀이 완료 문제의 writeup 생성, 검수 상태 확인 및 evidence ZIP 다운로드
 - runtime 상태와 cross-challenge experience의 독립적인 초기화
+- 공유 풀이 경험의 checksummed ZIP 내보내기·병합 불러오기
 
 `DISCORD_WEBHOOK_URL`을 설정하면 새 문제, 풀이 완료, 검토가 필요한 flag 후보와 writeup 상태를 Discord로 알립니다. Flag 값은 spoiler로 표시되며, webhook 실패는 solver 실행을 중단하지 않습니다.
 
@@ -364,7 +365,7 @@ These helpers are scoped to `/challenge/{distfiles,workspace,shared}` and are av
 | `logs/` | solver JSONL trace | 재실행 후 유지 |
 | `.ctf-agent-settings.json` | 대시보드 runtime 및 연결 설정 | 재실행 후 유지 |
 
-정상 종료는 실행 terminal에서 `Ctrl+C`를 사용합니다. 다음 시작 시 `ctf-agent` label이 붙은 orphan container를 자동 정리합니다. 대시보드의 runtime reset과 experience reset은 서로 독립적이며 `challenges/`의 원본 문제 파일은 삭제하지 않습니다.
+정상 종료는 실행 terminal에서 `Ctrl+C`를 사용합니다. 다음 시작 시 `ctf-agent` label이 붙은 orphan container를 자동 정리합니다. 대시보드의 runtime reset과 experience reset은 서로 독립적이며 `challenges/`의 원본 문제 파일은 삭제하지 않습니다. 공유 경험 패널의 `내보내기`는 전체 기록을 checksum manifest가 포함된 ZIP으로 저장하고, `불러오기`는 검증된 ZIP을 기존 기록에 병합합니다. 동일한 기록은 건너뛰며 같은 경로의 다른 기록은 별도 이름으로 보존합니다.
 
 ## Benchmark
 

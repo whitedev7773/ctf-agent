@@ -182,7 +182,6 @@ function initializeIconography() {
     ["#add-challenge", "plus"],
     [".dashboard-hero-actions .button-link", "arrowRight", "end"],
     ["#operator-form button", "send"],
-    ["#advanced-filter-toggle", "filter"],
     ["#filter-reset", "refresh"],
     ["#empty-add-challenge", "plus"],
     ["#runtime-settings-reset", "refresh"],
@@ -191,6 +190,8 @@ function initializeIconography() {
     ["#discord-form button[type=submit]", "check"],
     ["#discord-disconnect", "x"],
     ["#local-challenge-form > button[type=submit]", "plus"],
+    ["#experience-export", "download"],
+    ["#experience-import", "upload"],
     ["#experience-reset-open", "trash"],
     ["#reset-open", "trash"],
     ["#detail-back", "arrowLeft"],
@@ -208,6 +209,14 @@ function initializeIconography() {
     const element = document.querySelector(selector);
     if (!element || element.dataset.iconName) continue;
     appendIconLabel(element, element.textContent.trim(), iconName, position);
+  }
+  const filterToggle = byId("advanced-filter-toggle");
+  if (filterToggle && !filterToggle.dataset.iconName) {
+    const count = byId("filter-count");
+    filterToggle.replaceChildren(icon("filter"), node("span", "button-label", "고급 필터"));
+    if (count) filterToggle.append(count);
+    filterToggle.dataset.iconName = "filter";
+    filterToggle.dataset.iconLabel = "고급 필터";
   }
   for (const element of document.querySelectorAll(".icon-button")) {
     if (element.dataset.iconName) continue;
@@ -2385,6 +2394,7 @@ async function refresh({ renderSelected = false } = {}) {
       state.viewInitialized = true;
     }
   } catch (error) {
+    console.error("Dashboard refresh failed", error);
     state.csrfToken = "";
     setConnection(false);
   } finally {
@@ -2694,6 +2704,60 @@ async function initialize() {
   const experienceDialog = byId("experience-reset-dialog");
   const experienceInput = byId("experience-reset-confirmation");
   const experienceSubmit = byId("experience-reset-submit");
+  const experienceExport = byId("experience-export");
+  const experienceImport = byId("experience-import");
+  const experienceImportFile = byId("experience-import-file");
+  experienceExport.addEventListener("click", async () => {
+    const originalLabel = experienceExport.textContent;
+    experienceExport.disabled = true;
+    experienceExport.setAttribute("aria-busy", "true");
+    setButtonLabel(experienceExport, "내보내는 중…");
+    try {
+      const response = await fetch("/api/experience/export", { cache: "no-store" });
+      if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
+      const blob = await response.blob();
+      const disposition = response.headers.get("content-disposition") || "";
+      const matched = disposition.match(/filename="?([^";]+)"?/i);
+      const link = document.createElement("a");
+      const objectUrl = URL.createObjectURL(blob);
+      link.href = objectUrl;
+      link.download = matched?.[1] || "ctf-agent-experience.zip";
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+      toast(`공유 경험 ${response.headers.get("x-experience-records") || "0"}건을 내보냈습니다.`);
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      experienceExport.disabled = false;
+      experienceExport.removeAttribute("aria-busy");
+      setButtonLabel(experienceExport, originalLabel);
+    }
+  });
+  experienceImport.addEventListener("click", () => experienceImportFile.click());
+  experienceImportFile.addEventListener("change", async () => {
+    const archive = experienceImportFile.files?.[0];
+    if (!archive) return;
+    const originalLabel = experienceImport.textContent;
+    experienceImport.disabled = true;
+    experienceImport.setAttribute("aria-busy", "true");
+    setButtonLabel(experienceImport, "불러오는 중…");
+    try {
+      const form = new FormData();
+      form.append("archive", archive);
+      const result = await api("/api/experience/import", { method: "POST", body: form });
+      toast(result.message);
+      await refresh({ renderSelected: true });
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      experienceImportFile.value = "";
+      experienceImport.disabled = false;
+      experienceImport.removeAttribute("aria-busy");
+      setButtonLabel(experienceImport, originalLabel);
+    }
+  });
   byId("experience-reset-open").addEventListener("click", () => {
     experienceInput.value = "";
     experienceSubmit.disabled = true;
