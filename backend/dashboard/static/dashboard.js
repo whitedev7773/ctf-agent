@@ -96,6 +96,135 @@ function node(tag, className = "", text = "") {
   return element;
 }
 
+// HeroUI's icons are intentionally kept inline so the dashboard has no icon
+// font or third-party runtime dependency. The 24px viewBox and currentColor
+// stroke match HeroUI's default icon treatment.
+const ICON_PATHS = {
+  arrowLeft: ["M19 12H5", "m11 18-6-6 6-6"],
+  arrowRight: ["M5 12h14", "m13 6 6 6-6 6"],
+  check: ["m5 12 4 4L19 6"],
+  chevronDown: ["m6 9 6 6 6-6"],
+  chevronRight: ["m9 18 6-6-6-6"],
+  copy: ["M9 9h10v10H9z", "M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"],
+  download: ["M12 3v12", "m7 10 5 5 5-5", "M5 21h14"],
+  filter: ["M4 5h16", "M7 12h10", "M10 19h4"],
+  link: ["M10 13a5 5 0 0 0 7.1.1l1.4-1.4a5 5 0 0 0-7.1-7.1L10.6 5.4", "M14 11a5 5 0 0 0-7.1-.1l-1.4 1.4a5 5 0 0 0 7.1 7.1l.8-.8"],
+  plus: ["M12 5v14", "M5 12h14"],
+  play: ["m9 5 10 7-10 7V5Z"],
+  refresh: ["M20 11a8 8 0 0 0-14.7-4L4 9", "M4 5v4h4", "M4 13a8 8 0 0 0 14.7 4L20 15", "M20 19v-4h-4"],
+  search: ["m21 21-4.35-4.35", "M11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z"],
+  send: ["m3 11 18-8-8 18-2-8-8-2Z", "m11 13 10-10"],
+  settings: ["M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z", "M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 1.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.1h-2.6v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1-1.8-1.8.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H6.4v-2.6h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 1.8-1.8.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.5v-.1H15v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1 1.8 1.8-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.5 1h.1V14h-.1a1.7 1.7 0 0 0-1.5 1Z"],
+  stop: ["M6 6h12v12H6z"],
+  terminal: ["M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5v-13Z", "m8 9 3 3-3 3", "M13 15h3"],
+  trash: ["M4 7h16", "M10 11v6", "M14 11v6", "m6-4V20a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V7", "m3-3 1-1h4l1 1"],
+  upload: ["M12 16V4", "m7 9 5-5 5 5", "M5 20h14"],
+  x: ["m6 6 12 12", "M18 6 6 18"],
+};
+
+function icon(name, size = 16, className = "") {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", `ui-icon${className ? ` ${className}` : ""}`);
+  svg.setAttribute("width", String(size));
+  svg.setAttribute("height", String(size));
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.8");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  for (const pathData of ICON_PATHS[name] || []) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", pathData);
+    svg.append(path);
+  }
+  return svg;
+}
+
+function appendIconLabel(element, label, iconName, iconPosition = "start") {
+  element.replaceChildren();
+  element.dataset.iconName = iconName;
+  element.dataset.iconLabel = label;
+  const labelNode = node("span", "button-label", label);
+  if (iconPosition === "end") element.append(labelNode, icon(iconName));
+  else element.append(icon(iconName), labelNode);
+  return element;
+}
+
+function setButtonLabel(element, label) {
+  if (element?.dataset.iconName) {
+    appendIconLabel(element, label, element.dataset.iconName);
+    return;
+  }
+  element.textContent = label;
+}
+
+function inferButtonIcon(label, className = "") {
+  const text = String(label || "");
+  if (className.includes("destructive") || /삭제|제거/.test(text)) return "trash";
+  if (/취소|닫기/.test(text)) return "x";
+  if (/복사/.test(text)) return "copy";
+  if (/다운로드|ZIP/.test(text)) return "download";
+  if (/새로고침|다시/.test(text)) return "refresh";
+  if (/확인|인정|저장|연결|테스트/.test(text)) return "check";
+  if (/검토|검색/.test(text)) return "search";
+  if (/전송/.test(text)) return "send";
+  if (/시작|등록|추가|생성/.test(text)) return "plus";
+  if (/보기|열기|결과/.test(text)) return "chevronRight";
+  return "";
+}
+
+function initializeIconography() {
+  const labels = [
+    ["#operations-open", "settings"],
+    ["#add-challenge", "plus"],
+    [".dashboard-hero-actions .button-link", "arrowRight", "end"],
+    ["#operator-form button", "send"],
+    ["#advanced-filter-toggle", "filter"],
+    ["#filter-reset", "refresh"],
+    ["#empty-add-challenge", "plus"],
+    ["#runtime-settings-reset", "refresh"],
+    ["#ctfd-form button[type=submit]", "link"],
+    ["#ctfd-disconnect", "x"],
+    ["#discord-form button[type=submit]", "check"],
+    ["#discord-disconnect", "x"],
+    ["#local-challenge-form > button[type=submit]", "plus"],
+    ["#experience-reset-open", "trash"],
+    ["#reset-open", "trash"],
+    ["#detail-back", "arrowLeft"],
+    ["#workspace-dialog-close", "x"],
+    ["#confirmation-cancel", "x"],
+    ["#confirmation-accept", "check"],
+    ["#reset-cancel", "x"],
+    ["#reset-submit", "trash"],
+    ["#experience-reset-cancel", "x"],
+    ["#experience-reset-submit", "trash"],
+    ["#delete-challenge-cancel", "x"],
+    ["#delete-challenge-submit", "trash"],
+  ];
+  for (const [selector, iconName, position] of labels) {
+    const element = document.querySelector(selector);
+    if (!element || element.dataset.iconName) continue;
+    appendIconLabel(element, element.textContent.trim(), iconName, position);
+  }
+  for (const element of document.querySelectorAll(".icon-button")) {
+    if (element.dataset.iconName) continue;
+    const iconName = {"refresh-button": "refresh", "codex-usage-refresh": "refresh"}[element.id] || "refresh";
+    element.replaceChildren(icon(iconName, 18));
+    element.dataset.iconName = iconName;
+  }
+  const searchIcon = document.querySelector(".search-box > span[aria-hidden=true]");
+  if (searchIcon) searchIcon.replaceChildren(icon("search", 17));
+  const terminal = document.querySelector(".terminal-glyph");
+  if (terminal) terminal.replaceChildren(icon("terminal", 19));
+  const emptyIcon = document.querySelector(".empty-state > span");
+  if (emptyIcon) emptyIcon.replaceChildren(icon("search", 28));
+  const fileDrop = document.querySelector(".file-drop");
+  if (fileDrop && !fileDrop.querySelector(".ui-icon")) fileDrop.prepend(icon("upload", 20));
+}
+
 function syncModalScrollLock() {
   document.documentElement.classList.toggle("modal-open", Boolean(document.querySelector("dialog[open]")));
 }
@@ -171,7 +300,7 @@ function modalSection(section, title, subtitle = "", onOpen = null) {
   stash.hidden = true;
   stash.append(section);
   const open = onOpen || (() => openWorkspaceModal(title, section));
-  const launch = button("열기", "secondary-button", open);
+  const launch = button("열기", "secondary-button", open, false, "chevronRight");
   launch.setAttribute("aria-label", `${title} 열기`);
   launch.setAttribute("aria-haspopup", "dialog");
   card.append(copy, launch, stash);
@@ -209,8 +338,9 @@ function initializeModals() {
   for (const [key, title, content] of operations) {
     state.operations.set(key, {title, content});
     stash.append(content);
-    launcherBar.append(button(title, "secondary-button", () => openOperation(key)));
-    const tab = button(title, "secondary-button", () => openOperation(key));
+    const operationIcon = {runtime: "settings", ctfd: "link", discord: "send", local: "plus", experience: "copy", maintenance: "trash"}[key];
+    launcherBar.append(button(title, "secondary-button", () => openOperation(key), false, operationIcon));
+    const tab = button(title, "secondary-button", () => openOperation(key), false, operationIcon);
     tab.dataset.operation = key;
     byId("workspace-dialog-tabs").append(tab);
   }
@@ -222,17 +352,19 @@ function initializeModals() {
   const operator = document.querySelector(".operator-panel");
   state.operations.set("operator", {title: "Coordinator에게 지시", content: operator});
   for (const key of ["monitor", "operator"]) {
-    const tab = button(state.operations.get(key).title, "secondary-button", () => openOperation(key));
+    const tab = button(state.operations.get(key).title, "secondary-button", () => openOperation(key), false, key === "monitor" ? "terminal" : "send");
     tab.dataset.operation = key;
     byId("workspace-dialog-tabs").append(tab);
   }
   byId("operations-open").addEventListener("click", () => openOperation("runtime"));
 }
 
-function button(label, className, onClick, disabled = false) {
+function button(label, className, onClick, disabled = false, iconName = "") {
   const element = node("button", className, label);
   element.type = "button";
   element.disabled = disabled;
+  const resolvedIcon = iconName || inferButtonIcon(label, className);
+  if (resolvedIcon) appendIconLabel(element, label, resolvedIcon);
   element.addEventListener("click", (event) => {
     event.stopPropagation();
     onClick();
@@ -378,9 +510,9 @@ async function syncLocalFiles(files) {
       node("span", "file-item-name", file.name),
       node("span", "file-item-size", formatFileSize(file.size)),
     );
-    const remove = button("×", "file-remove", () => {
+    const remove = button("", "file-remove", () => {
       syncLocalFiles(state.localFiles.filter((_selected, selectedIndex) => selectedIndex !== index));
-    });
+    }, false, "x");
     remove.setAttribute("aria-label", `${file.name} 제거`);
     item.append(copy, remove);
     list.append(item);
@@ -461,7 +593,7 @@ function toast(message, type = "success") {
   } else byId("toast-region").append(item);
   if (type === "error") {
     item.setAttribute("role", "alert");
-    item.append(button("닫기", "secondary-button", () => item.remove()));
+    item.append(button("닫기", "secondary-button", () => item.remove(), false, "x"));
   } else window.setTimeout(() => item.remove(), 4200);
 }
 
@@ -473,7 +605,7 @@ function copyControl(text, label = "복사") {
     } catch (_error) {
       toast("복사하지 못했습니다. 내용을 선택해 직접 복사하세요.", "error");
     }
-  });
+  }, false, "copy");
 }
 
 function showFormError(form, message) {
@@ -1192,7 +1324,9 @@ function updateChallengeRow(row, challenge) {
   progressCell.append(elapsed);
 
   const action = row.querySelector(".row-action");
-  action.textContent = challenge.active ? "중단" : challenge.solved ? "보기" : "시작";
+  const actionLabel = challenge.active ? "중단" : challenge.solved ? "보기" : "시작";
+  const actionIcon = challenge.active ? "stop" : challenge.solved ? "chevronRight" : "play";
+  appendIconLabel(action, actionLabel, actionIcon);
   action.setAttribute(
     "aria-label",
     challenge.active
@@ -1771,9 +1905,9 @@ function renderDetailPage({ preserveScroll = false } = {}) {
   summary.children[2].querySelector("strong").dataset.challengeElapsed = challenge.name;
   const controls = node("div", "control-row detail-actions");
   if (challenge.active) {
-    controls.append(button("풀이 중단", "danger-button", () => stopChallenge(challenge.name)));
+    controls.append(button("풀이 중단", "danger-button", () => stopChallenge(challenge.name), false, "stop"));
   } else if (!challenge.solved) {
-    controls.append(button("SOL 풀이 시작", "primary-button", () => spawnChallenge(challenge.name)));
+    controls.append(button("SOL 풀이 시작", "primary-button", () => spawnChallenge(challenge.name), false, "play"));
   }
   const reviewStatus = challenge.solution_review || {};
   const reviewButton = button(
@@ -1781,19 +1915,22 @@ function renderDetailPage({ preserveScroll = false } = {}) {
     challenge.active ? "primary-button" : "secondary-button",
     () => requestSolutionReview(challenge.name, reviewButton),
     reviewStatus.active,
+    "search",
   );
   if (reviewStatus.active) reviewButton.setAttribute("aria-busy", "true");
   controls.append(reviewButton);
   const more = node("details", "detail-action-menu");
   more.dataset.disclosureKey = "action-menu";
-  const moreSummary = node("summary", "secondary-button", "더보기");
+  const moreSummary = node("summary", "secondary-button");
+  appendIconLabel(moreSummary, "더보기", "chevronDown", "end");
   const morePanel = node("div", "detail-action-menu-panel");
-  morePanel.append(button("상태 새로고침", "secondary-button", () => refresh({ renderSelected: true })));
+  morePanel.append(button("상태 새로고침", "secondary-button", () => refresh({ renderSelected: true }), false, "refresh"));
   const deleteButton = button(
     "문제 삭제",
     "destructive-button",
     () => openDeleteChallengeDialog(challenge.name),
     !state.deleteChallengeSupported,
+    "trash",
   );
   if (!state.deleteChallengeSupported) {
     deleteButton.title = "새 삭제 API를 사용하려면 coordinator를 재시작해야 합니다.";
@@ -1873,7 +2010,7 @@ function renderDetailPage({ preserveScroll = false } = {}) {
           { challenge: challenge.name, flag: candidateFlag, accepted: false },
           reject,
         );
-      });
+      }, false, "x");
       reviewControls.append(accept, reject);
         candidateEntry.append(reviewControls);
       }
@@ -1965,7 +2102,7 @@ function renderDetailPage({ preserveScroll = false } = {}) {
     if (agent.findings) card.append(node("p", "agent-findings", agent.findings));
     if (agent.stop_reason) card.append(node("p", "agent-stop-reason", `종료 사유: ${agent.stop_reason}`));
     if (agent.workspace_path) card.append(node("p", "agent-workspace", `산출물: ${agent.workspace_path}`));
-    const traceButton = button("최근 trace 보기 →", "trace-button", () => loadTrace(challenge.name, agent.model_spec));
+    const traceButton = button("최근 trace 보기", "trace-button", () => loadTrace(challenge.name, agent.model_spec), false, "arrowRight");
     card.append(traceButton);
     agentsSection.append(card);
   }
@@ -2162,7 +2299,7 @@ async function runCommand(path, body, control = null, onSuccess = null) {
   if (control) {
     control.disabled = true;
     control.setAttribute("aria-busy", "true");
-    control.textContent = "처리 중…";
+    setButtonLabel(control, "처리 중…");
   }
   try {
     const result = await api(path, { method: "POST", body: JSON.stringify(body) });
@@ -2178,7 +2315,7 @@ async function runCommand(path, body, control = null, onSuccess = null) {
     if (control) {
       control.disabled = false;
       control.removeAttribute("aria-busy");
-      control.textContent = originalLabel;
+      setButtonLabel(control, originalLabel);
     }
   }
 }
@@ -2311,7 +2448,7 @@ async function refreshSession() {
   reset.disabled = !resetSupported;
   byId("reset-compatibility").hidden = resetSupported;
   if (!reset.dataset.defaultLabel) reset.dataset.defaultLabel = reset.textContent;
-  reset.textContent = resetSupported ? reset.dataset.defaultLabel : "백엔드 재시작 필요";
+  setButtonLabel(reset, resetSupported ? reset.dataset.defaultLabel : "백엔드 재시작 필요");
   reset.title = resetSupported ? "" : "실행 중인 coordinator가 초기화 API를 지원하지 않습니다.";
   state.csrfToken = session.csrf_token;
 }
@@ -2324,6 +2461,7 @@ function handleEscape(event) {
 async function initialize() {
   state.filters = filtersFromLocation();
   initializeModals();
+  initializeIconography();
   byId("add-challenge").addEventListener("click", openLocalChallengeForm);
   byId("empty-add-challenge").addEventListener("click", openLocalChallengeForm);
   for (const disclosure of document.querySelectorAll(".dashboard-disclosure")) {
@@ -2398,7 +2536,7 @@ async function initialize() {
   const filterResult = node("p");
   filterResult.id = "filter-modal-result";
   filterResult.setAttribute("aria-live", "polite");
-  filterActions.append(filterResult, button("필터 초기화", "secondary-button", resetFilters), button("결과 보기", "primary-button", () => closeWorkspaceModal()));
+  filterActions.append(filterResult, button("필터 초기화", "secondary-button", resetFilters, false, "refresh"), button("결과 보기", "primary-button", () => closeWorkspaceModal(), false, "arrowRight"));
   advancedPanel.append(filterActions);
   byId("filter-reset").addEventListener("click", resetFilters);
 
@@ -2622,7 +2760,7 @@ async function initialize() {
     const originalLabel = submit.textContent;
     submit.disabled = true;
     submit.setAttribute("aria-busy", "true");
-    submit.textContent = "문제를 등록하는 중…";
+    setButtonLabel(submit, "문제를 등록하는 중…");
     try {
       const result = await api("/api/challenges/local", {
         method: "POST",
@@ -2645,7 +2783,7 @@ async function initialize() {
     } finally {
       submit.disabled = false;
       submit.removeAttribute("aria-busy");
-      submit.textContent = originalLabel;
+      setButtonLabel(submit, originalLabel);
     }
   });
 
