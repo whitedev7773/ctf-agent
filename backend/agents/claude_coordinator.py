@@ -20,7 +20,6 @@ from backend.agents.coordinator_core import (
     do_check_swarm_status,
     do_fetch_challenges,
     do_get_solve_status,
-    do_kill_swarm,
     do_read_solver_trace,
     do_spawn_swarm,
     do_submit_flag,
@@ -49,6 +48,9 @@ CRITICAL RULES:
 - When a solver seems stuck, bump it with very specific technical guidance based on
   its trace. Tell it exactly what to try next — specific tools, techniques, approaches.
 - Never submit guesses. Preserve reproducible scripts and evidence in the persistent workspace.
+- Never stop an active unsolved swarm merely to control cost, free capacity, or because it appears
+  stuck. Use targeted guidance and let the configured hard budgets terminate it. Solved challenges
+  are retired automatically, and only the operator may stop other active work.
 
 You will receive event messages. Respond with tool calls to manage the competition.
 """
@@ -82,10 +84,6 @@ def _build_coordinator_mcp(deps: CoordinatorDeps):
     async def submit_flag(args: dict) -> dict:
         return _text(await do_submit_flag(deps, args["challenge_name"], args["flag"]))
 
-    @tool("kill_swarm", "Cancel all agents for a challenge.", {"challenge_name": str})
-    async def kill_swarm(args: dict) -> dict:
-        return _text(await do_kill_swarm(deps, args["challenge_name"]))
-
     @tool("bump_agent", "Send targeted insights to a stuck agent.", {"challenge_name": str, "model_spec": str, "insights": str})
     async def bump_agent(args: dict) -> dict:
         return _text(await do_bump_agent(deps, args["challenge_name"], args["model_spec"], args["insights"]))
@@ -101,7 +99,7 @@ def _build_coordinator_mcp(deps: CoordinatorDeps):
     return create_sdk_mcp_server(
         name="coordinator", version="1.0.0",
         tools=[fetch_challenges, get_solve_status, spawn_swarm, check_swarm_status,
-               submit_flag, kill_swarm, bump_agent, broadcast, read_solver_trace],
+               submit_flag, bump_agent, broadcast, read_solver_trace],
     )
 
 
@@ -127,7 +125,7 @@ async def run_claude_coordinator(
     allowed = {
         "mcp__coordinator__fetch_challenges", "mcp__coordinator__get_solve_status",
         "mcp__coordinator__spawn_swarm", "mcp__coordinator__check_swarm_status",
-        "mcp__coordinator__submit_flag", "mcp__coordinator__kill_swarm",
+        "mcp__coordinator__submit_flag",
         "mcp__coordinator__bump_agent", "mcp__coordinator__broadcast",
         "mcp__coordinator__read_solver_trace",
         "ToolSearch",

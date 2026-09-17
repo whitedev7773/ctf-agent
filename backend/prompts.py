@@ -37,9 +37,14 @@ class ChallengeMeta:
     @classmethod
     def from_yaml(cls, path: str | Path) -> ChallengeMeta:
         with open(path, encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"challenge metadata must be a mapping: {path}")
+        name = str(data.get("name", "")).strip()
+        if not name:
+            raise ValueError(f"challenge metadata requires a non-empty name: {path}")
         return cls(
-            name=data.get("name", "Unknown"),
+            name=name,
             source=data.get("source", ""),
             category=data.get("category", ""),
             value=data.get("value", 0),

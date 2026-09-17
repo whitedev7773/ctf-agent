@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.agents.codex_solver import REASONING_TOOLS, CodexSolver
+from backend.agents.codex_solver import (
+    REASONING_TOOLS,
+    CodexSolver,
+    _bounded_solve_state_payload,
+)
 from backend.agents.coordinator_loop import _rank_unsolved
 from backend.agents.swarm import ChallengeSwarm
 from backend.message_bus import ChallengeMessageBus
@@ -215,6 +219,45 @@ async def test_codex_state_tools_use_runtime_observation_receipt(tmp_path: Path)
         "sync_findings",
         "search_experience",
     }
+
+
+def test_restart_state_payload_is_bounded_and_keeps_active_evidence() -> None:
+    hypotheses = [
+        {
+            "id": f"H-{index}",
+            "statement": "candidate " + ("x" * 400),
+            "evidence_for": [f"EV-{index}"],
+            "evidence_against": [],
+        }
+        for index in range(20)
+    ]
+    evidence = [
+        {
+            "id": f"EV-{index}",
+            "kind": "dynamic",
+            "claim": "signal " + ("y" * 1_000),
+            "source_command": "ignored " + ("z" * 2_000),
+        }
+        for index in range(30)
+    ]
+    payload = {
+        "active_hypothesis": "H-0",
+        "hypotheses": hypotheses,
+        "evidence": evidence,
+        "failed_experiments": [f"failure-{index}" for index in range(30)],
+        "ranked_hypotheses": hypotheses,
+    }
+
+    bounded = _bounded_solve_state_payload(payload, {"ready": 2})
+
+    assert bounded["hypotheses"][0]["id"] == "H-0"
+    assert any(item["id"] == "EV-0" for item in bounded["evidence"])
+    assert len(bounded["hypotheses"]) <= 8
+    assert len(bounded["evidence"]) <= 16
+    assert len(bounded["failed_experiments"]) == 8
+    assert bounded["omitted_counts"] == {"hypotheses": 12, "evidence": 14}
+    assert bounded["attack_graph_summary"] == {"ready": 2}
+    assert len(json.dumps(bounded)) < 30_000
 
 
 @pytest.mark.asyncio

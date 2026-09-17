@@ -2141,7 +2141,7 @@ class DashboardServer:
 
             swarm = self.deps.swarms.get(name)
             if swarm is not None:
-                swarm.kill()
+                swarm.kill("challenge deleted by operator")
             swarm_task = self.deps.swarm_tasks.get(name)
             if swarm_task is not None and not swarm_task.done():
                 swarm_task.cancel()
@@ -2171,6 +2171,8 @@ class DashboardServer:
             self._solution_review_errors.pop(name, None)
             self.deps.swarms.pop(name, None)
             self.deps.swarm_tasks.pop(name, None)
+            self.deps.swarm_run_counts.pop(name, None)
+            self.deps.swarm_retry_after.pop(name, None)
             self._challenge_clocks.pop(name, None)
             self.deps.results.pop(name, None)
             self.deps.candidates.pop(name, None)
@@ -2226,7 +2228,7 @@ class DashboardServer:
             raise web.HTTPBadRequest(text="challenge required")
         async with self._command_lock:
             try:
-                message = await do_spawn_swarm(self.deps, name)
+                message = await do_spawn_swarm(self.deps, name, reset_run_budget=True)
             except Exception as exc:
                 logger.exception("Could not start solver swarm for %s", name)
                 return web.json_response(
@@ -2256,7 +2258,11 @@ class DashboardServer:
         if not name:
             raise web.HTTPBadRequest(text="challenge required")
         async with self._command_lock:
-            message = await do_kill_swarm(self.deps, name)
+            message = await do_kill_swarm(
+                self.deps,
+                name,
+                reason="operator requested stop from dashboard",
+            )
             clock = self._challenge_clocks.get(name)
             if clock is not None:
                 clock.stop()
@@ -2348,7 +2354,7 @@ class DashboardServer:
                 await asyncio.gather(*document_tasks, return_exceptions=True)
 
             for swarm in list(self.deps.swarms.values()):
-                swarm.kill()
+                swarm.kill("runtime reset requested by operator")
             tasks = list(self.deps.swarm_tasks.values())
             for task in tasks:
                 if not task.done():
@@ -2373,6 +2379,8 @@ class DashboardServer:
 
             self.deps.swarms.clear()
             self.deps.swarm_tasks.clear()
+            self.deps.swarm_run_counts.clear()
+            self.deps.swarm_retry_after.clear()
             self._solution_review_tasks.clear()
             self._solution_reviewers.clear()
             self._solution_review_clocks.clear()

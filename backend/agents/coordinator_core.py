@@ -293,6 +293,8 @@ async def do_spawn_swarm(
     deps: CoordinatorDeps,
     challenge_name: str,
     feedback: str = "",
+    *,
+    reset_run_budget: bool = False,
 ) -> str:
     # Retire ALL finished swarms before checking capacity
     finished = [
@@ -316,6 +318,47 @@ async def do_spawn_swarm(
 
     if challenge_name in deps.swarms:
         return f"Swarm still running for {challenge_name}"
+
+    run_counts = getattr(deps, "swarm_run_counts", None)
+    if run_counts is None:
+        run_counts = {}
+        deps.swarm_run_counts = run_counts
+    retry_after = getattr(deps, "swarm_retry_after", None)
+    if retry_after is None:
+        retry_after = {}
+        deps.swarm_retry_after = retry_after
+    if reset_run_budget:
+        run_counts.pop(challenge_name, None)
+        retry_after.pop(challenge_name, None)
+        # An operator restart is a new bounded run, but CostTracker intentionally
+        # survives for the lifetime of the coordinator.  Keeping the old entry
+        # under the canonical agent name makes the replacement swarm inherit the
+        # exhausted token/cost budget and stop on its first turn.  Archive those
+        # entries under non-live names so aggregate accounting remains accurate
+        # while the restarted lane receives a fresh budget.
+        usage_prefix = f"{challenge_name}/"
+        restart_stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+        for agent_name in list(deps.cost_tracker.by_agent):
+            if not agent_name.startswith(usage_prefix) or "#restart-" in agent_name:
+                continue
+            archived_name = f"{agent_name}#restart-{restart_stamp}"
+            sequence = 2
+            while archived_name in deps.cost_tracker.by_agent:
+                archived_name = f"{agent_name}#restart-{restart_stamp}-{sequence}"
+                sequence += 1
+            deps.cost_tracker.by_agent[archived_name] = deps.cost_tracker.by_agent.pop(
+                agent_name
+            )
+    else:
+        max_runs = max(
+            1,
+            int(getattr(deps.settings, "coordinator_max_swarm_runs_per_challenge", 2)),
+        )
+        if run_counts.get(challenge_name, 0) >= max_runs:
+            return (
+                f"Automatic run budget exhausted for {challenge_name} "
+                f"({run_counts[challenge_name]}/{max_runs}); operator restart required."
+            )
 
     # Auto-pull challenge if needed
     if challenge_name not in deps.challenge_dirs:
@@ -362,14 +405,6 @@ async def do_spawn_swarm(
         solution_review_directive=review_guidance,
     )
     deps.swarms[challenge_name] = swarm
-    run_counts = getattr(deps, "swarm_run_counts", None)
-    if run_counts is None:
-        run_counts = {}
-        deps.swarm_run_counts = run_counts
-    retry_after = getattr(deps, "swarm_retry_after", None)
-    if retry_after is None:
-        retry_after = {}
-        deps.swarm_retry_after = retry_after
     run_counts[challenge_name] = run_counts.get(challenge_name, 0) + 1
     retry_after.pop(challenge_name, None)
 
@@ -681,18 +716,22 @@ async def do_review_candidate(
     )
 
 
-async def do_kill_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
+async def do_kill_swarm(
+    deps: CoordinatorDeps,
+    challenge_name: str,
+    reason: str = "operator requested stop",
+) -> str:
     swarm = deps.swarms.get(challenge_name)
     if not swarm:
         return f"No swarm running for {challenge_name}"
     preserved = preserve_evidence_candidates(deps, challenge_name)
-    swarm.kill()
+    swarm.kill(reason)
     if preserved:
         return (
-            f"Swarm for {challenge_name} cancelled; preserved "
+            f"Swarm for {challenge_name} cancelled ({reason}); preserved "
             f"{len(preserved)} unverified candidate(s) from evidence"
         )
-    return f"Swarm for {challenge_name} cancelled"
+    return f"Swarm for {challenge_name} cancelled ({reason})"
 
 
 async def do_bump_agent(deps: CoordinatorDeps, challenge_name: str, model_spec: str, insights: str) -> str:

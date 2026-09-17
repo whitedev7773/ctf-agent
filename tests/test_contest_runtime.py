@@ -1029,6 +1029,51 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(swarm.settings.solver_max_steps, 300)
         self.assertEqual(swarm.model_specs, ["codex/gpt-5.6-sol/high"])
 
+    async def test_operator_restart_archives_usage_and_starts_with_fresh_budget(self) -> None:
+        settings = Settings(_env_file=None)
+        gate = asyncio.Event()
+
+        async def fake_run(_swarm: ChallengeSwarm) -> None:
+            await gate.wait()
+
+        tracker = CostTracker()
+        live_agent = "restart/codex/gpt-5.6-sol/high"
+        other_agent = "other/codex/gpt-5.6-sol/high"
+        tracker.record_tokens(live_agent, "gpt-5.6-sol", input_tokens=1_500_000)
+        tracker.record_tokens(other_agent, "gpt-5.6-sol", input_tokens=123)
+        deps = SimpleNamespace(
+            swarms={},
+            swarm_tasks={},
+            swarm_run_counts={"restart": 2},
+            swarm_retry_after={"restart": 123.0},
+            results={},
+            candidates={},
+            dismissed_challenges=set(),
+            max_concurrent_challenges=1,
+            ctfd=SimpleNamespace(is_configured=False),
+            challenges_root="challenges",
+            challenge_dirs={"restart": "."},
+            challenge_metas={"restart": ChallengeMeta(name="restart", category="misc")},
+            cost_tracker=tracker,
+            settings=settings,
+            model_specs=["codex/gpt-5.6-sol/high"],
+            no_submit=True,
+            coordinator_inbox=asyncio.Queue(),
+        )
+
+        with patch("backend.agents.swarm.ChallengeSwarm.run", new=fake_run):
+            await do_spawn_swarm(deps, "restart", reset_run_budget=True)
+            self.assertNotIn(live_agent, tracker.by_agent)
+            archived = [name for name in tracker.by_agent if name.startswith(live_agent + "#restart-")]
+            self.assertEqual(len(archived), 1)
+            self.assertEqual(tracker.by_agent[archived[0]].usage.input_tokens, 1_500_000)
+            self.assertIn(other_agent, tracker.by_agent)
+            self.assertEqual(deps.swarm_run_counts["restart"], 1)
+            self.assertNotIn("restart", deps.swarm_retry_after)
+            task = deps.swarm_tasks["restart"]
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def test_new_swarm_uses_per_challenge_lead_model_override(self) -> None:
         settings = Settings(_env_file=None)
         gate = asyncio.Event()
@@ -1199,7 +1244,7 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
             with patch("backend.agents.coordinator_core.persist_deps_state") as persist:
                 message = await do_kill_swarm(deps, "candidate-before-submit")
 
-            swarm.kill.assert_called_once_with()
+            swarm.kill.assert_called_once_with("operator requested stop")
             persist.assert_called_once_with(deps)
             self.assertIn("preserved 1 unverified candidate", message)
             self.assertEqual(
@@ -1263,6 +1308,26 @@ class RuntimeBudgetTests(unittest.IsolatedAsyncioTestCase):
                 ["TEAM{resume_me}"],
             )
             self.assertNotIn("stopped-candidate", _unsolved_names(deps, poller))
+
+    def test_startup_ignores_empty_challenge_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            challenges_root = Path(root) / "challenges"
+            invalid = challenges_root / "partial-upload"
+            invalid.mkdir(parents=True)
+            (invalid / "metadata.yml").write_text("", encoding="utf-8")
+            settings = Settings(
+                _env_file=None,
+                workspace_root=str(Path(root) / "workspace"),
+                logs_root=str(Path(root) / "logs"),
+            )
+
+            _ctfd, _cost, deps = build_deps(
+                settings,
+                challenges_root=str(challenges_root),
+            )
+
+            self.assertEqual(deps.challenge_metas, {})
+            self.assertEqual(deps.challenge_dirs, {})
 
     async def test_cached_long_context_gets_checkpoint_not_global_budget_stop(self) -> None:
         class FakeStdout:

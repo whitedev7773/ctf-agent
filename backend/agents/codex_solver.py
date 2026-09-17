@@ -104,6 +104,75 @@ def _next_id() -> int:
     return next(_rpc_counter)
 
 
+def _bounded_solve_state_payload(
+    payload: dict[str, Any],
+    attack_graph_summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep restart context useful without replaying the full historical ledger."""
+    bounded = dict(payload)
+    hypotheses = [item for item in payload.get("hypotheses", []) if isinstance(item, dict)]
+    active_id = str(payload.get("active_hypothesis") or "")
+    active = [item for item in hypotheses if str(item.get("id", "")) == active_id]
+    recent = [item for item in hypotheses if str(item.get("id", "")) != active_id][-7:]
+    selected_hypotheses = [*active[:1], *recent]
+
+    evidence_ids: list[str] = []
+    for hypothesis in selected_hypotheses:
+        for key in ("evidence_for", "evidence_against"):
+            for evidence_id in hypothesis.get(key, []):
+                value = str(evidence_id)
+                if value and value not in evidence_ids:
+                    evidence_ids.append(value)
+    all_evidence = [item for item in payload.get("evidence", []) if isinstance(item, dict)]
+    evidence_by_id = {str(item.get("id", "")): item for item in all_evidence}
+    selected_evidence = [
+        evidence_by_id[evidence_id]
+        for evidence_id in evidence_ids
+        if evidence_id in evidence_by_id
+    ]
+    for item in all_evidence[-8:]:
+        if item not in selected_evidence:
+            selected_evidence.append(item)
+    selected_evidence = selected_evidence[:16]
+
+    evidence_fields = (
+        "id",
+        "kind",
+        "claim",
+        "confidence",
+        "environment",
+        "scope",
+        "limitations",
+        "artifact_path",
+        "source_tool",
+    )
+    bounded["hypotheses"] = selected_hypotheses
+    bounded["evidence"] = [
+        {key: item[key] for key in evidence_fields if key in item}
+        for item in selected_evidence
+    ]
+    for key, limit in (
+        ("confirmed_facts", 16),
+        ("contradictions", 8),
+        ("attempted_routes", 8),
+        ("failed_experiments", 8),
+        ("ranked_hypotheses", 8),
+    ):
+        values = payload.get(key, [])
+        if isinstance(values, list):
+            bounded[key] = values[-limit:]
+    bounded["omitted_counts"] = {
+        "hypotheses": max(0, len(hypotheses) - len(selected_hypotheses)),
+        "evidence": max(0, len(all_evidence) - len(selected_evidence)),
+    }
+    bounded["resume_note"] = (
+        "This is a bounded restart view. The full authoritative ledger remains in "
+        "/challenge/shared/reasoning/state.json; use sync_findings for a targeted lookup."
+    )
+    bounded["attack_graph_summary"] = attack_graph_summary
+    return bounded
+
+
 # DynamicToolSpec[] for thread/start
 SANDBOX_TOOLS: list[dict[str, Any]] = [
     {
@@ -1487,7 +1556,7 @@ class CodexSolver:
             outcome_status = self.loop_detector.record_result(
                 tool_name, args, result, active_hypothesis
             )
-            failure_reason = self.loop_detector.failure_reason(result)
+            failure_reason = self.loop_detector.failure_reason(result, tool_name)
             if failure_reason:
                 family = self.loop_detector._action_family(tool_name, args)
                 await self.reasoning_state_store.update_context(
@@ -1836,8 +1905,11 @@ class CodexSolver:
             return f"HYPOTHESIS UPDATED: {hypothesis.id} status={hypothesis.status}"
         elif name == "get_solve_state":
             payload = json.loads(self.reasoning_state_store.format_state())
-            payload["attack_graph_summary"] = self.attack_graph_store.summary()
-            return json.dumps(payload, ensure_ascii=False, indent=2)
+            bounded = _bounded_solve_state_payload(
+                payload,
+                self.attack_graph_store.summary(),
+            )
+            return json.dumps(bounded, ensure_ascii=False, indent=2)
         elif name == "update_solve_context":
             try:
                 state = await self.reasoning_state_store.update_context(

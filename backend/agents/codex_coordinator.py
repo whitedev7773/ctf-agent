@@ -15,7 +15,6 @@ from backend.agents.coordinator_core import (
     do_check_swarm_status,
     do_fetch_challenges,
     do_get_solve_status,
-    do_kill_swarm,
     do_read_solver_trace,
     do_spawn_swarm,
     do_submit_flag,
@@ -51,6 +50,9 @@ CRITICAL RULES:
 - Preserve useful scripts, evidence, and a concise NOTES.md in the persistent workspace.
 - Do not immediately respawn an exhausted swarm unless new evidence or an operator instruction
   justifies another bounded run.
+- Never stop an active unsolved swarm merely to control cost, free capacity, or because it appears
+  stuck. Use targeted guidance and let the configured hard budgets terminate it. Solved challenges
+  are retired automatically, and only the operator may stop other active work.
 
 You will receive event messages. Respond with tool calls to manage the competition.
 """
@@ -91,15 +93,6 @@ COORDINATOR_TOOLS = [
             "type": "object",
             "properties": {"challenge_name": {"type": "string"}, "flag": {"type": "string"}},
             "required": ["challenge_name", "flag"],
-        },
-    },
-    {
-        "name": "kill_swarm",
-        "description": "Cancel all agents for a challenge.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"challenge_name": {"type": "string"}},
-            "required": ["challenge_name"],
         },
     },
     {
@@ -468,8 +461,6 @@ class CodexCoordinator:
             return await do_check_swarm_status(deps, args["challenge_name"])
         elif name == "submit_flag":
             return await do_submit_flag(deps, args["challenge_name"], args["flag"])
-        elif name == "kill_swarm":
-            return await do_kill_swarm(deps, args["challenge_name"])
         elif name == "bump_agent":
             return await do_bump_agent(deps, args["challenge_name"], args["model_spec"], args["insights"])
         elif name == "broadcast":

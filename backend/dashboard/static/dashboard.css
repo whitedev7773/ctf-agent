@@ -560,7 +560,7 @@ input::placeholder, textarea::placeholder { color: var(--faint); }
 }
 
 .detail-section-nav { display: flex; flex-wrap: wrap; gap: 8px; position: sticky; top: 76px; z-index: 9; padding: 10px 0; margin-top: 20px; background: var(--canvas); border-bottom: 1px solid var(--hairline); }
-.detail-section-nav button, #add-challenge, #empty-add-challenge { padding: 10px 16px; }
+.detail-section-nav button, #add-challenge { padding: 10px 16px; }
 #local-challenge-form, #detail-overview-section, #detail-notes-section, #detail-results-section, #detail-input-section { scroll-margin-top: 160px; }
 .challenge-description { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }
 .overview-value { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }

@@ -109,6 +109,10 @@ def test_resource_failures_block_expensive_family_until_pivot() -> None:
     ) is None
     assert "memory exhaustion" in detector.failure_reason("[exit 137]")
     assert "assertion failed" in detector.failure_reason("AssertionError: model != native")
+    assert detector.failure_reason(
+        '{"failed_experiments":["angr stopped: out of memory"]}',
+        "get_solve_state",
+    ) == ""
 
 
 @pytest.mark.asyncio

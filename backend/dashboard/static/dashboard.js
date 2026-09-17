@@ -183,7 +183,6 @@ function initializeIconography() {
     [".dashboard-hero-actions .button-link", "arrowRight", "end"],
     ["#operator-form button", "send"],
     ["#filter-reset", "refresh"],
-    ["#empty-add-challenge", "plus"],
     ["#runtime-settings-reset", "refresh"],
     ["#ctfd-form button[type=submit]", "link"],
     ["#ctfd-disconnect", "x"],
@@ -1359,7 +1358,6 @@ function renderRows() {
   byId("empty-copy").textContent = hasRegisteredChallenges
     ? "검색어나 적용 중인 필터를 바꾸거나 전체 초기화해보세요."
     : "아래에서 CTFd를 연결하거나 로컬 문제를 추가하세요.";
-  byId("empty-add-challenge").hidden = hasRegisteredChallenges;
 
   const rowsByName = new Map(
     [...tbody.querySelectorAll("tr")].map((row) => [row.dataset.challengeName, row]),
@@ -2473,7 +2471,6 @@ async function initialize() {
   initializeModals();
   initializeIconography();
   byId("add-challenge").addEventListener("click", openLocalChallengeForm);
-  byId("empty-add-challenge").addEventListener("click", openLocalChallengeForm);
   for (const disclosure of document.querySelectorAll(".dashboard-disclosure")) {
     const action = disclosure.querySelector(":scope > summary .disclosure-action");
     const syncLabel = () => {

@@ -8,6 +8,22 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 
+_NON_EXECUTION_RESULT_TOOLS = frozenset(
+    {
+        "record_evidence",
+        "update_hypothesis",
+        "get_solve_state",
+        "update_solve_context",
+        "sync_findings",
+        "search_experience",
+        "get_attack_graph",
+        "register_attack_node",
+        "link_attack_nodes",
+        "update_attack_node",
+        "get_ready_tasks",
+    }
+)
+
 
 @dataclass
 class LoopDetector:
@@ -54,8 +70,13 @@ class LoopDetector:
         return ""
 
     @staticmethod
-    def failure_reason(result: object) -> str:
+    def failure_reason(result: object, tool_name: str = "") -> str:
         """Classify hard execution failures that require a changed plan before retrying."""
+        # State/query tools can legitimately return historical failure strings.
+        # Treating those strings as the outcome of the current tool pollutes the
+        # ledger and can force a newly restarted solver off course immediately.
+        if tool_name.casefold() in _NON_EXECUTION_RESULT_TOOLS:
+            return ""
         folded = str(result).casefold()
         markers = (
             ("[exit 137]", "process killed (exit 137; probable memory exhaustion)"),
@@ -184,7 +205,7 @@ class LoopDetector:
         if not family:
             return "warn" if semantic_count >= self.warn_threshold else None
         heavy_key = f"{hypothesis_id or '-'}|{family}"
-        failure = self.failure_reason(result)
+        failure = self.failure_reason(result, tool_name)
         if failure:
             failures = self._heavy_failures.get(heavy_key, 0) + 1
             self._heavy_failures[heavy_key] = failures

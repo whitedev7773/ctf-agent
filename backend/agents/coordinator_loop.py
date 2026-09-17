@@ -9,6 +9,8 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from backend.config import Settings
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
@@ -148,9 +150,15 @@ def build_deps(
 
     # Pre-load already-pulled challenges
     for d in Path(challenges_root).iterdir():
+        if not d.is_dir():
+            continue
         meta_path = d / "metadata.yml"
         if meta_path.exists():
-            meta = ChallengeMeta.from_yaml(meta_path)
+            try:
+                meta = ChallengeMeta.from_yaml(meta_path)
+            except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
+                logger.warning("Ignoring invalid challenge metadata %s: %s", meta_path, exc)
+                continue
             if meta.name not in deps.challenge_dirs:
                 deps.challenge_dirs[meta.name] = str(d)
                 deps.challenge_metas[meta.name] = meta
@@ -254,7 +262,7 @@ async def run_event_loop(
                 if evt.kind == "challenge_solved" and evt.challenge_name in deps.swarms:
                     swarm = deps.swarms[evt.challenge_name]
                     if not swarm.cancel_event.is_set():
-                        swarm.kill()
+                        swarm.kill(f"challenge marked solved: {evt.challenge_name}")
                         logger.info("Auto-killed swarm for: %s", evt.challenge_name)
 
             parts: list[str] = []
@@ -400,7 +408,7 @@ async def run_event_loop(
             await dashboard_server.stop()
         await poller.stop()
         for swarm in deps.swarms.values():
-            swarm.kill()
+            swarm.kill("coordinator runtime shutting down")
         for task in deps.swarm_tasks.values():
             task.cancel()
         if deps.swarm_tasks:

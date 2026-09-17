@@ -1483,6 +1483,10 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.deps.swarm_tasks["web/intro"] = task
         self.deps.results["web/intro"] = {"flag": "TEAM{done}"}
         self.deps.candidates["web/intro"] = {"flag": "TEAM{maybe}"}
+        self.deps.swarm_run_counts = {}
+        self.deps.swarm_retry_after = {}
+        self.deps.swarm_run_counts["web/intro"] = 2
+        self.deps.swarm_retry_after["web/intro"] = 123.0
         self.cost_tracker.by_agent["web/intro/codex/test"] = object()
 
         async with self.client.get(f"{self.base_url}/api/session") as response:
@@ -1506,7 +1510,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 200)
         self.assertTrue(payload["experience_preserved"])
-        swarm.kill.assert_called_once_with()
+        swarm.kill.assert_called_once_with("challenge deleted by operator")
         self.assertTrue(task.cancelled())
         self.assertFalse(challenge_dir.exists())
         self.assertFalse(workspace_dir.exists())
@@ -1515,6 +1519,8 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("web/intro", self.deps.results)
         self.assertNotIn("web/intro", self.deps.candidates)
         self.assertNotIn("web/intro/codex/test", self.cost_tracker.by_agent)
+        self.assertNotIn("web/intro", self.deps.swarm_run_counts)
+        self.assertNotIn("web/intro", self.deps.swarm_retry_after)
         self.assertIn("web/intro", self.deps.dismissed_challenges)
         self.assertIn("web/intro", load_dismissed_challenges(self.deps.settings))
 
@@ -1578,6 +1584,10 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.deps.settings.ctfd_token = "secret"
         self.deps.results["web/intro"] = {"flag": "TEAM{done}"}
         self.deps.candidates["candidate"] = {"flag": "TEAM{maybe}"}
+        self.deps.swarm_run_counts = {}
+        self.deps.swarm_retry_after = {}
+        self.deps.swarm_run_counts["web/intro"] = 2
+        self.deps.swarm_retry_after["web/intro"] = 123.0
         self.deps.challenge_dirs["web/intro"] = str(challenge_file.parent)
         self.cost_tracker.by_agent["solver"] = object()
         self.deps.coordinator_inbox.put_nowait("old solver message")
@@ -1600,7 +1610,7 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["retained_locked_entries"], 0)
-        swarm.kill.assert_called_once_with()
+        swarm.kill.assert_called_once_with("runtime reset requested by operator")
         self.assertTrue(task.cancelled())
         for root in (self.challenges_root, self.workspace_root, self.logs_root):
             self.assertTrue(root.is_dir())
@@ -1611,6 +1621,8 @@ class DashboardServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.deps.no_submit)
         self.assertEqual(self.deps.swarms, {})
         self.assertEqual(self.deps.swarm_tasks, {})
+        self.assertEqual(self.deps.swarm_run_counts, {})
+        self.assertEqual(self.deps.swarm_retry_after, {})
         self.assertEqual(self.deps.results, {})
         self.assertEqual(self.deps.candidates, {})
         self.assertEqual(self.deps.dismissed_challenges, set())
